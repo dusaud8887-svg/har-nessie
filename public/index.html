@@ -1,0 +1,535 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Har-Nessie</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="app">
+    <aside>
+      <div class="sidebar-header">
+        <div class="sidebar-kicker">Har-Nessie</div>
+        <h1><span>Har-Nessie</span></h1>
+        <p class="sidebar-subtitle">Surfacing your deep issues.</p>
+      </div>
+      <div class="sidebar-content">
+        <button class="btn-create" onclick="openCreateProjectModal()">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+          <span>Start new project</span>
+        </button>
+        <button class="btn-secondary" onclick="openCreateModal()">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7h18"></path><path d="M8 7V5.8A1.8 1.8 0 0 1 9.8 4h4.4A1.8 1.8 0 0 1 16 5.8V7"></path><rect x="4" y="7" width="16" height="13" rx="2"></rect></svg>
+          <span>Quick start</span>
+        </button>
+        <div id="sidebar-live-snapshot" class="sidebar-live-snapshot">
+          <div class="signal-card">
+            <div class="signal-label">Control Plane</div>
+            <div class="signal-headline">Create the first project to start long-running work.</div>
+            <div class="signal-detail">Projects keep the next run draft, docs context, memory, and cleanup flow connected.</div>
+          </div>
+        </div>
+        <div class="run-list-title">Projects</div>
+        <div class="sidebar-search">
+          <input id="project-search-input" placeholder="Search projects" oninput="updateProjectSearch(this.value)">
+        </div>
+        <div id="project-list" class="run-list" style="margin-bottom: 24px;"></div>
+        <div class="run-list-title">Recent runs</div>
+        <div class="sidebar-search">
+          <input id="run-search-input" placeholder="Search runs" oninput="updateRunSearch(this.value)">
+        </div>
+        <div id="run-list" class="run-list"></div>
+      </div>
+      <div class="sidebar-footer">
+        <button class="btn-settings" onclick="openSettingsModal()">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+          <span>Global settings</span>
+        </button>
+      </div>
+    </aside>
+    <main id="main-area">
+      <div class="empty-state mission-shell">
+        <div class="mission-hero">
+          <div class="mission-kicker">Har-Nessie</div>
+          <h3>A harness for long-running work grounded in docs and memory</h3>
+          <p>If you already have a repo or docs, start with a project and let analysis draft the first run for you.</p>
+          <div class="mission-manifesto">
+            <span>Surfacing your deep issues.</span>
+            <span>Proof over vibes.</span>
+            <span>Docs become the next run.</span>
+          </div>
+          <div class="mission-actions">
+            <button class="primary" onclick="openCreateProjectModal()">Start with a project</button>
+            <button class="secondary-btn" onclick="openCreateModal()">Quick run</button>
+          </div>
+        </div>
+        <div class="mission-grid">
+          <div class="mission-card">
+            <strong>Docs stay in play</strong>
+            <span>Specs, plans, and notes feed the first run and the next one after it.</span>
+          </div>
+          <div class="mission-card">
+            <strong>Work keeps moving</strong>
+            <span>Phases, memory, and carry-over work stay connected across runs.</span>
+          </div>
+          <div class="mission-card">
+            <strong>Proof and recovery included</strong>
+            <span>Failure reasons, verification evidence, and retry paths stay visible to the operator.</span>
+          </div>
+        </div>
+        <div class="mission-usecases">
+          <div class="mission-usecase">
+            <strong>Docs-heavy products</strong>
+            <span>Keep moving through phases using specs, ops docs, and requirements PDFs.</span>
+          </div>
+          <div class="mission-usecase">
+            <strong>Research and content work</strong>
+            <span>Accumulate notes and references into the next run draft and project memory.</span>
+          </div>
+          <div class="mission-usecase">
+            <strong>Internal ops repos</strong>
+            <span>Manage policy-heavy repositories as long-running projects.</span>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Create Run Modal -->
+  <div id="create-modal" class="modal-overlay">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>Create a run</h3>
+        <button class="ghost" onclick="closeCreateModal()">&times;</button>
+      </div>
+      <form id="run-form">
+        <div class="modal-body">
+          <div class="form-note">
+            To start, the project folder and a plain-language goal are enough. If details are missing, Codex can narrow the scope with follow-up questions. Fill the advanced fields only when you want tighter control.
+          </div>
+          <div id="create-run-context" class="form-note" style="display:none"></div>
+          <div class="form-grid">
+            <div class="form-group">
+              <label>Run name (optional)</label>
+              <input id="run-title-input" name="title" placeholder="For example: onboarding-flow">
+              <div class="helper-text">Leave it blank to auto-name the run from the folder or goal.</div>
+            </div>
+            <div class="form-group">
+              <label>Project folder</label>
+              <div class="picker-row">
+                <input name="projectPath" id="project-path-input" placeholder="C:\\path\\to\\repo" required>
+                <button type="button" class="secondary-btn" onclick="pickProjectFolder()">Browse</button>
+              </div>
+            </div>
+            <div class="form-group full">
+              <label>What should this run change?</label>
+              <textarea id="run-objective-input" name="objective" required placeholder="Describe the desired result in one short paragraph."></textarea>
+              <div class="helper-text">A sentence or two about who it is for and what should exist at the end is usually enough.</div>
+            </div>
+          </div>
+          <details class="advanced-settings">
+            <summary>Add more detail if needed</summary>
+            <div class="advanced-body">
+              <div class="form-note">
+                These fields are optional. More detail usually means a better first plan.
+              </div>
+              <div class="form-grid">
+                <div class="form-group">
+                  <label>Success criteria</label>
+                  <textarea id="run-success-criteria-input" name="successCriteria" placeholder="For example: the user reaches the first screen within three steps"></textarea>
+                </div>
+                <div class="form-group">
+                  <label>Excluded scope</label>
+                  <textarea id="run-excluded-scope-input" name="excludedScope" placeholder="For example: no visual redesign, no admin changes"></textarea>
+                </div>
+                <div class="form-group">
+                  <label>Target users</label>
+                  <textarea id="run-target-users-input" name="targetUsers" placeholder="For example: first-time operators, end users"></textarea>
+                </div>
+                <div class="form-group">
+                  <label>Example input / output</label>
+                  <textarea id="run-example-io-input" name="exampleIO" placeholder="For example: CSV upload -> validated customer list"></textarea>
+                </div>
+                <div class="form-group full">
+                  <label>Protected areas</label>
+                  <textarea id="run-protected-areas-input" name="protectedAreas" placeholder="For example: auth, billing, existing public API format"></textarea>
+                </div>
+                <div class="form-group full">
+                  <label>Spec file paths (one per line)</label>
+                  <textarea id="run-spec-files-input" name="specFiles" placeholder="md, txt, json, pdf are supported when possible"></textarea>
+                </div>
+              </div>
+            </div>
+          </details>
+          <details class="advanced-settings">
+            <summary>Advanced run settings</summary>
+            <div class="advanced-body">
+              <div class="form-note">
+                Most people should leave these at the defaults. Change them only if you want to tune parallelism or retry policy.
+              </div>
+              <div class="form-group">
+                <label>Preset</label>
+                <select id="run-preset-input" name="presetId">
+                  <option value="auto">Auto (recommended)</option>
+                  <option value="existing-repo-feature">Existing Repo Feature</option>
+                  <option value="existing-repo-bugfix">Existing Repo Bugfix</option>
+                  <option value="greenfield-app">Greenfield App</option>
+                  <option value="refactor-stabilize">Refactor and Stabilize</option>
+                  <option value="docs-spec-first">Docs and Spec First</option>
+                </select>
+                <div class="helper-text">Auto is enough for most runs. Change it only when the work type is obvious.</div>
+              </div>
+                <div class="form-group">
+                  <label>Max parallel tasks</label>
+                  <input id="run-max-parallel-input" type="number" name="maxParallel" value="1">
+                </div>
+              <div class="form-group">
+                <label>Max task retries</label>
+                <input id="run-max-task-attempts-input" type="number" name="maxTaskAttempts" value="2" min="1">
+              </div>
+              <div class="form-group">
+                <label>Max goal loops</label>
+                <input id="run-max-goal-loops-input" type="number" name="maxGoalLoops" value="3" min="1">
+              </div>
+            </div>
+          </details>
+          <div id="draft-diagnostics" class="inline-diagnostics" style="display:none"></div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" onclick="closeCreateModal()">Cancel</button>
+          <button type="button" class="secondary-btn" onclick="diagnoseDraft()">Diagnose input</button>
+          <button type="submit" class="primary">Create run</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="create-project-modal" class="modal-overlay">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>Create a project</h3>
+        <button class="ghost" onclick="closeCreateProjectModal()">&times;</button>
+      </div>
+      <form id="project-form">
+        <div class="modal-body">
+          <div class="form-note">
+            A project is the long-running container for big work. If you already have a repo or docs, use Project Analysis first instead of filling everything by hand.
+          </div>
+          <div class="form-grid">
+            <div class="form-group">
+              <label>Project name</label>
+              <input id="project-title-input" name="title" placeholder="For example: write_claw" required>
+            </div>
+            <div class="form-group">
+              <label>Project root folder</label>
+              <div class="picker-row">
+                <input name="rootPath" id="project-root-input" placeholder="C:\\path\\to\\repo" required>
+                <button type="button" class="secondary-btn" onclick="pickProjectRootFolder()">Browse</button>
+              </div>
+            </div>
+            <div class="form-group full">
+              <label>Project charter / purpose</label>
+              <textarea id="project-charter-input" name="charterText" placeholder="Describe what this project is for and what it should protect."></textarea>
+            </div>
+            <div class="form-group">
+              <label>Default preset</label>
+              <select id="project-default-preset-input" name="defaultPresetId">
+                <option value="auto">Auto (recommended)</option>
+                <option value="existing-repo-feature">Existing Repo Feature</option>
+                <option value="existing-repo-bugfix">Existing Repo Bugfix</option>
+                <option value="greenfield-app">Greenfield App</option>
+                <option value="refactor-stabilize">Refactor and Stabilize</option>
+                <option value="docs-spec-first">Docs and Spec First</option>
+              </select>
+            </div>
+            <div class="form-group full">
+              <div class="checkbox-row">
+                <input type="checkbox" id="bootstrap-project-docs" name="bootstrapRepoDocs">
+                <label for="bootstrap-project-docs">Create starter docs</label>
+                <div class="helper-text">When enabled, the app writes starter AGENTS/ARCHITECTURE/docs files into the repo. Leave it off for an existing repo with docs.</div>
+              </div>
+            </div>
+            <div class="form-group full">
+              <details class="advanced-settings">
+                <summary>Set the first phase manually (optional)</summary>
+                <div class="advanced-body">
+                  <div class="helper-text" style="margin-top: 16px;">Use this only when you already know the first phase. For an existing repo, leaving it blank and following Project Analysis is usually safer.</div>
+                  <div class="form-grid" style="margin-top: 16px;">
+                    <div class="form-group">
+                      <label>First phase title</label>
+                      <input id="project-phase-title-input" name="phaseTitle" placeholder="For example: Phase 1 · foundation">
+                    </div>
+                    <div class="form-group full">
+                      <label>First phase goal</label>
+                      <textarea id="project-phase-goal-input" name="phaseGoal" placeholder="For example: stabilize restart flow, starter docs, and validation basics"></textarea>
+                    </div>
+                  </div>
+                </div>
+              </details>
+            </div>
+          </div>
+          <div id="project-intake-results" class="project-intake-results" style="display:none"></div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" onclick="closeCreateProjectModal()">Cancel</button>
+          <div id="project-footer-hint" class="helper-text" style="margin: 0 auto 0 0; display: none;"></div>
+          <button type="button" id="project-analyze-btn" class="secondary-btn" onclick="analyzeProjectIntakeDraft()">Project analysis</button>
+          <button type="button" id="project-create-only-btn" class="secondary-btn" style="display:none;">Create project only</button>
+          <button type="submit" id="project-submit-btn" class="primary">Create project only</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Settings Modal -->
+  <div id="settings-modal" class="modal-overlay">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>Local harness settings</h3>
+        <button class="ghost" onclick="closeSettingsModal()">&times;</button>
+      </div>
+      <form id="harness-settings-form">
+        <div class="modal-body">
+          <div class="form-note">
+            These settings are stored only in <code>.harness-web/settings.json</code> on this machine. They do not change repo files. They only shape the default behavior of future runs.
+          </div>
+          <div class="form-group">
+            <div class="checkbox-row">
+              <input type="checkbox" id="include-global-agents" checked>
+              <label for="include-global-agents">Include machine-wide guidance</label>
+            </div>
+            <div class="helper-text">Recommended. This includes a summary of your machine-wide AGENTS.md guidance.</div>
+          </div>
+          <div class="form-group">
+            <div class="checkbox-row">
+              <input type="checkbox" id="include-karpathy" checked>
+              <label for="include-karpathy">Include coding safety guidance</label>
+            </div>
+            <div class="helper-text">Recommended. This adds conservative coding guidance to reduce unsafe changes.</div>
+          </div>
+          <div class="form-group">
+            <label>Extra rules for this machine</label>
+            <textarea id="custom-constitution" placeholder="For example: docs-first, never touch auth/payment"></textarea>
+            <div class="helper-text">Only put in short rules you want applied often. Leave blank if unsure.</div>
+          </div>
+          <div class="form-group">
+            <label>Advanced: planning strategy</label>
+            <textarea id="planner-strategy" placeholder="For example: reproduce bugs before fixing them"></textarea>
+            <div class="helper-text">Advanced. Leave blank if unsure.</div>
+          </div>
+          <div class="form-group">
+            <label>Advanced: team strategy</label>
+            <textarea id="team-strategy" placeholder="For example: use a stricter spec-locker and verifier on new domains"></textarea>
+            <div class="helper-text">Advanced. Leave blank if unsure.</div>
+          </div>
+          <div class="form-group">
+            <label>Planning and review provider</label>
+            <select id="coordination-provider">
+              <option value="codex">Codex</option>
+              <option value="claude">Claude Code CLI</option>
+              <option value="gemini">Gemini CLI</option>
+            </select>
+            <div class="helper-text">Pick whichever CLI you have installed. All three work.</div>
+          </div>
+          <div class="form-group">
+            <label>Implementation provider</label>
+            <select id="worker-provider">
+              <option value="codex">Codex</option>
+              <option value="claude">Claude Code CLI</option>
+              <option value="gemini">Gemini CLI</option>
+            </select>
+            <div class="helper-text">Can be the same as or different from the planning provider.</div>
+          </div>
+          <div class="form-group">
+            <label>Codex runtime profile</label>
+            <select id="codex-runtime-profile">
+              <option value="yolo">Go now · full access without approval</option>
+              <option value="full-auto">Approval requested · workspace write</option>
+              <option value="safe">Read-only · safe mode</option>
+            </select>
+            <div class="form-note" style="margin-top:8px;">
+              The default is <code>Go now</code>. Most people should leave it there unless they want a more conservative mode.
+            </div>
+          </div>
+          <div class="form-group">
+            <label>UI language</label>
+            <select id="ui-language">
+              <option value="en">English</option>
+              <option value="ko">한국어</option>
+            </select>
+            <div class="helper-text">English is the default public UI language.</div>
+          </div>
+          <div class="form-group">
+            <label>Agent response language</label>
+            <select id="agent-language">
+              <option value="en">English</option>
+              <option value="ko">한국어</option>
+            </select>
+            <div class="helper-text">English is the default for user-facing agent summaries unless you choose otherwise.</div>
+          </div>
+          <details class="advanced-settings">
+            <summary>Advanced: per-provider notes and model overrides</summary>
+            <div class="advanced-body">
+              <div class="form-note">
+                Defaults are usually fine. Only expand this if you want to fine-tune a specific provider.
+              </div>
+              <div class="form-group">
+                <label>Codex notes</label>
+                <textarea id="codex-notes" placeholder="e.g. minimal changes, no edits outside scope"></textarea>
+                <div class="helper-text">Short standing note appended to every Codex prompt. Leave empty if not needed.</div>
+              </div>
+              <div class="form-group">
+                <label>Claude notes</label>
+                <textarea id="claude-notes" placeholder="e.g. planning and review only"></textarea>
+                <div class="helper-text">Only relevant if you are using Claude Code.</div>
+              </div>
+              <div class="form-group">
+                <label>Gemini notes</label>
+                <textarea id="gemini-notes" placeholder="e.g. implementation role, verify first"></textarea>
+                <div class="helper-text">Only relevant if you are using Gemini CLI.</div>
+              </div>
+              <div class="form-group">
+                <label>Claude model override</label>
+                <input id="claude-model" placeholder="e.g. claude-sonnet-4-5">
+              </div>
+              <div class="form-group">
+                <label>Gemini model override</label>
+                <input id="gemini-model" placeholder="e.g. gemini-2.5-flash">
+              </div>
+              <div class="form-group full">
+                <label>Gemini project ID</label>
+                <input id="gemini-project-id" placeholder="e.g. c-gemini-admin">
+                <div class="helper-text">Leave empty if you are not using Gemini CLI.</div>
+              </div>
+            </div>
+          </details>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="secondary-btn" onclick="closeSettingsModal()">Close</button>
+          <button type="submit" class="primary">Save settings</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="plan-edit-modal" class="modal-overlay">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>Edit Plan</h3>
+        <button class="ghost" onclick="closePlanEditModal()">&times;</button>
+      </div>
+      <form id="plan-edit-form">
+        <div class="modal-body">
+          <div class="form-note">
+            The goal is locked. Edit the plan summary, agents, and tasks before execution starts.
+          </div>
+          <div class="form-group">
+            <label>Plan summary</label>
+            <textarea id="plan-edit-summary" placeholder="Plan summary"></textarea>
+          </div>
+          <div class="form-group">
+            <label>Execution model</label>
+            <textarea id="plan-edit-execution-model" placeholder="e.g. Codex-specialized agents plan, implement, review, and judge completion."></textarea>
+          </div>
+          <div class="form-group">
+            <div style="display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px;">
+              <label style="margin:0;">Agents</label>
+              <button type="button" class="secondary-btn" onclick="addPlanAgent()">Add agent</button>
+            </div>
+            <div id="plan-edit-agents-list" class="stack-list"></div>
+          </div>
+          <div class="form-group">
+            <div style="display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px;">
+              <label style="margin:0;">Tasks</label>
+              <button type="button" class="secondary-btn" onclick="addPlanTask()">Add task</button>
+            </div>
+            <div id="plan-edit-tasks-list" class="stack-list"></div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="secondary-btn" onclick="closePlanEditModal()">Close</button>
+          <button type="submit" class="primary">Save plan</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="reject-plan-modal" class="modal-overlay">
+    <div class="modal" style="max-width: 640px;">
+      <div class="modal-header">
+        <h3>Request plan changes</h3>
+        <button class="ghost" onclick="closeRejectPlanModal()">&times;</button>
+      </div>
+      <form id="reject-plan-form">
+        <div class="modal-body">
+          <div class="form-note">Describe why the plan needs changes and what should be different.</div>
+          <div class="form-group">
+            <label>Feedback</label>
+            <textarea id="reject-plan-feedback" placeholder="e.g. Tasks are too large and the auth scope is too broad. Split out the reproduction step first."></textarea>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="secondary-btn" onclick="closeRejectPlanModal()">Cancel</button>
+          <button type="submit" class="danger">Request changes</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="skip-task-modal" class="modal-overlay">
+    <div class="modal" style="max-width: 640px;">
+      <div class="modal-header">
+        <h3>Skip task</h3>
+        <button class="ghost" onclick="closeSkipTaskModal()">&times;</button>
+      </div>
+      <form id="skip-task-form">
+        <div class="modal-body">
+          <div class="form-note">Recording why you are skipping this task helps with later review and log analysis.</div>
+          <div class="form-group">
+            <label>Reason for skipping</label>
+            <textarea id="skip-task-reason" placeholder="e.g. out of scope for this run, operator decision"></textarea>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="secondary-btn" onclick="closeSkipTaskModal()">Cancel</button>
+          <button type="submit" class="danger">Skip task</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Add Requirements Modal -->
+  <div id="addreq-modal" class="modal-overlay">
+    <div class="modal" style="max-width: 560px;">
+      <div class="modal-header">
+        <h3>Additional requirements (optional)</h3>
+        <button class="ghost" onclick="closeAddReqModal()">&times;</button>
+      </div>
+      <form id="addreq-form">
+        <div class="modal-body">
+          <div class="form-note">
+            Continuing from a previous run. Add any new requirements or changes to carry into this run. Leave empty to start or resume as-is.
+          </div>
+          <div class="form-group">
+            <label>Additional requirements</label>
+            <textarea id="addreq-text" placeholder="e.g. change button color to blue, update error messages"></textarea>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" onclick="closeAddReqModal()">Cancel</button>
+          <button type="submit" class="primary">Start / resume</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="global-banner" style="position:fixed; top:18px; right:18px; z-index:120; display:none; max-width:420px;"></div>
+
+  <script src="/app-helpers.js"></script>
+  <script src="/app-artifact-renderers.js"></script>
+  <script src="/app-project-renderers.js"></script>
+  <script src="/app-modal-actions.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

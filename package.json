@@ -1,0 +1,20 @@
+{
+  "name": "har-nessie",
+  "version": "1.0.0",
+  "description": "A local-first web harness for long-running AI project work. Surfacing your deep issues.",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning app/server.mjs",
+    "drill:live-ready": "node --disable-warning=ExperimentalWarning scripts/live-ready-drill.mjs",
+    "drill:corruption": "node --disable-warning=ExperimentalWarning scripts/live-ready-drill.mjs corruption",
+    "burn-in:real": "node --disable-warning=ExperimentalWarning scripts/real-burn-in.mjs",
+    "burn-in:real:full": "node --disable-warning=ExperimentalWarning scripts/real-burn-in.mjs --full",
+    "check": "node --check app/server.mjs && node --check app/orchestrator.mjs && node --check app/project-intel.mjs && node --check app/project-workflow.mjs && node --check app/project-health.mjs && node --check app/task-action-runtime.mjs && node --check app/harness-paths.mjs && node --check app/memory-store.mjs && node --check app/folder-picker.mjs && node --check public/app.js && node --check public/app-helpers.js && node --check public/app-artifact-renderers.js && node --check public/app-project-renderers.js && node --check public/app-modal-actions.js && node --check scripts/live-ready-drill.mjs && node --check scripts/real-burn-in.mjs",
+    "test": "node --disable-warning=ExperimentalWarning --test tests/*.test.mjs",
+    "validate": "npm run check && npm test"
+  }
+}

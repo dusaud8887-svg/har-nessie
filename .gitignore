@@ -1,0 +1,29 @@
+.DS_Store
+Thumbs.db
+node_modules/
+
+# claude code project settings (machine-local)
+.claude/
+
+# local harness machine settings
+.harness-web/settings.json
+
+# local run and project state
+runs/**
+!runs/.gitkeep
+projects/**
+!projects/.gitkeep
+memory/projects/**
+!memory/projects/.gitkeep
+
+# local logs or scratch files
+*.log
+
+# internal docs
+docs/**
+!docs/screenshots/
+!docs/screenshots/**
+
+# internal launch / promotion notes
+LAUNCH.md
+LAUNCH.kr.md
