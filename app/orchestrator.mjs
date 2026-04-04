@@ -67,6 +67,8 @@ const CLAUDE_TIMEOUT_MS = 12 * 60 * 1000;
 const GEMINI_TIMEOUT_MS = 12 * 60 * 1000;
 const COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_CAPTURED_PROCESS_OUTPUT_BYTES = 256 * 1024;
+const CODE_LIKE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.go', '.rs', '.java', '.cs', '.rb', '.php']);
+const CODE_DOMAIN_ROOTS = new Set(['src', 'app', 'server', 'lib', 'components', 'features', 'packages', 'tests']);
 const TASK_ARTIFACT_FILES = {
   prompt: { primary: 'agent-prompt.md', legacy: 'codex-prompt.md' },
   output: { primary: 'agent-output.md', legacy: 'codex-output.md' },
@@ -436,18 +438,50 @@ function normalizeFilesLikely(value) {
   const list = Array.isArray(value) ? value : [];
   const normalized = list
     .map((item) => {
-      const normalizedPath = String(item || '').trim().replace(/\\/g, '/');
+      const normalizedPath = String(item || '').trim().replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/$/, '');
       return process.platform === 'win32' ? normalizedPath.toLowerCase() : normalizedPath;
     })
     .filter(Boolean);
   return normalized.length ? [...new Set(normalized)] : ['*'];
 }
 
+function filesLikelyOverlap(leftPath, rightPath) {
+  if (!leftPath || !rightPath) return false;
+  if (leftPath === rightPath) return true;
+  return rightPath.startsWith(`${leftPath}/`) || leftPath.startsWith(`${rightPath}/`);
+}
+
+function pathExtension(value) {
+  return path.posix.extname(String(value || '').trim().replace(/\\/g, '/')).toLowerCase();
+}
+
+function isCodeLikePath(value) {
+  const normalized = String(value || '').trim().replace(/\\/g, '/');
+  if (!normalized) return false;
+  const parts = normalized.split('/').filter(Boolean);
+  if (CODE_DOMAIN_ROOTS.has(parts[0] || '')) return true;
+  return CODE_LIKE_EXTENSIONS.has(pathExtension(normalized));
+}
+
+function collisionDomainRoot(value) {
+  const normalized = String(value || '').trim().replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/$/, '');
+  if (!normalized || !isCodeLikePath(normalized)) return '';
+  const parts = normalized.split('/').filter(Boolean);
+  if (!parts.length) return '';
+  if (parts.length >= 2 && CODE_DOMAIN_ROOTS.has(parts[0])) {
+    return `${parts[0]}/${parts[1]}`;
+  }
+  return parts[0];
+}
+
 function tasksCollide(left, right) {
   const a = normalizeFilesLikely(left.filesLikely);
   const b = normalizeFilesLikely(right.filesLikely);
   if (a.includes('*') || b.includes('*')) return true;
-  return a.some((item) => b.includes(item));
+  if (a.some((item) => b.some((candidate) => filesLikelyOverlap(item, candidate)))) return true;
+  const aDomains = new Set(a.map(collisionDomainRoot).filter(Boolean));
+  const bDomains = new Set(b.map(collisionDomainRoot).filter(Boolean));
+  return [...aDomains].some((domain) => bDomains.has(domain));
 }
 
 function nextTaskId(tasks) {
@@ -1957,6 +1991,22 @@ function injectSyntheticTask(rawTasks, taskShape, position = 'prepend') {
   return position === 'prepend' ? [taskShape, ...rawTasks] : [...rawTasks, taskShape];
 }
 
+function injectLeadingGateTask(rawTasks, taskShape) {
+  return injectSyntheticTask(
+    rawTasks.map((task) => ({
+      ...task,
+      dependsOn: Array.isArray(task?.dependsOn) && task.dependsOn.length
+        ? task.dependsOn.map(String)
+        : ['__RAW_0']
+    })),
+    {
+      ...taskShape,
+      dependsOn: Array.isArray(taskShape?.dependsOn) ? taskShape.dependsOn.map(String) : []
+    },
+    'prepend'
+  );
+}
+
 function hasMultiDependencyTask(tasks) {
   return tasks.some((task) => Array.isArray(task.dependsOn) && task.dependsOn.length >= 2);
 }
@@ -2108,6 +2158,7 @@ function planHasDiagnosisTask(rawTasks) {
 export function applyPlanPolicy(run, parsed) {
   let rawTasks = Array.isArray(parsed.tasks) ? parsed.tasks.map((item) => ({ ...item })) : [];
   const pattern = String(run.clarify?.architecturePattern || 'pipeline').trim() || 'pipeline';
+  const worktreeEligible = run?.preflight?.project?.worktreeEligible !== false;
   const policy = {
     ...defaultExecutionPolicy(run.profile),
     pattern
@@ -2125,13 +2176,17 @@ export function applyPlanPolicy(run, parsed) {
   } else {
     policy.parallelMode = 'sequential';
   }
+  if (policy.parallelMode === 'parallel' && !worktreeEligible) {
+    policy.parallelMode = 'sequential';
+    policy.policyNotes.push('Parallel execution was downgraded because isolated worktrees are unavailable for this repo state.');
+  }
 
   if (run?.profile?.diagnosisFirst && !planLooksDocsOnly(rawTasks) && !planHasDiagnosisTask(rawTasks)) {
     const fileBudget = Number(run?.profile?.fileBudget || 0);
     const needsDiagnosis = (run?.preset?.id || '') === 'greenfield-app'
       || rawTasks.some((task) => taskNeedsDiagnosis(task, fileBudget));
     if (needsDiagnosis) {
-      rawTasks = injectSyntheticTask(rawTasks, {
+      rawTasks = injectLeadingGateTask(rawTasks, {
         title: 'Diagnose current phase scope and lock implementation boundaries',
         goal: 'Narrow down the current phase goal, excluded scope, and concrete filesLikely before handing off to implementation tasks.',
         dependsOn: [],
@@ -2158,7 +2213,7 @@ export function applyPlanPolicy(run, parsed) {
   if ((run.preset?.id || 'auto') === 'existing-repo-bugfix') {
     policy.parallelMode = 'sequential';
     if (!rawTasks.some((task) => taskContainsText(task, ['reproduce', 'regression', 'failing', 'test']))) {
-      rawTasks = injectSyntheticTask(rawTasks, {
+      rawTasks = injectLeadingGateTask(rawTasks, {
         title: 'Reproduce the bug before implementation',
         goal: 'Identify a failing check, reproduction path, or precise before-state for the reported bug before changing behavior.',
         dependsOn: [],
@@ -2172,9 +2227,8 @@ export function applyPlanPolicy(run, parsed) {
   }
 
   if ((run.preset?.id || 'auto') === 'docs-spec-first') {
-    policy.parallelMode = 'sequential';
     if (!rawTasks.some((task) => taskContainsText(task, ['spec', 'acceptance', 'doc', 'docs', 'requirements']))) {
-      rawTasks = injectSyntheticTask(rawTasks, {
+      rawTasks = injectLeadingGateTask(rawTasks, {
         title: 'Lock the spec and acceptance criteria',
         goal: 'Clarify the spec, acceptance criteria, and excluded scope before implementation begins.',
         dependsOn: [],
@@ -2429,6 +2483,9 @@ function buildHarnessGuidanceLines(harnessConfig, target, provider = 'codex') {
   }
   if (target === 'planner') {
     lines.push(`Default provider profile: coordination=${providerDisplayName(harnessConfig?.coordinationProvider || 'codex')} | worker=${providerDisplayName(harnessConfig?.workerProvider || 'codex')}`);
+    if (provider === 'codex') {
+      lines.push('Planner policy: prefer small, dependency-aware task graphs over wide speculative fan-out.');
+    }
   }
   const providerNotes = resolveProviderNotes(harnessConfig, provider);
   if (providerNotes) {
@@ -2443,6 +2500,67 @@ function preferredUserFacingLanguage(harnessConfig) {
 
 function writeInPreferredLanguageRule(harnessConfig, fieldsDescription) {
   return `${fieldsDescription} in ${preferredUserFacingLanguage(harnessConfig)} unless the repository and user input clearly require another language.`;
+}
+
+function plannerTaskSizingRule(run) {
+  const fileBudget = Number(run?.profile?.fileBudget || 0);
+  if ((run?.preset?.id || '') === 'docs-spec-first') {
+    return `- For docs/spec alignment tasks, keep each task inside the active file budget (${fileBudget || 4} filesLikely). Prefer 1-2 files, but allow up to the budget when the docs must move as one tightly related bundle.`;
+  }
+  return '- Each task should usually touch only 1 file, and at most 2-3 files when tightly related.';
+}
+
+function plannerParallelRule(run, policy) {
+  const maxParallel = Number(run?.profile?.maxParallel || run?.settings?.maxParallel || 1);
+  const worktreeEligible = run?.preflight?.project?.worktreeEligible !== false;
+  if (!worktreeEligible) {
+    return '- Shared-workspace fallback is active. Plan sequentially even if the preset normally allows limited parallelism.';
+  }
+  if ((policy?.parallelMode || 'sequential') === 'parallel') {
+    return `- Parallelize only when filesLikely are clearly disjoint. Keep the runnable batch small (at most ${maxParallel} tasks at a time).`;
+  }
+  return '- Parallelize only when filesLikely are clearly disjoint.';
+}
+
+function presetPolicyBaseline(run) {
+  switch (run?.preset?.id || 'auto') {
+    case 'docs-spec-first':
+      return {
+        constitution: 'Keep docs and acceptance criteria as the source of record for the current phase. Prefer doc-bundle alignment before broad implementation, and only use limited parallelism on clean worktrees.',
+        planner: 'Start with the smallest scope-locking or doc-alignment slice. Group tightly related docs when they must move together, but keep parallel batches small and disjoint.',
+        team: 'Lean on spec-locker and verifier to lock scope and evidence before treating the phase as ready for implementation.'
+      };
+    case 'existing-repo-bugfix':
+      return {
+        constitution: 'Preserve current behavior until a failing path is reproduced. Favor the smallest safe diff that closes the bug and its regression check.',
+        planner: 'Make reproduction or before-state capture explicit before the fix. Keep the graph sequential unless the validation path is clearly independent.',
+        team: 'Use a strong bug reproducer and verifier pairing. Do not fan out implementation before the failing path is pinned down.'
+      };
+    case 'existing-repo-feature':
+      return {
+        constitution: 'Extend the current repo in bounded slices. Preserve adjacent behavior and docs contracts while landing only the requested feature scope.',
+        planner: 'Split work by disjoint subsystems or filesLikely sets. Add explicit verification whenever behavior changes.',
+        team: 'Keep planning and review on the coordination provider, with implementation parallelism only for truly disjoint slices.'
+      };
+    case 'refactor-stabilize':
+      return {
+        constitution: 'Preserve behavior while restructuring. Prefer reversible slices and keep verification close to each refactor step.',
+        planner: 'Use smaller sequential tasks than feature work, and keep acceptance checks focused on unchanged observable behavior.',
+        team: 'Bias toward verifier-heavy loops and avoid wide parallel refactors in the same subsystem.'
+      };
+    case 'greenfield-app':
+      return {
+        constitution: 'Lock architecture and boundaries before broad build-out. Grow the app in staged slices with explicit validation per slice.',
+        planner: 'Insert diagnosis or scaffold-locking work before broad implementation when the subsystem map is still uncertain.',
+        team: 'Use planner/integrator structure to keep greenfield fan-out coherent, but do not skip the initial scoping pass.'
+      };
+    default:
+      return {
+        constitution: 'Keep the run scoped to the current objective and phase slice, with the smallest safe diff and explicit verification.',
+        planner: 'Prefer dependency-aware task graphs over speculative breadth. Only parallelize when the scope is clearly disjoint.',
+        team: 'Keep planning and review conservative by default, and let implementation fan out only when the file boundaries are stable.'
+      };
+  }
 }
 
 function buildProjectPromptLines(run) {
@@ -2474,6 +2592,7 @@ function buildProjectPromptLines(run) {
 function buildHarnessGuidanceDocument(run) {
   const teamBlueprint = run.harnessConfig?.teamBlueprint || deriveTeamBlueprint(run);
   const executionPolicy = run.executionPolicy || defaultExecutionPolicy(run.profile);
+  const presetBaseline = presetPolicyBaseline(run);
   const providerProfile = resolveRunProviderProfile(run);
   const lines = [
     '# Harness Guidance',
@@ -2529,6 +2648,11 @@ function buildHarnessGuidanceDocument(run) {
   } else {
     lines.push('- No custom constitution set in local web settings.', '');
   }
+
+  lines.push('## Preset Baseline', '');
+  lines.push(`- Constitution: ${presetBaseline.constitution}`);
+  lines.push(`- Planner: ${presetBaseline.planner}`);
+  lines.push(`- Team: ${presetBaseline.team}`, '');
 
   lines.push('## Effective Prompt Sources', '');
   if (run.harnessConfig?.promptSourceReport?.precedence) {
@@ -3432,6 +3556,7 @@ async function applyTaskPatch(run, currentTaskDir) {
 function buildPlannerPrompt(run, memory, provider = 'codex') {
   const clarify = run.clarify || {};
   const policy = run.executionPolicy || defaultExecutionPolicy(run.profile);
+  const presetBaseline = presetPolicyBaseline(run);
   const teamBlueprint = run.harnessConfig?.teamBlueprint || deriveTeamBlueprint(run);
   const providerName = providerDisplayName(provider);
   return [
@@ -3460,6 +3585,9 @@ function buildPlannerPrompt(run, memory, provider = 'codex') {
     `File budget per task: ${run.profile?.fileBudget ?? '-'}`,
     `Diagnosis-first: ${run.profile?.diagnosisFirst === false ? 'optional' : 'required'}`,
     `Fresh session threshold: ${run.profile?.freshSessionThreshold || '-'}`,
+    `Preset baseline constitution: ${presetBaseline.constitution}`,
+    `Preset baseline planner stance: ${presetBaseline.planner}`,
+    `Preset baseline team stance: ${presetBaseline.team}`,
     `Suggested starter team blueprint: ${JSON.stringify(teamBlueprint)}`,
     '',
     'Return JSON only with this shape:',
@@ -3482,7 +3610,7 @@ function buildPlannerPrompt(run, memory, provider = 'codex') {
     '- Keep planning/review/judgment roles on the coordination provider by default, and keep implementer on the worker provider unless there is a strong reason not to.',
     '- Prefer 2-8 initial tasks.',
     writeInPreferredLanguageRule(run.harnessConfig, 'Write summary, executionModel, agent roles/responsibilities, task titles, goals, constraints, and acceptanceChecks'),
-    '- Each task should usually touch only 1 file, and at most 2-3 files when tightly related.',
+    plannerTaskSizingRule(run),
     '- If a task likely needs more than ~200 LOC of changes or spans multiple subsystems, split it into smaller sequential tasks.',
     '- When filesLikely are uncertain or the subsystem is unfamiliar, create a diagnosis/read-only task first before implementation.',
     '- Do not create a separate implementation task for pure read-only verification when the verifier can decide it directly.',
@@ -3491,7 +3619,7 @@ function buildPlannerPrompt(run, memory, provider = 'codex') {
     '- Bad acceptance check: "error handling works correctly" or "API behaves well".',
     '- If the plan changes executable code and the repository exposes validation commands, include an explicit mechanical verification step or a read-only verification task.',
     '- Follow the preferred harness pattern unless the task graph strongly requires another one.',
-    '- Parallelize only when filesLikely are clearly disjoint.',
+    plannerParallelRule(run, policy),
     '- Continue from the latest unresolved state instead of re-describing already completed work.',
     run.project ? '- This run is scoped to the current project phase only. Do not plan the whole product; create tasks only for this phase slice.' : '- Scope the tasks to the current run objective only.',
     '- No markdown, no prose outside JSON.'
@@ -6700,13 +6828,17 @@ export async function createRun(input) {
   const projectDefaultSettings = attachedProject?.defaultSettings && typeof attachedProject.defaultSettings === 'object'
     ? attachedProject.defaultSettings
     : {};
+  const profileInputSettings = {
+    ...projectDefaultSettings,
+    ...rawInputSettings
+  };
   const mergedInputSettings = {
     ...DEFAULT_SETTINGS,
     ...projectDefaultSettings,
     ...rawInputSettings
   };
   const toolProfile = normalizeToolProfile(input.toolProfile || attachedProject?.defaultSettings?.toolProfile);
-  const runProfile = buildRunProfile(selectedPreset, mergedInputSettings);
+  const runProfile = buildRunProfile(selectedPreset, profileInputSettings);
   const runOperationDefaults = getRunOperationDefaults(selectedPreset.id || 'auto');
   const effectiveProviderProfile = normalizeProviderProfile(input.providerProfile || attachedProject?.defaultSettings?.providerProfile, harnessSettings) || {
     coordinationProvider: normalizeAgentProvider(harnessSettings.coordinationProvider, DEFAULT_HARNESS_SETTINGS.coordinationProvider),

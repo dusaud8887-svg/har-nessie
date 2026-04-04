@@ -626,10 +626,10 @@ test('project-backed runs include a continuation pack from recent docs and carry
     const projectSummary = await fs.readFile(path.join(root, 'runs', secondRun.id, 'context', 'project-summary.md'), 'utf8');
 
     assert.match(specBundle, /## Continuation Pack/);
-    assert.match(specBundle, /Auto-prepare suggested draft/);
+    assert.match(specBundle, /(Auto-prepare suggested draft|권장 초안 자동 준비)/);
     assert.match(specBundle, /docs\/spec\.md/);
     assert.match(specBundle, /foundation-doc-sync/);
-    assert.match(specBundle, /source-of-record docs or specs/);
+    assert.match(specBundle, /(source-of-record docs or specs|source-of-record 문서나 spec)/);
 
     assert.match(projectSummary, /## Active continuation pack/);
     assert.match(projectSummary, /Carry-over focus/);
@@ -1857,6 +1857,29 @@ test('applyPlanPolicy injects diagnosis-first scoping work for broad greenfield 
   assert.equal(policy.parallelMode, 'sequential');
 });
 
+test('applyPlanPolicy gates synthetic diagnosis work before parallel implementation tasks', () => {
+  const { rawTasks, policy } = applyPlanPolicy({
+    preset: { id: 'greenfield-app' },
+    profile: { flowProfile: 'hybrid', taskBudget: 8, fileBudget: 2, diagnosisFirst: true, freshSessionThreshold: '75m' },
+    clarify: { architecturePattern: 'fan-out/fan-in' },
+    projectContext: { validationCommands: ['npm test'] },
+    preflight: { project: { worktreeEligible: true } }
+  }, {
+    tasks: [{
+      title: '앱 기본 구조를 한 번에 만든다',
+      goal: 'routing, state, editor shell을 모두 만든다',
+      dependsOn: [],
+      filesLikely: ['src/app.tsx', 'src/router.tsx', 'src/editor.tsx'],
+      constraints: ['초기 구조를 잡는다'],
+      acceptanceChecks: ['앱이 실행된다']
+    }]
+  });
+
+  assert.equal(policy.parallelMode, 'parallel');
+  assert.equal(rawTasks[0].title, 'Diagnose current phase scope and lock implementation boundaries');
+  assert.deepEqual(rawTasks[1].dependsOn, ['__RAW_0']);
+});
+
 test('evaluateFreshSessionState recommends a fresh run after threshold crossings', () => {
   const result = evaluateFreshSessionState({
     createdAt: new Date(Date.now() - (91 * 60 * 1000)).toISOString(),
@@ -1889,6 +1912,60 @@ test('applyPlanPolicy skips verification nudge for docs-only plans', () => {
 
   assert.equal(policy.verificationNudgeNeeded, false);
   assert.equal(rawTasks.some((task) => task.title === 'Verify the integrated changes mechanically'), false);
+});
+
+test('applyPlanPolicy keeps docs-first runs parallel on clean worktrees', () => {
+  const { policy } = applyPlanPolicy({
+    preset: { id: 'docs-spec-first' },
+    profile: { flowProfile: 'hybrid', taskBudget: 6, fileBudget: 4, diagnosisFirst: true, freshSessionThreshold: '120m' },
+    clarify: { architecturePattern: 'fan-out/fan-in' },
+    projectContext: { validationCommands: ['npm test'] },
+    preflight: { project: { worktreeEligible: true } }
+  }, {
+    tasks: [
+      {
+        title: 'Align contributor entrypoint',
+        goal: 'Point contributors to the current landing document',
+        dependsOn: [],
+        filesLikely: ['docs/README.md'],
+        constraints: ['Document only'],
+        acceptanceChecks: ['Landing document points to the current flow']
+      },
+      {
+        title: 'Refresh reference landing page',
+        goal: 'Keep the reference landing page aligned with the current structure',
+        dependsOn: [],
+        filesLikely: ['docs/references/README.md'],
+        constraints: ['Document only'],
+        acceptanceChecks: ['Reference landing page matches the active structure']
+      }
+    ]
+  });
+
+  assert.equal(policy.parallelMode, 'parallel');
+  assert.ok(policy.policyNotes.some((item) => /Hybrid flow profile/i.test(item)));
+});
+
+test('applyPlanPolicy downgrades docs-first parallelism when worktree isolation is unavailable', () => {
+  const { policy } = applyPlanPolicy({
+    preset: { id: 'docs-spec-first' },
+    profile: { flowProfile: 'hybrid', taskBudget: 6, fileBudget: 4, diagnosisFirst: true, freshSessionThreshold: '120m' },
+    clarify: { architecturePattern: 'fan-out/fan-in' },
+    projectContext: { validationCommands: ['npm test'] },
+    preflight: { project: { worktreeEligible: false } }
+  }, {
+    tasks: [{
+      title: 'Align contributor entrypoint',
+      goal: 'Point contributors to the current landing document',
+      dependsOn: [],
+      filesLikely: ['docs/README.md'],
+      constraints: ['Document only'],
+      acceptanceChecks: ['Landing document points to the current flow']
+    }]
+  });
+
+  assert.equal(policy.parallelMode, 'sequential');
+  assert.ok(policy.policyNotes.some((item) => /isolated worktrees are unavailable/i.test(item)));
 });
 
 test('createRun defaults Codex execution settings', async () => {
@@ -1944,9 +2021,15 @@ test('createRun applies larger goal loop defaults for docs-first and greenfield 
       specFiles: ''
     });
     docsRunId = docsRun.id;
-    assert.equal(docsRun.settings.maxParallel, 1);
+    assert.equal(docsRun.settings.maxParallel, 2);
     assert.equal(docsRun.settings.maxTaskAttempts, 2);
     assert.equal(docsRun.settings.maxGoalLoops, 4);
+    assert.equal(docsRun.profile.flowProfile, 'hybrid');
+    assert.equal(docsRun.profile.fileBudget, 4);
+    const docsGuidance = await fs.readFile(path.join(root, 'runs', docsRun.id, 'context', 'harness-guidance.md'), 'utf8');
+    assert.match(docsGuidance, /## Preset Baseline/);
+    assert.match(docsGuidance, /Constitution: Keep docs and acceptance criteria as the source of record/);
+    assert.match(docsGuidance, /Planner: Start with the smallest scope-locking or doc-alignment slice/);
 
     const greenfieldRun = await createRun({
       title: 'greenfield-default-smoke',

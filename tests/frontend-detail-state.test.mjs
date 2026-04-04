@@ -1968,6 +1968,54 @@ test('project intake analysis prefills project form and opens a first-run draft'
   assert.match(document.getElementById('create-run-context').innerHTML, /프로젝트 분석 추천 초안/);
 });
 
+test('docs-first preset applies the higher parallel default in the create form', async () => {
+  const { context, document } = await createUiHarness();
+
+  document.getElementById('run-preset-input').value = 'docs-spec-first';
+  vm.runInContext(`applyRunPresetDefaults('docs-spec-first')`, context);
+
+  assert.equal(document.getElementById('run-max-parallel-input').value, '2');
+  assert.equal(document.getElementById('run-max-task-attempts-input').value, '2');
+  assert.equal(document.getElementById('run-max-goal-loops-input').value, '4');
+});
+
+test('parallel reason explains shared-workspace fallback and directory collisions', async () => {
+  const { context } = await createUiHarness();
+
+  const downgradedReason = vm.runInContext(`deriveParallelReason(${JSON.stringify({
+    tasks: [],
+    settings: { maxParallel: 2 },
+    profile: { flowProfile: 'hybrid' },
+    executionPolicy: { parallelMode: 'sequential' },
+    preflight: { project: { worktreeEligible: false } }
+  })})`, context);
+  assert.match(downgradedReason, /공유 워크스페이스 상태라 병렬 실행을 잠시 끄고 1개씩 진행합니다/);
+
+  const collisionReason = vm.runInContext(`deriveParallelReason(${JSON.stringify({
+    tasks: [
+      { id: 'T001', status: 'ready', dependsOn: [], filesLikely: ['docs/'], title: 'A' },
+      { id: 'T002', status: 'ready', dependsOn: [], filesLikely: ['docs/guide.md'], title: 'B' }
+    ],
+    settings: { maxParallel: 2 },
+    profile: { flowProfile: 'hybrid' },
+    executionPolicy: { parallelMode: 'parallel' },
+    preflight: { project: { worktreeEligible: true } }
+  })})`, context);
+  assert.match(collisionReason, /T001-T002/);
+
+  const subsystemReason = vm.runInContext(`deriveParallelReason(${JSON.stringify({
+    tasks: [
+      { id: 'T003', status: 'ready', dependsOn: [], filesLikely: ['src/auth/login.ts'], title: 'Login' },
+      { id: 'T004', status: 'ready', dependsOn: [], filesLikely: ['src/auth/session.ts'], title: 'Session' }
+    ],
+    settings: { maxParallel: 2 },
+    profile: { flowProfile: 'hybrid' },
+    executionPolicy: { parallelMode: 'parallel' },
+    preflight: { project: { worktreeEligible: true } }
+  })})`, context);
+  assert.match(subsystemReason, /T003-T004/);
+});
+
 test('draft diagnostics shows autonomy trust level and stronger input warnings', async () => {
   const { context, document, fetchStub } = await createUiHarness();
   document.getElementById('project-path-input').value = 'D:/repos/write_claw';
@@ -2061,6 +2109,9 @@ test('project intake can create a project and first run in one flow', async () =
   assert.equal(projectBody.phases?.[0]?.title, 'Project Intake');
   assert.equal(runBody.projectId, 'project-write-claw');
   assert.equal(runBody.presetId, 'docs-spec-first');
+  assert.equal(runBody.settings?.maxParallel, 2);
+  assert.equal(runBody.settings?.maxTaskAttempts, 2);
+  assert.equal(runBody.settings?.maxGoalLoops, 4);
   assert.match(runBody.specText, /성공 조건/);
   assert.equal(vm.runInContext('selectedRunId', context), 'run-write-claw-intake');
 });

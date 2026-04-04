@@ -1324,7 +1324,7 @@ let runs = [];
       'existing-repo-feature': { maxParallel: 1, maxTaskAttempts: 2, maxGoalLoops: 3 },
       'greenfield-app': { maxParallel: 1, maxTaskAttempts: 2, maxGoalLoops: 4 },
       'refactor-stabilize': { maxParallel: 1, maxTaskAttempts: 2, maxGoalLoops: 3 },
-      'docs-spec-first': { maxParallel: 1, maxTaskAttempts: 2, maxGoalLoops: 4 }
+      'docs-spec-first': { maxParallel: 2, maxTaskAttempts: 2, maxGoalLoops: 4 }
     };
 
     function getRunPresetFormDefaults(presetId) {
@@ -1653,18 +1653,53 @@ let runs = [];
       const tasks = Array.isArray(run.tasks) ? run.tasks : [];
       const doneIds = new Set(tasks.filter((task) => task.status === 'done' || task.status === 'skipped').map((task) => task.id));
       const ready = tasks.filter((task) => task.status === 'ready' && (task.dependsOn || []).every((dep) => doneIds.has(dep)));
+      const worktreeEligible = run.preflight?.project?.worktreeEligible !== false;
       if ((run.executionPolicy?.parallelMode || 'sequential') !== 'parallel') {
+        if (!worktreeEligible && ((run.profile?.flowProfile || 'sequential') === 'hybrid' || Number(run.settings?.maxParallel || 0) > 1)) {
+          return '공유 워크스페이스 상태라 병렬 실행을 잠시 끄고 1개씩 진행합니다.';
+        }
         return '현재 계획 패턴이 순차 실행이라 한 번에 1개씩 진행합니다.';
       }
       if (ready.length <= 1) {
         return ready.length ? '현재는 바로 실행 가능한 태스크가 1개뿐입니다.' : '현재는 선행 태스크나 실패 태스크 때문에 바로 실행 가능한 태스크가 없습니다.';
       }
-      const normalizeFiles = (list) => [...new Set((Array.isArray(list) ? list : []).map((item) => String(item || '').trim().replace(/\\\\/g, '/').toLowerCase()).filter(Boolean))];
+      const codeLikeExtensions = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.go', '.rs', '.java', '.cs', '.rb', '.php']);
+      const codeDomainRoots = new Set(['src', 'app', 'server', 'lib', 'components', 'features', 'packages', 'tests']);
+      const normalizeFiles = (list) => [...new Set((Array.isArray(list) ? list : []).map((item) => String(item || '').trim().replace(/\\\\/g, '/').replace(/\/+/g, '/').replace(/\/$/, '').toLowerCase()).filter(Boolean))];
+      const overlaps = (leftPath, rightPath) => {
+        if (!leftPath || !rightPath) return false;
+        if (leftPath === rightPath) return true;
+        return rightPath.startsWith(`${leftPath}/`) || leftPath.startsWith(`${rightPath}/`);
+      };
+      const extname = (value) => {
+        const normalized = String(value || '');
+        const index = normalized.lastIndexOf('.');
+        return index >= 0 ? normalized.slice(index).toLowerCase() : '';
+      };
+      const isCodeLike = (value) => {
+        const normalized = String(value || '').trim();
+        if (!normalized) return false;
+        const parts = normalized.split('/').filter(Boolean);
+        if (codeDomainRoots.has(parts[0] || '')) return true;
+        return codeLikeExtensions.has(extname(normalized));
+      };
+      const collisionDomainRoot = (value) => {
+        const normalized = String(value || '').trim();
+        if (!normalized || !isCodeLike(normalized)) return '';
+        const parts = normalized.split('/').filter(Boolean);
+        if (parts.length >= 2 && codeDomainRoots.has(parts[0])) {
+          return `${parts[0]}/${parts[1]}`;
+        }
+        return parts[0] || '';
+      };
       const collide = (left, right) => {
         const a = normalizeFiles(left.filesLikely);
         const b = normalizeFiles(right.filesLikely);
         if (a.includes('*') || b.includes('*')) return true;
-        return a.some((item) => b.includes(item));
+        if (a.some((item) => b.some((candidate) => overlaps(item, candidate)))) return true;
+        const aDomains = new Set(a.map(collisionDomainRoot).filter(Boolean));
+        const bDomains = new Set(b.map(collisionDomainRoot).filter(Boolean));
+        return [...aDomains].some((domain) => bDomains.has(domain));
       };
       const blockedPairs = [];
       for (let i = 0; i < ready.length; i += 1) {
@@ -1814,18 +1849,20 @@ let runs = [];
 
     function buildStarterRunPayload(project, intake) {
       const draft = intake?.starterRunDraft || {};
+      const presetId = draft.presetId || project?.defaultPresetId || 'auto';
+      const defaults = getRunPresetFormDefaults(presetId);
       return {
         title: draft.title || `${project?.title || 'project'}-intake`,
         projectId: project?.id || '',
         projectPath: intake?.rootPath || project?.rootPath || '',
-        presetId: draft.presetId || project?.defaultPresetId || 'auto',
+        presetId,
         objective: draft.objective || '',
         specText: buildStructuredSpecTextFromDraft(draft),
         specFiles: draft.specFilesText || '',
         settings: {
-          maxParallel: 1,
-          maxTaskAttempts: 2,
-          maxGoalLoops: 3
+          maxParallel: defaults.maxParallel,
+          maxTaskAttempts: defaults.maxTaskAttempts,
+          maxGoalLoops: defaults.maxGoalLoops
         }
       };
     }

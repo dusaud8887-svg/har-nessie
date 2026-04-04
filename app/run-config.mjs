@@ -132,10 +132,10 @@ export const RUN_PROFILE_DEFAULTS = {
     freshSessionThreshold: '2 failed replans or 60m'
   },
   'docs-spec-first': {
-    flowProfile: 'sequential',
-    maxParallel: 1,
+    flowProfile: 'hybrid',
+    maxParallel: 2,
     taskBudget: 6,
-    fileBudget: 3,
+    fileBudget: 4,
     diagnosisFirst: true,
     replanThreshold: 'phase-boundary',
     freshSessionThreshold: '120m'

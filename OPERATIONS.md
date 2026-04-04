@@ -57,6 +57,7 @@ Impact:
 
 - worktree isolation may be unavailable
 - tasks may run in the shared workspace instead
+- even if a preset prefers parallel execution, the live run may downgrade to one task at a time for safety
 
 Preferred fix:
 
@@ -134,3 +135,8 @@ Use:
   - more conservative
 - `Read-only`
   - best when you want inspection before edits
+
+Additional notes:
+
+- The `Docs and Spec First` preset can use limited parallelism (`2` tasks at a time) when the git repo is clean.
+- If the repo is dirty and falls back to the shared workspace, the same preset automatically downgrades to sequential execution.
