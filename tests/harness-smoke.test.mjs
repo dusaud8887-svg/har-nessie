@@ -1455,9 +1455,13 @@ test('buildTaskCodeContext returns related file symbols and references', async (
     });
 
     assert.match(context.summary, /src\/auth-service\.ts/);
+    assert.match(context.summary, /symbol graph edges/i);
     assert.ok(context.symbolHints.some((item) => item === 'buildAuthSession'));
     assert.ok(context.relatedFiles[0].symbols.some((item) => item.includes('buildAuthSession')));
     assert.ok(context.relatedFiles[0].references.some((item) => item.includes('buildToken')));
+    assert.equal(context.relatedFiles[0].codeGraph.imports[0].target, 'src/token-utils.ts');
+    assert.ok(context.relatedFiles[0].codeGraph.exports.includes('buildAuthSession'));
+    assert.ok(context.relatedFiles[0].codeGraph.importedSymbols.includes('buildToken'));
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -1713,6 +1717,30 @@ test('artifact memory writes manifest, summaries, and searchable records', async
       attempt: 1,
       completedAt: new Date().toISOString()
     }, null, 2), 'utf8');
+    await fs.mkdir(path.join(root, 'runs', run.id, 'context', 'code-context'), { recursive: true });
+    await fs.writeFile(path.join(root, 'runs', run.id, 'context', 'code-context', 'T001.json'), JSON.stringify({
+      schemaVersion: '2',
+      runId: run.id,
+      taskId: 'T001',
+      generatedAt: new Date().toISOString(),
+      summary: 'Top files: src/ui/login-form.tsx, src/auth/session-service.ts | symbol graph edges: 1',
+      queryTokens: ['login', 'session'],
+      symbolHints: ['buildAuthSession', 'LoginForm'],
+      relatedFiles: [{
+        path: 'src/ui/login-form.tsx',
+        score: 88,
+        symbols: ['export function LoginForm'],
+        references: ['buildAuthSession()'],
+        codeGraph: {
+          imports: [{ specifier: '../auth/session-service', target: 'src/auth/session-service.ts', importedSymbols: ['buildAuthSession'] }],
+          exports: ['LoginForm'],
+          declarations: ['LoginForm'],
+          importedSymbols: ['buildAuthSession'],
+          references: ['buildAuthSession']
+        },
+        snippet: 'import { buildAuthSession } from ../auth/session-service'
+      }]
+    }, null, 2), 'utf8');
 
     const snapshot = await appendArtifactMemory(root, state, state.tasks[0]);
     projectKey = run.memory.projectKey;
@@ -1724,10 +1752,14 @@ test('artifact memory writes manifest, summaries, and searchable records', async
     assert.equal(Array.isArray(manifest.entries), true);
     assert.equal(manifest.entries.some((entry) => entry.kind === 'review-verdict'), true);
     assert.match(artifactIndex, /review-verdict/);
+    assert.match(artifactIndex, /src\/ui\/login-form\.tsx->src\/auth\/session-service\.ts#buildAuthSession/);
     assert.match(runMemory, /Fix login retry flow/);
     assert.match(taskMemory, /Retry diagnosis/);
     assert.ok(snapshot.searchResults.some((item) => ['artifact-memory', 'task-memory', 'run-memory'].includes(item.kind)));
     assert.ok(snapshot.searchResults.some((item) => item.kind === 'artifact-record'));
+    assert.ok(Array.isArray(snapshot.graphInsights?.topEdges));
+    assert.ok(snapshot.graphInsights.topEdges.some((item) => /src\/ui\/login-form\.tsx->src\/auth\/session-service\.ts/.test(item.edge)));
+    assert.ok(snapshot.graphInsights.topSymbols.some((item) => item.symbol === 'buildAuthSession'));
     assert.equal(snapshot.failureAnalytics.retryCount >= 1, true);
     assert.equal(snapshot.failureAnalytics.verificationFailures >= 1, true);
     assert.equal(snapshot.traceSummary.artifactCount >= 1, true);
@@ -1755,6 +1787,7 @@ test('createRun seeds memory analytics fields', async () => {
     runId = run.id;
     assert.equal(typeof run.memory.failureAnalytics, 'object');
     assert.equal(typeof run.memory.traceSummary, 'object');
+    assert.equal(typeof run.memory.graphInsights, 'object');
   } finally {
     if (runId) {
       await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
@@ -1976,9 +2009,12 @@ test('tasksCollide detects import, shared fixture, and shared config conflicts',
   try {
     await fs.mkdir(path.join(tempDir, 'src', 'auth'), { recursive: true });
     await fs.mkdir(path.join(tempDir, 'src', 'shared'), { recursive: true });
+    await fs.mkdir(path.join(tempDir, 'src', 'ui'), { recursive: true });
     await fs.mkdir(path.join(tempDir, 'tests', '__fixtures__', 'auth'), { recursive: true });
     await fs.writeFile(path.join(tempDir, 'src', 'auth', 'login.ts'), "import { authConfig } from '../shared/config';\nexport function createSession() { return authConfig; }\n", 'utf8');
     await fs.writeFile(path.join(tempDir, 'src', 'shared', 'config.ts'), "export const authConfig = { enabled: true };\n", 'utf8');
+    await fs.writeFile(path.join(tempDir, 'src', 'auth', 'session-service.ts'), "export function buildAuthSession() { return 'ok'; }\n", 'utf8');
+    await fs.writeFile(path.join(tempDir, 'src', 'ui', 'login-form.tsx'), "import { buildAuthSession } from '../auth/session-service';\nexport function LoginForm() { return buildAuthSession(); }\n", 'utf8');
     await fs.writeFile(path.join(tempDir, 'vitest.config.ts'), "export default {};\n", 'utf8');
     await fs.writeFile(path.join(tempDir, 'tests', '__fixtures__', 'auth', 'user.json'), '{"id":1}\n', 'utf8');
     await fs.writeFile(path.join(tempDir, 'tests', '__fixtures__', 'auth', 'session.json'), '{"id":2}\n', 'utf8');
@@ -1996,6 +2032,11 @@ test('tasksCollide detects import, shared fixture, and shared config conflicts',
     assert.equal(tasksCollide(
       { id: 'T005', filesLikely: ['vitest.config.ts'] },
       { id: 'T006', filesLikely: ['vite.config.ts'] },
+      tempDir
+    ), true);
+    assert.equal(tasksCollide(
+      { id: 'T006A', filesLikely: ['src/ui/login-form.tsx'] },
+      { id: 'T006B', filesLikely: ['src/auth/session-service.ts'] },
       tempDir
     ), true);
     assert.equal(tasksCollide(

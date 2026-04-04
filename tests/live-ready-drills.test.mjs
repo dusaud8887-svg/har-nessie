@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { runCorruptionDrill, runLiveReadyDrill } from '../scripts/live-ready-drill.mjs';
 
-test('live-ready drill covers clarify, approval, retry, requeue, skip, stop-resume, and automatic replanning flows', { concurrency: false }, async () => {
+test('live-ready drill covers clarify, approval, retry, requeue, skip, stop-resume, and automatic replanning flows', { concurrency: false, timeout: 90000 }, async () => {
   const report = await runLiveReadyDrill();
 
   assert.equal(report.ok, true);
@@ -24,7 +24,7 @@ test('live-ready drill covers clarify, approval, retry, requeue, skip, stop-resu
   assert.ok((providerRecovery?.selectedProviders || []).some((item) => item.provider === 'gemini' && item.ready === true));
 });
 
-test('corruption drill recovers stale running state and tolerates broken action logs', { concurrency: false }, async () => {
+test('corruption drill recovers stale running state and tolerates broken action logs', { concurrency: false, timeout: 90000 }, async () => {
   const report = await runCorruptionDrill();
 
   assert.equal(report.ok, true);

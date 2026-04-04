@@ -656,6 +656,7 @@ function scoreArtifactRecord(record, searchContext, options = {}) {
   const symbolHints = Array.isArray(searchContext?.symbolHints) ? searchContext.symbolHints : [];
   const keywords = uniqueStrings(record.keywords).map((token) => token.toLowerCase());
   const recordSymbols = uniqueStrings(record.symbolHints).map((token) => token.toLowerCase());
+  const graphSymbols = uniqueStrings(record.graphSymbols).map((token) => token.toLowerCase());
   const recordFiles = uniqueStrings([
     ...(record.filesLikely || []),
     ...(record.changedFiles || []),
@@ -664,10 +665,13 @@ function scoreArtifactRecord(record, searchContext, options = {}) {
   const haystack = [
     record.title,
     record.summary,
+    record.graphSummary,
     record.rootCause,
     ...(record.acceptanceFailures || []),
     ...keywords,
     ...recordSymbols,
+    ...graphSymbols,
+    ...record.graphEdges || [],
     ...recordFiles
   ].join('\n').toLowerCase();
 
@@ -682,6 +686,7 @@ function scoreArtifactRecord(record, searchContext, options = {}) {
   if (filesLikely.length && recordFiles.some((item) => filesLikely.includes(item))) score += 24;
   if (relatedFiles.length && recordFiles.some((item) => relatedFiles.includes(item))) score += 18;
   if (symbolHints.length && recordSymbols.some((item) => symbolHints.includes(item))) score += 16;
+  if (symbolHints.length && graphSymbols.some((item) => symbolHints.includes(item))) score += 18;
   if (record.verificationOk === false) score += 12;
   if ((record.outOfScopeFiles || []).length) score += 10;
   if (String(record.decision || '') === 'retry') score += 8;
@@ -737,8 +742,60 @@ function artifactSemanticKey(record) {
     record.decision || '',
     rootCause || summary,
     normalizedFiles,
-    acceptance
+    acceptance,
+    uniqueStrings(record.graphEdges).slice(0, 3).join('|')
   ].join('::');
+}
+
+function buildGraphMemory(taskCodeContext = null) {
+  const relatedFiles = Array.isArray(taskCodeContext?.relatedFiles) ? taskCodeContext.relatedFiles : [];
+  const graphEdges = uniqueStrings(
+    relatedFiles.flatMap((entry) => (Array.isArray(entry?.codeGraph?.imports) ? entry.codeGraph.imports : []).map((link) => {
+      const source = String(entry?.path || '').trim();
+      const target = String(link?.target || '').trim();
+      const imported = Array.isArray(link?.importedSymbols) && link.importedSymbols.length
+        ? `#${link.importedSymbols.join(',')}`
+        : '';
+      return source && target ? `${source}->${target}${imported}` : '';
+    }))
+  ).filter(Boolean).slice(0, 12);
+  const graphSymbols = uniqueStrings([
+    ...(Array.isArray(taskCodeContext?.symbolHints) ? taskCodeContext.symbolHints : []),
+    ...relatedFiles.flatMap((entry) => entry?.codeGraph?.exports || []),
+    ...relatedFiles.flatMap((entry) => entry?.codeGraph?.declarations || []),
+    ...relatedFiles.flatMap((entry) => entry?.codeGraph?.importedSymbols || [])
+  ]).filter(Boolean).slice(0, 24);
+  return {
+    graphSummary: String(taskCodeContext?.summary || '').trim(),
+    graphEdges,
+    graphSymbols
+  };
+}
+
+function buildGraphInsights(records = []) {
+  const recent = [...(Array.isArray(records) ? records : [])]
+    .sort((left, right) => (Date.parse(right.createdAt || right.updatedAt || '') || 0) - (Date.parse(left.createdAt || left.updatedAt || '') || 0))
+    .slice(0, 12);
+  const edgeCounts = new Map();
+  const symbolCounts = new Map();
+  for (const record of recent) {
+    for (const edge of record.graphEdges || []) {
+      edgeCounts.set(edge, (edgeCounts.get(edge) || 0) + 1);
+    }
+    for (const symbol of record.graphSymbols || []) {
+      symbolCounts.set(symbol, (symbolCounts.get(symbol) || 0) + 1);
+    }
+  }
+  return {
+    topEdges: [...edgeCounts.entries()]
+      .sort((left, right) => right[1] - left[1])
+      .slice(0, 6)
+      .map(([edge, count]) => ({ edge, count })),
+    topSymbols: [...symbolCounts.entries()]
+      .sort((left, right) => right[1] - left[1])
+      .slice(0, 8)
+      .map(([symbol, count]) => ({ symbol, count }))
+  };
 }
 
 function compactArtifactRecords(records) {
@@ -779,9 +836,12 @@ async function searchArtifactRecords(paths, query, limit, options = {}, records 
       const haystack = [
         record.title,
         record.summary,
+        record.graphSummary,
         record.rootCause,
         ...(record.acceptanceFailures || []),
-        ...(record.symbolHints || [])
+        ...(record.symbolHints || []),
+        ...(record.graphSymbols || []),
+        ...(record.graphEdges || [])
       ].join('\n').toLowerCase();
       return searchContext.queryTokens.some((token) => haystack.includes(token));
     })
@@ -800,9 +860,11 @@ async function searchArtifactRecords(paths, query, limit, options = {}, records 
     updatedAt: record.createdAt || now(),
     snippet: excerpt([
       record.summary,
+      record.graphSummary,
       record.rootCause,
       ...(record.acceptanceFailures || []),
-      ...(record.outOfScopeFiles || [])
+      ...(record.outOfScopeFiles || []),
+      ...(record.graphEdges || []).slice(0, 2)
     ].filter(Boolean).join(' | '), 260),
     taskId: record.taskId,
     stage: record.stage,
@@ -813,7 +875,8 @@ async function searchArtifactRecords(paths, query, limit, options = {}, records 
       score,
       verificationOk: record.verificationOk !== false,
       matchedFiles: uniqueStrings(record.filesLikely).slice(0, 4),
-      matchedSymbols: uniqueStrings(record.symbolHints).slice(0, 4)
+      matchedSymbols: uniqueStrings([...(record.symbolHints || []), ...(record.graphSymbols || [])]).slice(0, 4),
+      graphEdges: uniqueStrings(record.graphEdges).slice(0, 3)
     }
   }));
 }
@@ -916,6 +979,7 @@ export async function ensureProjectMemory(rootDir, projectKey, meta = {}) {
     searchBackend: DatabaseSync ? 'sqlite-fts' : 'file-scan',
     failureAnalytics: buildFailureAnalytics([]),
     traceSummary: buildTraceSummary([]),
+    graphInsights: buildGraphInsights([]),
     compaction: {
       originalCount: 0,
       compactedCount: 0,
@@ -1024,6 +1088,7 @@ export async function searchProjectMemory(rootDir, projectKey, query, limit = 5,
     searchBackend: DatabaseSync ? 'sqlite-fts+artifact-index' : 'file-scan+artifact-index',
     failureAnalytics: buildFailureAnalytics(compaction.records),
     traceSummary: buildTraceSummary(compaction.records),
+    graphInsights: buildGraphInsights(compaction.records),
     compaction
   };
 }
@@ -1261,6 +1326,7 @@ export async function appendArtifactMemory(rootDir, run, task) {
 
   const artifactEntries = await buildArtifactEntries(rootDir, run, task);
   const taskCodeContext = await readOptionalJson(taskCodeContextArtifactPath(rootDir, run.id, task.id)) || null;
+  const graphMemory = buildGraphMemory(taskCodeContext);
   const symbolHints = uniqueStrings([
     ...(Array.isArray(taskCodeContext?.symbolHints) ? taskCodeContext.symbolHints : []),
     ...((Array.isArray(taskCodeContext?.relatedFiles) ? taskCodeContext.relatedFiles : []).flatMap((entry) => Array.isArray(entry?.symbols) ? entry.symbols : []))
@@ -1324,7 +1390,10 @@ export async function appendArtifactMemory(rootDir, run, task) {
       acceptanceFailures: entry.acceptanceFailures,
       sourcePath: entry.sourcePath,
       createdAt: entry.createdAt,
-      symbolHints
+      symbolHints,
+      graphSummary: graphMemory.graphSummary,
+      graphEdges: graphMemory.graphEdges,
+      graphSymbols: graphMemory.graphSymbols
     });
   }
   const compaction = compactArtifactRecords([...recordMap.values()]);

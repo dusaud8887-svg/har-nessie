@@ -21,6 +21,11 @@ const HIGH_RISK_PATTERNS = [
 
 const CODE_CONTEXT_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.go', '.rs', '.java', '.cs', '.rb', '.php']);
 const CODE_CONTEXT_IGNORED_DIRS = new Set(['.git', 'node_modules', 'dist', 'build', 'coverage', 'runs', 'memory', '.harness-web']);
+const STATIC_IMPORT_PATTERN = /(?:from\s+['"]([^'"]+)['"]|require\(\s*['"]([^'"]+)['"]\s*\)|import\(\s*['"]([^'"]+)['"]\s*\))/g;
+const PYTHON_IMPORT_PATTERN = /^\s*(?:from\s+([.\w/]+)\s+import\s+([A-Za-z0-9_,\s*]+)|import\s+([.\w/.]+))/gm;
+const EXPORT_SYMBOL_PATTERN = /\bexport\s+(?:async\s+)?(?:function|class|interface|type|enum|const|let|var)\s+([A-Za-z_]\w*)/g;
+const DECLARATION_SYMBOL_PATTERN = /\b(?:async\s+)?(?:function|class|interface|type|enum|const|let|var)\s+([A-Za-z_]\w*)/g;
+const IMPORTED_SYMBOL_PATTERN = /\bimport\s+(?:type\s+)?(?:\{([^}]+)\}|([A-Za-z_]\w*))/g;
 const VERIFICATION_TYPES = ['TEST', 'STATIC', 'BROWSER', 'MANUAL'];
 const ACTION_CLASSES = ['memory-read', 'code-context', 'codex-exec', 'verification', 'git-write', 'recovery'];
 
@@ -366,6 +371,108 @@ function extractIdentifierHints(values) {
     .slice(0, 14);
 }
 
+function splitImportedSymbols(text) {
+  return String(text || '')
+    .split(',')
+    .map((item) => String(item || '').trim())
+    .map((item) => item.replace(/\s+as\s+[A-Za-z_]\w*$/i, '').trim())
+    .filter(Boolean);
+}
+
+async function resolveStaticImportTarget(projectPath, fromRelativePath, specifier) {
+  const root = String(projectPath || '').trim();
+  const fromPath = String(fromRelativePath || '').trim().replace(/\\/g, '/');
+  const raw = String(specifier || '').trim();
+  if (!root || !fromPath || !raw.startsWith('.')) return '';
+  const fromDir = path.posix.dirname(fromPath);
+  const basePath = path.posix.normalize(path.posix.join(fromDir, raw));
+  const candidates = [
+    basePath,
+    ...[...CODE_CONTEXT_EXTENSIONS].map((ext) => `${basePath}${ext}`),
+    ...[...CODE_CONTEXT_EXTENSIONS].map((ext) => path.posix.join(basePath, `index${ext}`))
+  ];
+  for (const candidate of candidates) {
+    const absolutePath = path.join(root, ...candidate.split('/'));
+    try {
+      await fs.access(absolutePath);
+      return candidate;
+    } catch {
+      continue;
+    }
+  }
+  return basePath;
+}
+
+export function extractStaticCodeGraphFacts(sourceText) {
+  const imports = [];
+  const exports = [];
+  const declarations = [];
+  const importedSymbols = [];
+  let match;
+  STATIC_IMPORT_PATTERN.lastIndex = 0;
+  PYTHON_IMPORT_PATTERN.lastIndex = 0;
+  IMPORTED_SYMBOL_PATTERN.lastIndex = 0;
+  EXPORT_SYMBOL_PATTERN.lastIndex = 0;
+  DECLARATION_SYMBOL_PATTERN.lastIndex = 0;
+  while ((match = STATIC_IMPORT_PATTERN.exec(sourceText)) !== null) {
+    const specifier = match[1] || match[2] || match[3] || '';
+    imports.push({
+      specifier,
+      importedSymbols: []
+    });
+  }
+  while ((match = PYTHON_IMPORT_PATTERN.exec(sourceText)) !== null) {
+    const specifier = match[1] || match[3] || '';
+    const imported = splitImportedSymbols(match[2] || '');
+    imports.push({
+      specifier,
+      importedSymbols: imported
+    });
+    importedSymbols.push(...imported);
+  }
+  while ((match = IMPORTED_SYMBOL_PATTERN.exec(sourceText)) !== null) {
+    importedSymbols.push(...splitImportedSymbols(match[1] || match[2] || ''));
+  }
+  while ((match = EXPORT_SYMBOL_PATTERN.exec(sourceText)) !== null) {
+    const symbol = String(match[1] || '').trim();
+    if (symbol) exports.push(symbol);
+  }
+  while ((match = DECLARATION_SYMBOL_PATTERN.exec(sourceText)) !== null) {
+    const symbol = String(match[1] || '').trim();
+    if (symbol) declarations.push(symbol);
+  }
+  const referenceHints = extractReferenceHints(sourceText, []);
+  return {
+    imports: uniqueBy(imports, (item) => `${item.specifier}:${(item.importedSymbols || []).join(',')}`),
+    exports: uniqueBy(exports, (item) => item),
+    declarations: uniqueBy(declarations, (item) => item),
+    importedSymbols: uniqueBy(importedSymbols, (item) => String(item || '').toLowerCase()).filter(Boolean),
+    references: extractIdentifierHints(referenceHints)
+  };
+}
+
+export async function extractStaticCodeGraph(projectPath, relativePath, body = '') {
+  const sourceText = String(body || '').trim()
+    ? String(body || '')
+    : await fs.readFile(path.join(projectPath, ...String(relativePath || '').split('/')), 'utf8').catch(() => '');
+  const facts = extractStaticCodeGraphFacts(sourceText);
+  const imports = [];
+  for (const entry of facts.imports) {
+    imports.push({
+      specifier: entry.specifier,
+      importedSymbols: Array.isArray(entry.importedSymbols) ? entry.importedSymbols : [],
+      target: await resolveStaticImportTarget(projectPath, relativePath, entry.specifier)
+    });
+  }
+  return {
+    imports: uniqueBy(imports, (item) => `${item.specifier}:${item.target}:${(item.importedSymbols || []).join(',')}`),
+    exports: facts.exports,
+    declarations: facts.declarations,
+    importedSymbols: facts.importedSymbols,
+    references: facts.references
+  };
+}
+
 export async function buildTaskCodeContext(run, task) {
   if (!run?.projectPath) {
     return {
@@ -402,14 +509,18 @@ export async function buildTaskCodeContext(run, task) {
     }
     const symbols = extractSymbolHints(body, queryTokens);
     const references = extractReferenceHints(body, queryTokens);
+    const codeGraph = await extractStaticCodeGraph(run.projectPath, relativePath, body);
     score += symbols.length * 4;
     score += references.length * 2;
+    score += (codeGraph.exports.length + codeGraph.declarations.length) * 2;
+    score += codeGraph.imports.length;
     if (!score) continue;
     relatedFiles.push({
       path: relativePath,
       score,
       symbols,
       references,
+      codeGraph,
       snippet: clipText(body, 280)
     });
   }
@@ -419,6 +530,9 @@ export async function buildTaskCodeContext(run, task) {
   const symbolHints = extractIdentifierHints([
     ...selectedFiles.flatMap((item) => item.symbols),
     ...selectedFiles.flatMap((item) => item.references),
+    ...selectedFiles.flatMap((item) => item.codeGraph?.exports || []),
+    ...selectedFiles.flatMap((item) => item.codeGraph?.declarations || []),
+    ...selectedFiles.flatMap((item) => item.codeGraph?.importedSymbols || []),
     ...queryTokens
   ]);
   return {
@@ -427,7 +541,7 @@ export async function buildTaskCodeContext(run, task) {
     taskId: task.id,
     generatedAt: now(),
     summary: selectedFiles.length
-      ? `Top files: ${selectedFiles.map((item) => item.path).join(', ')}`
+      ? `Top files: ${selectedFiles.map((item) => item.path).join(', ')} | symbol graph edges: ${selectedFiles.reduce((sum, item) => sum + Number(item.codeGraph?.imports?.length || 0), 0)}`
       : 'No strongly related code files were detected from the task goal and filesLikely.',
     queryTokens,
     symbolHints,

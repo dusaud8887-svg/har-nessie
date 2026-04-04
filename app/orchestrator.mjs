@@ -28,6 +28,7 @@ import {
   buildAcceptanceMetadata,
   buildTaskActionPolicy,
   buildTaskCodeContext,
+  extractStaticCodeGraphFacts,
   inferTaskVerificationTypes,
   normalizeToolProfile,
   summarizeActionOutput
@@ -561,32 +562,6 @@ function resolveRelativeImport(projectPath, fromFile, specifier) {
   return basePath;
 }
 
-function importTargetsFromSource(projectPath, relativePath, sourceText) {
-  const targets = new Set();
-  let match;
-  while ((match = REPO_IMPORT_PATTERN.exec(sourceText)) !== null) {
-    const specifier = match[1] || match[2] || match[3] || '';
-    const resolved = resolveRelativeImport(projectPath, relativePath, specifier);
-    if (resolved) targets.add(resolved.toLowerCase());
-  }
-  while ((match = PYTHON_IMPORT_PATTERN.exec(sourceText)) !== null) {
-    const specifier = match[1] || match[2] || '';
-    const resolved = resolveRelativeImport(projectPath, relativePath, specifier);
-    if (resolved) targets.add(resolved.toLowerCase());
-  }
-  return [...targets];
-}
-
-function declaredSymbolsFromSource(sourceText) {
-  const symbols = new Set();
-  let match;
-  while ((match = DECLARED_SYMBOL_PATTERN.exec(sourceText)) !== null) {
-    const symbol = String(match[1] || '').trim().toLowerCase();
-    if (symbol) symbols.add(symbol);
-  }
-  return [...symbols];
-}
-
 function readTaskParallelSignals(task, projectPath, cache = null) {
   const cacheKey = `${String(projectPath || '').trim()}::${task?.id || JSON.stringify(task?.filesLikely || [])}`;
   if (cache?.has(cacheKey)) return cache.get(cacheKey);
@@ -598,7 +573,9 @@ function readTaskParallelSignals(task, projectPath, cache = null) {
     fixtureKeys: new Set(),
     importTargets: new Set(),
     importedDomains: new Set(),
-    symbols: new Set()
+    symbols: new Set(),
+    exportedSymbols: new Set(),
+    importedSymbols: new Set()
   };
   for (const filePath of files) {
     if (!filePath || filePath === '*') continue;
@@ -623,7 +600,20 @@ function readTaskParallelSignals(task, projectPath, cache = null) {
       sourceText = '';
     }
     if (!sourceText) continue;
-    for (const importTarget of importTargetsFromSource(projectPath, normalized, sourceText)) {
+    const graphFacts = extractStaticCodeGraphFacts(sourceText);
+    for (const symbol of graphFacts.exports || []) {
+      signals.exportedSymbols.add(String(symbol || '').trim().toLowerCase());
+    }
+    for (const symbol of graphFacts.declarations || []) {
+      signals.symbols.add(String(symbol || '').trim().toLowerCase());
+    }
+    for (const symbol of graphFacts.importedSymbols || []) {
+      signals.importedSymbols.add(String(symbol || '').trim().toLowerCase());
+      signals.symbols.add(String(symbol || '').trim().toLowerCase());
+    }
+    for (const importEntry of graphFacts.imports || []) {
+      const importTarget = resolveRelativeImport(projectPath, normalized, importEntry.specifier);
+      if (!importTarget) continue;
       signals.importTargets.add(importTarget);
       const importedDomain = collisionDomainRoot(importTarget);
       if (importedDomain) signals.importedDomains.add(importedDomain);
@@ -631,9 +621,6 @@ function readTaskParallelSignals(task, projectPath, cache = null) {
       if (importedConfigKey) signals.configKeys.add(importedConfigKey);
       const importedFixtureKey = sharedFixtureKey(importTarget);
       if (importedFixtureKey) signals.fixtureKeys.add(importedFixtureKey);
-    }
-    for (const symbol of declaredSymbolsFromSource(sourceText)) {
-      signals.symbols.add(symbol);
     }
   }
   for (const token of taskTextTokens(task)) {
@@ -646,7 +633,9 @@ function readTaskParallelSignals(task, projectPath, cache = null) {
     fixtureKeys: [...signals.fixtureKeys],
     importTargets: [...signals.importTargets],
     importedDomains: [...signals.importedDomains],
-    symbols: [...signals.symbols]
+    symbols: [...signals.symbols],
+    exportedSymbols: [...signals.exportedSymbols],
+    importedSymbols: [...signals.importedSymbols]
   };
   cache?.set(cacheKey, finalized);
   return finalized;
@@ -669,6 +658,8 @@ export function tasksCollide(left, right, projectPath = '', cache = null) {
   if (leftSignals.importTargets.some((item) => b.includes(item) || rightSignals.importTargets.includes(item))) return true;
   if (rightSignals.importTargets.some((item) => a.includes(item) || leftSignals.importTargets.includes(item))) return true;
   if (sameSetIntersection(leftSignals.importedDomains, rightSignals.domains) || sameSetIntersection(rightSignals.importedDomains, leftSignals.domains)) return true;
+  if (leftSignals.importTargets.some((item) => b.includes(item)) && sameSetIntersection(leftSignals.importedSymbols, rightSignals.exportedSymbols)) return true;
+  if (rightSignals.importTargets.some((item) => a.includes(item)) && sameSetIntersection(rightSignals.importedSymbols, leftSignals.exportedSymbols)) return true;
   return sameSetIntersection(leftSignals.symbols, rightSignals.symbols)
     && (sameSetIntersection(leftSignals.domains, rightSignals.importedDomains)
       || sameSetIntersection(rightSignals.domains, leftSignals.importedDomains)
@@ -2988,6 +2979,12 @@ function buildMemoryPromptLines(memory) {
   if (memory?.traceSummary) {
     lines.push(`Trace memory summary: artifacts=${memory.traceSummary.artifactCount || 0} | tasks=${memory.traceSummary.taskCount || 0} | lastDecision=${memory.traceSummary.lastDecision || 'none'}`);
   }
+  if (Array.isArray(memory?.graphInsights?.topEdges) && memory.graphInsights.topEdges.length > 0) {
+    lines.push(`Graph memory edges: ${memory.graphInsights.topEdges.slice(0, 4).map((item) => item.edge).join(' | ')}`);
+  }
+  if (Array.isArray(memory?.graphInsights?.topSymbols) && memory.graphInsights.topSymbols.length > 0) {
+    lines.push(`Graph memory symbols: ${memory.graphInsights.topSymbols.slice(0, 6).map((item) => item.symbol).join(', ')}`);
+  }
 
   if (Array.isArray(memory?.searchResults) && memory.searchResults.length > 0) {
     lines.push('Relevant memory hits:');
@@ -3030,6 +3027,9 @@ export function buildProjectPlanningPriorLines(memory, run = null) {
   if (memoryExamples.length) {
     lines.push(`- Grounding examples from project memory: ${memoryExamples.join(' || ')}`);
   }
+  if (Array.isArray(memory?.graphInsights?.topEdges) && memory.graphInsights.topEdges.length > 0) {
+    lines.push(`- Project-specific prior: recent graph edges touched together: ${memory.graphInsights.topEdges.slice(0, 3).map((item) => item.edge).join(' | ')}`);
+  }
   return lines;
 }
 
@@ -3044,7 +3044,8 @@ async function resolvePromptMemory(run, query, limit = 4, options = {}) {
       retrievedContext: 'No relevant project memory found.',
       searchBackend: 'none',
       failureAnalytics: null,
-      traceSummary: null
+      traceSummary: null,
+      graphInsights: { topEdges: [], topSymbols: [] }
     };
   }
   return searchProjectMemory(ROOT_DIR, run.memory.projectKey, query, limit, {
@@ -3068,7 +3069,8 @@ async function applyMemorySnapshot(runId, snapshot) {
       retrievedContext: snapshot.retrievedContext,
       searchBackend: snapshot.searchBackend,
       failureAnalytics: snapshot.failureAnalytics || null,
-      traceSummary: snapshot.traceSummary || null
+      traceSummary: snapshot.traceSummary || null,
+      graphInsights: snapshot.graphInsights || { topEdges: [], topSymbols: [] }
     };
     await saveState(fresh);
   });
@@ -3953,7 +3955,9 @@ function buildCodeContextPromptLines(codeContext) {
     lines.push('Relevant code files and symbols:');
     for (const item of codeContext.relatedFiles.slice(0, 4)) {
       const symbolText = Array.isArray(item.symbols) ? item.symbols.join(' | ') : '';
-      lines.push(`- ${item.path}: ${clipText(symbolText || item.snippet || '', 220)}`);
+      const exportText = Array.isArray(item.codeGraph?.exports) && item.codeGraph.exports.length ? ` exports=${item.codeGraph.exports.join(',')}` : '';
+      const importText = Array.isArray(item.codeGraph?.imports) && item.codeGraph.imports.length ? ` imports=${item.codeGraph.imports.map((entry) => entry.target || entry.specifier).join(',')}` : '';
+      lines.push(`- ${item.path}: ${clipText(`${symbolText || item.snippet || ''}${exportText}${importText}`, 220)}`);
     }
   } else {
     lines.push('Relevant code files and symbols: none');
@@ -3975,7 +3979,9 @@ async function buildCodexPrompt(run, task, memory, executionCtx, codeContext = n
     reindex: false,
     stage: 'review',
     taskId: task.id,
-    filesLikely: task.filesLikely
+    filesLikely: task.filesLikely,
+    relatedFiles: codeContext?.relatedFiles || [],
+    symbolHints: codeContext?.symbolHints || []
   }).catch(() => ({ searchResults: [] }));
   return [
     `You are the ${providerName} implementation executor inside a local engineering harness.`,
