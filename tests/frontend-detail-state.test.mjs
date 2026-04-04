@@ -1523,6 +1523,30 @@ test('folder picker request forwards the current path as initialPath', async () 
   assert.equal(JSON.parse(String(pickFolderRequest?.options?.body || '{}')).initialPath, 'D:/repos');
 });
 
+test('memory search renders graph memory hints alongside search hits', async () => {
+  const { context, document, fetchStub } = await createUiHarness();
+  fetchStub.queue('/api/runs/run-memory/memory?q=login', {
+    searchResults: [{
+      title: 'Graph memory artifact',
+      snippet: 'login flow touched buildAuthSession',
+      kind: 'artifact-record'
+    }],
+    graphInsights: {
+      topEdges: [{ edge: 'src/ui/login-form.tsx->src/auth/session-service.ts#buildAuthSession', count: 2 }],
+      topSymbols: [{ symbol: 'buildAuthSession', count: 3 }]
+    }
+  });
+
+  document.getElementById('mem-q').value = 'login';
+  vm.runInContext(`selectedRunId = 'run-memory'`, context);
+  await vm.runInContext('searchMemory()', context);
+
+  const markup = document.getElementById('mem-results').innerHTML;
+  assert.match(markup, /Graph memory hints|그래프 메모리 힌트/);
+  assert.match(markup, /buildAuthSession/);
+  assert.match(markup, /Graph memory artifact/);
+});
+
 test('empty detail state renders the control plane launch surface and live snapshot', async () => {
   const { context, document } = await createUiHarness();
   vm.runInContext(`

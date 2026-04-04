@@ -30,6 +30,7 @@ import {
   runBrowserVerification,
   runProjectQualitySweep,
   retryTask,
+  searchRunMemory,
   skipTask,
   stopRun,
   tasksCollide,
@@ -1791,6 +1792,85 @@ test('createRun seeds memory analytics fields', async () => {
   } finally {
     if (runId) {
       await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+    }
+  }
+});
+
+test('searchRunMemory exposes graph insights from the memory snapshot', async () => {
+  let runId = '';
+  let projectKey = '';
+  try {
+    const run = await createRun({
+      title: 'graph-memory-search-smoke',
+      projectPath: root,
+      objective: 'graph memory search smoke',
+      specText: '',
+      specFiles: '',
+      settings: { maxParallel: 1, maxTaskAttempts: 1, maxGoalLoops: 1 }
+    });
+    runId = run.id;
+    projectKey = run.memory.projectKey;
+
+    const taskRoot = path.join(root, 'runs', run.id, 'tasks', 'T001');
+    await fs.mkdir(taskRoot, { recursive: true });
+    await fs.mkdir(path.join(root, 'runs', run.id, 'context', 'code-context'), { recursive: true });
+    await fs.writeFile(path.join(root, 'runs', run.id, 'context', 'code-context', 'T001.json'), JSON.stringify({
+      schemaVersion: '2',
+      runId: run.id,
+      taskId: 'T001',
+      generatedAt: new Date().toISOString(),
+      summary: 'Top files: src/ui/login-form.tsx, src/auth/session-service.ts | symbol graph edges: 1',
+      queryTokens: ['login', 'session'],
+      symbolHints: ['buildAuthSession'],
+      relatedFiles: [{
+        path: 'src/ui/login-form.tsx',
+        score: 80,
+        symbols: ['export function LoginForm'],
+        references: ['buildAuthSession()'],
+        codeGraph: {
+          imports: [{ specifier: '../auth/session-service', target: 'src/auth/session-service.ts', importedSymbols: ['buildAuthSession'] }],
+          exports: ['LoginForm'],
+          declarations: ['LoginForm'],
+          importedSymbols: ['buildAuthSession'],
+          references: ['buildAuthSession']
+        },
+        snippet: 'import { buildAuthSession } from ../auth/session-service'
+      }]
+    }, null, 2), 'utf8');
+    await fs.writeFile(path.join(taskRoot, 'execution-summary.json'), JSON.stringify({
+      schemaVersion: '1',
+      taskId: 'T001',
+      changedFiles: ['src/ui/login-form.tsx'],
+      repoChangedFiles: ['src/ui/login-form.tsx'],
+      reviewDecision: 'approved',
+      completedAt: new Date().toISOString()
+    }, null, 2), 'utf8');
+
+    const state = await getRun(run.id);
+    state.tasks = [{
+      id: 'T001',
+      title: 'Graph memory task',
+      status: 'done',
+      goal: 'Persist graph-aware memory',
+      reviewSummary: 'Stores graph evidence for memory search.',
+      findings: [],
+      lastExecution: {
+        reviewDecision: 'approved',
+        codeContextSummary: 'symbol graph edges: 1'
+      }
+    }];
+    await appendArtifactMemory(root, state, state.tasks[0]);
+
+    const snapshot = await searchRunMemory(run.id, 'buildAuthSession login graph');
+    assert.ok(Array.isArray(snapshot.graphInsights?.topEdges));
+    assert.ok(snapshot.graphInsights.topEdges.some((item) => /src\/ui\/login-form\.tsx->src\/auth\/session-service\.ts#buildAuthSession/.test(item.edge)));
+    assert.ok(snapshot.graphInsights.topSymbols.some((item) => item.symbol === 'buildAuthSession'));
+  } finally {
+    if (runId) {
+      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+    }
+    if (projectKey) {
+      await fs.rm(path.join(root, 'memory', 'projects', projectKey), { recursive: true, force: true }).catch(() => {});
     }
   }
 });

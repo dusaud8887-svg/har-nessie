@@ -3674,12 +3674,24 @@ let runs = [];
     async function searchMemory() {
       const q = document.getElementById('mem-q').value;
       const res = await request(`/api/runs/${selectedRunId}/memory?q=${encodeURIComponent(q)}`);
-      document.getElementById('mem-results').innerHTML = (res.searchResults || []).map(h => `
+      const graphEdges = Array.isArray(res.graphInsights?.topEdges) ? res.graphInsights.topEdges.slice(0, 3) : [];
+      const graphSymbols = Array.isArray(res.graphInsights?.topSymbols) ? res.graphInsights.topSymbols.slice(0, 5) : [];
+      const graphMarkup = graphEdges.length || graphSymbols.length
+        ? `
+        <div style="margin-bottom: 12px; padding: 10px; background: #eef6ff; border-radius: 6px; font-size: 13px;">
+          <strong>${t('그래프 메모리 힌트', 'Graph memory hints')}</strong>
+          ${graphEdges.length ? `<div style="color: var(--muted); margin-top: 4px;">${escapeHtml(graphEdges.map((item) => item.edge).join(' | '))}</div>` : ''}
+          ${graphSymbols.length ? `<div style="color: var(--muted); margin-top: 4px;">${escapeHtml(graphSymbols.map((item) => item.symbol).join(', '))}</div>` : ''}
+        </div>
+      `
+        : '';
+      const resultMarkup = (res.searchResults || []).map(h => `
         <div style="margin-bottom: 12px; padding: 10px; background: #f8fafc; border-radius: 6px; font-size: 13px;">
           <strong>${escapeHtml(h.title)}</strong>
           <div style="color: var(--muted); margin-top: 4px;">${escapeHtml(h.snippet)}</div>
         </div>
       `).join('') || t('결과 없음', 'No results');
+      document.getElementById('mem-results').innerHTML = `${graphMarkup}${resultMarkup}`;
     }
 
     async function refreshSystemInfo() {

@@ -6909,7 +6909,8 @@ export async function searchRunMemory(runId, query) {
     memoryFile: snapshot.memoryFile,
     dailyDir: snapshot.dailyDir,
     failureAnalytics: snapshot.failureAnalytics || null,
-    traceSummary: snapshot.traceSummary || null
+    traceSummary: snapshot.traceSummary || null,
+    graphInsights: snapshot.graphInsights || { topEdges: [], topSymbols: [] }
   };
 }
 
