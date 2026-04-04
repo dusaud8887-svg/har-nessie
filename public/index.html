@@ -324,6 +324,21 @@
             <div class="helper-text">Advanced. Leave blank if unsure.</div>
           </div>
           <div class="form-group">
+            <label>Preset strategy template</label>
+            <div class="form-grid" style="grid-template-columns: minmax(0, 1fr) auto;">
+              <select id="settings-strategy-template">
+                <option value="docs-spec-first">Docs / spec first</option>
+                <option value="existing-repo-bugfix">Existing repo bugfix</option>
+                <option value="existing-repo-feature">Existing repo feature</option>
+                <option value="refactor-stabilize">Refactor / stabilize</option>
+                <option value="greenfield-app">Greenfield app</option>
+                <option value="auto">General default</option>
+              </select>
+              <button type="button" class="secondary-btn" id="apply-strategy-template-btn">Fill recommended notes</button>
+            </div>
+            <div class="helper-text">This fills the three note fields above with a recommended machine-local baseline for the selected preset.</div>
+          </div>
+          <div class="form-group">
             <label>Planning and review provider</label>
             <select id="coordination-provider">
               <option value="codex">Codex</option>

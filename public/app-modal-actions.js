@@ -48,10 +48,59 @@
       selectProject
     } = deps || {};
     let projectIntakeBusy = false;
+    const presetStrategyTemplates = {
+      'docs-spec-first': {
+        customConstitution: 'Treat docs and acceptance criteria as the source of record for docs/spec-first phases. Prefer doc alignment before broad implementation.',
+        plannerStrategy: 'Start with the smallest scope-locking or doc-alignment slice. Group tightly related docs only when they must move together.',
+        teamStrategy: 'Lean on spec-locker and verifier before treating the phase as ready for implementation.'
+      },
+      'existing-repo-bugfix': {
+        customConstitution: 'Do not change behavior until the failing path is reproduced or the exact before-state is pinned down.',
+        plannerStrategy: 'Make reproduction explicit before the fix. Prefer sequential bugfix graphs unless the validation path is clearly independent.',
+        teamStrategy: 'Use a strong bug reproducer and verifier pairing. Avoid broad implementation fan-out in the same subsystem.'
+      },
+      'existing-repo-feature': {
+        customConstitution: 'Extend the current repo in bounded slices. Preserve adjacent behavior and docs contracts while landing only the requested feature scope.',
+        plannerStrategy: 'Split work by clearly disjoint subsystems or file groups. Keep explicit verification on every behavior-changing slice.',
+        teamStrategy: 'Keep planning and review conservative, and parallelize implementation only for truly disjoint slices.'
+      },
+      'refactor-stabilize': {
+        customConstitution: 'Preserve observable behavior while restructuring. Prefer reversible slices and keep verification close to each refactor step.',
+        plannerStrategy: 'Use smaller sequential tasks than feature work and keep acceptance focused on unchanged behavior.',
+        teamStrategy: 'Bias toward verifier-heavy loops and avoid wide parallel refactors inside the same subsystem.'
+      },
+      'greenfield-app': {
+        customConstitution: 'Lock architecture and boundaries before broad build-out. Grow the app in staged slices with explicit validation per slice.',
+        plannerStrategy: 'Insert scaffold-locking or diagnosis work before broad implementation when the subsystem map is still uncertain.',
+        teamStrategy: 'Use planner and integrator structure to keep greenfield fan-out coherent, but do not skip the initial scoping pass.'
+      },
+      auto: {
+        customConstitution: 'Keep the run scoped to the current objective with the smallest safe diff and explicit verification.',
+        plannerStrategy: 'Prefer dependency-aware task graphs over speculative breadth. Parallelize only when the scope is clearly disjoint.',
+        teamStrategy: 'Keep planning and review conservative by default, and let implementation fan out only when file boundaries are stable.'
+      }
+    };
+
+    function normalizeStrategyTemplateId(value) {
+      const id = String(value || '').trim();
+      return presetStrategyTemplates[id] ? id : 'auto';
+    }
+
+    function applyStrategyTemplatePreset(templateId = null) {
+      const selectedId = normalizeStrategyTemplateId(templateId || document.getElementById('settings-strategy-template')?.value || 'auto');
+      const template = presetStrategyTemplates[selectedId] || presetStrategyTemplates.auto;
+      document.getElementById('settings-strategy-template').value = selectedId;
+      document.getElementById('custom-constitution').value = template.customConstitution;
+      document.getElementById('planner-strategy').value = template.plannerStrategy;
+      document.getElementById('team-strategy').value = template.teamStrategy;
+      setBanner(t('선택한 preset 기준으로 로컬 전략 메모를 채웠습니다.', 'Filled the local strategy notes from the selected preset baseline.'), 'info');
+      return template;
+    }
 
     async function openSettingsModal() {
       document.getElementById('settings-modal').style.display = 'flex';
       const harnessSettings = await request('/api/settings');
+      const selectedProject = typeof getSelectedProjectSummary === 'function' ? getSelectedProjectSummary() : null;
       setHarnessSettings(harnessSettings);
       document.getElementById('include-global-agents').checked = harnessSettings.includeGlobalAgents !== false;
       document.getElementById('include-karpathy').checked = harnessSettings.includeKarpathyGuidelines !== false;
@@ -69,6 +118,7 @@
       document.getElementById('claude-model').value = harnessSettings.claudeModel || '';
       document.getElementById('gemini-model').value = harnessSettings.geminiModel || '';
       document.getElementById('gemini-project-id').value = harnessSettings.geminiProjectId || '';
+      document.getElementById('settings-strategy-template').value = normalizeStrategyTemplateId(selectedProject?.defaultPresetId || 'auto');
     }
 
     function closeSettingsModal() {
@@ -339,6 +389,10 @@
     }
 
     function attachFormHandlers() {
+      document.getElementById('apply-strategy-template-btn').addEventListener('click', () => {
+        applyStrategyTemplatePreset();
+      });
+
       document.getElementById('harness-settings-form').addEventListener('submit', async (event) => {
         event.preventDefault();
         await runUiAction('save-settings', async () => {
@@ -429,6 +483,7 @@
       applyProjectIntakeDraft,
       openStarterRunFromIntake,
       createProjectAndStarterRunFromIntake,
+      applyStrategyTemplatePreset,
       openCreateModal,
       closeCreateModal,
       openCreateProjectModal,

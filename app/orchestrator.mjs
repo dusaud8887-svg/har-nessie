@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { promises as fs } from 'node:fs';
+import { existsSync, readFileSync, promises as fs } from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -69,6 +69,36 @@ const COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_CAPTURED_PROCESS_OUTPUT_BYTES = 256 * 1024;
 const CODE_LIKE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.go', '.rs', '.java', '.cs', '.rb', '.php']);
 const CODE_DOMAIN_ROOTS = new Set(['src', 'app', 'server', 'lib', 'components', 'features', 'packages', 'tests']);
+const SHARED_FIXTURE_SEGMENTS = new Set(['__fixtures__', 'fixtures', '__mocks__', 'mocks', 'testdata']);
+const SHARED_CONFIG_BASENAMES = new Set([
+  'package.json',
+  'package-lock.json',
+  'pnpm-lock.yaml',
+  'yarn.lock',
+  'tsconfig.json',
+  'tsconfig.base.json',
+  'jsconfig.json',
+  'eslint.config.js',
+  'eslint.config.cjs',
+  'eslint.config.mjs',
+  '.eslintrc',
+  '.eslintrc.js',
+  '.eslintrc.cjs',
+  '.eslintrc.json',
+  'vite.config.ts',
+  'vite.config.js',
+  'vitest.config.ts',
+  'vitest.config.js',
+  'playwright.config.ts',
+  'playwright.config.js',
+  'jest.config.js',
+  'jest.config.ts',
+  'webpack.config.js',
+  'webpack.config.ts'
+]);
+const REPO_IMPORT_PATTERN = /(?:from\s+['"]([^'"]+)['"]|require\(\s*['"]([^'"]+)['"]\s*\)|import\(\s*['"]([^'"]+)['"]\s*\))/g;
+const PYTHON_IMPORT_PATTERN = /^\s*(?:from\s+([.\w/]+)\s+import\s+|import\s+([.\w/.]+))/gm;
+const DECLARED_SYMBOL_PATTERN = /\b(?:export\s+)?(?:async\s+)?(?:function|class|interface|type|enum|const|let|var)\s+([A-Za-z_]\w*)/g;
 const TASK_ARTIFACT_FILES = {
   prompt: { primary: 'agent-prompt.md', legacy: 'codex-prompt.md' },
   output: { primary: 'agent-output.md', legacy: 'codex-output.md' },
@@ -474,14 +504,175 @@ function collisionDomainRoot(value) {
   return parts[0];
 }
 
-function tasksCollide(left, right) {
+function basenameTokens(filePath) {
+  return String(path.posix.basename(String(filePath || '').trim(), pathExtension(filePath)) || '')
+    .split(/[^A-Za-z0-9_]+/)
+    .map((item) => item.trim().toLowerCase())
+    .filter((item) => item.length >= 3);
+}
+
+function taskTextTokens(task) {
+  return String([
+    task?.title,
+    task?.goal,
+    ...(Array.isArray(task?.constraints) ? task.constraints : []),
+    ...(Array.isArray(task?.acceptanceChecks) ? task.acceptanceChecks : [])
+  ].filter(Boolean).join(' '))
+    .toLowerCase()
+    .match(/[a-z_][a-z0-9_]{2,}/g) || [];
+}
+
+function sharedFixtureKey(value) {
+  const normalized = String(value || '').trim().replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/$/, '');
+  if (!normalized) return '';
+  const parts = normalized.split('/').filter(Boolean);
+  const fixtureIndex = parts.findIndex((part) => SHARED_FIXTURE_SEGMENTS.has(part.toLowerCase()));
+  if (fixtureIndex < 0) return '';
+  return parts.slice(0, Math.min(parts.length, fixtureIndex + 2)).join('/').toLowerCase();
+}
+
+function sharedConfigKey(value) {
+  const normalized = String(value || '').trim().replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/$/, '');
+  if (!normalized) return '';
+  const base = path.posix.basename(normalized).toLowerCase();
+  if (SHARED_CONFIG_BASENAMES.has(base)) return 'config:repo-root';
+  if (base.endsWith('.config.js') || base.endsWith('.config.ts') || base.endsWith('.config.mjs') || base.endsWith('.config.cjs')) {
+    return 'config:repo-root';
+  }
+  return '';
+}
+
+function resolveRelativeImport(projectPath, fromFile, specifier) {
+  const root = String(projectPath || '').trim();
+  const from = String(fromFile || '').trim().replace(/\\/g, '/');
+  const raw = String(specifier || '').trim();
+  if (!root || !from || !raw.startsWith('.')) return '';
+  const fromDir = path.posix.dirname(from);
+  const basePath = path.posix.normalize(path.posix.join(fromDir, raw));
+  const candidates = [
+    basePath,
+    ...[...CODE_LIKE_EXTENSIONS].map((ext) => `${basePath}${ext}`),
+    ...[...CODE_LIKE_EXTENSIONS].map((ext) => path.posix.join(basePath, `index${ext}`))
+  ];
+  for (const candidate of candidates) {
+    const absolutePath = path.join(root, ...candidate.split('/'));
+    if (existsSync(absolutePath)) return candidate;
+  }
+  return basePath;
+}
+
+function importTargetsFromSource(projectPath, relativePath, sourceText) {
+  const targets = new Set();
+  let match;
+  while ((match = REPO_IMPORT_PATTERN.exec(sourceText)) !== null) {
+    const specifier = match[1] || match[2] || match[3] || '';
+    const resolved = resolveRelativeImport(projectPath, relativePath, specifier);
+    if (resolved) targets.add(resolved.toLowerCase());
+  }
+  while ((match = PYTHON_IMPORT_PATTERN.exec(sourceText)) !== null) {
+    const specifier = match[1] || match[2] || '';
+    const resolved = resolveRelativeImport(projectPath, relativePath, specifier);
+    if (resolved) targets.add(resolved.toLowerCase());
+  }
+  return [...targets];
+}
+
+function declaredSymbolsFromSource(sourceText) {
+  const symbols = new Set();
+  let match;
+  while ((match = DECLARED_SYMBOL_PATTERN.exec(sourceText)) !== null) {
+    const symbol = String(match[1] || '').trim().toLowerCase();
+    if (symbol) symbols.add(symbol);
+  }
+  return [...symbols];
+}
+
+function readTaskParallelSignals(task, projectPath, cache = null) {
+  const cacheKey = `${String(projectPath || '').trim()}::${task?.id || JSON.stringify(task?.filesLikely || [])}`;
+  if (cache?.has(cacheKey)) return cache.get(cacheKey);
+  const files = normalizeFilesLikely(task?.filesLikely);
+  const signals = {
+    files,
+    domains: new Set(),
+    configKeys: new Set(),
+    fixtureKeys: new Set(),
+    importTargets: new Set(),
+    importedDomains: new Set(),
+    symbols: new Set()
+  };
+  for (const filePath of files) {
+    if (!filePath || filePath === '*') continue;
+    const normalized = filePath.toLowerCase();
+    const domain = collisionDomainRoot(normalized);
+    if (domain) signals.domains.add(domain);
+    const configKey = sharedConfigKey(normalized);
+    if (configKey) signals.configKeys.add(configKey);
+    const fixtureKey = sharedFixtureKey(normalized);
+    if (fixtureKey) signals.fixtureKeys.add(fixtureKey);
+    for (const token of basenameTokens(normalized)) {
+      signals.symbols.add(token);
+    }
+    const absolutePath = String(projectPath || '').trim()
+      ? path.join(String(projectPath || '').trim(), ...normalized.split('/'))
+      : '';
+    if (!absolutePath || !existsSync(absolutePath) || !isCodeLikePath(normalized)) continue;
+    let sourceText = '';
+    try {
+      sourceText = readFileSync(absolutePath, 'utf8');
+    } catch {
+      sourceText = '';
+    }
+    if (!sourceText) continue;
+    for (const importTarget of importTargetsFromSource(projectPath, normalized, sourceText)) {
+      signals.importTargets.add(importTarget);
+      const importedDomain = collisionDomainRoot(importTarget);
+      if (importedDomain) signals.importedDomains.add(importedDomain);
+      const importedConfigKey = sharedConfigKey(importTarget);
+      if (importedConfigKey) signals.configKeys.add(importedConfigKey);
+      const importedFixtureKey = sharedFixtureKey(importTarget);
+      if (importedFixtureKey) signals.fixtureKeys.add(importedFixtureKey);
+    }
+    for (const symbol of declaredSymbolsFromSource(sourceText)) {
+      signals.symbols.add(symbol);
+    }
+  }
+  for (const token of taskTextTokens(task)) {
+    signals.symbols.add(token);
+  }
+  const finalized = {
+    files,
+    domains: [...signals.domains],
+    configKeys: [...signals.configKeys],
+    fixtureKeys: [...signals.fixtureKeys],
+    importTargets: [...signals.importTargets],
+    importedDomains: [...signals.importedDomains],
+    symbols: [...signals.symbols]
+  };
+  cache?.set(cacheKey, finalized);
+  return finalized;
+}
+
+function sameSetIntersection(left, right) {
+  return left.some((item) => right.includes(item));
+}
+
+export function tasksCollide(left, right, projectPath = '', cache = null) {
   const a = normalizeFilesLikely(left.filesLikely);
   const b = normalizeFilesLikely(right.filesLikely);
   if (a.includes('*') || b.includes('*')) return true;
   if (a.some((item) => b.some((candidate) => filesLikelyOverlap(item, candidate)))) return true;
-  const aDomains = new Set(a.map(collisionDomainRoot).filter(Boolean));
-  const bDomains = new Set(b.map(collisionDomainRoot).filter(Boolean));
-  return [...aDomains].some((domain) => bDomains.has(domain));
+  const leftSignals = readTaskParallelSignals(left, projectPath, cache);
+  const rightSignals = readTaskParallelSignals(right, projectPath, cache);
+  if (sameSetIntersection(leftSignals.domains, rightSignals.domains)) return true;
+  if (sameSetIntersection(leftSignals.configKeys, rightSignals.configKeys)) return true;
+  if (sameSetIntersection(leftSignals.fixtureKeys, rightSignals.fixtureKeys)) return true;
+  if (leftSignals.importTargets.some((item) => b.includes(item) || rightSignals.importTargets.includes(item))) return true;
+  if (rightSignals.importTargets.some((item) => a.includes(item) || leftSignals.importTargets.includes(item))) return true;
+  if (sameSetIntersection(leftSignals.importedDomains, rightSignals.domains) || sameSetIntersection(rightSignals.importedDomains, leftSignals.domains)) return true;
+  return sameSetIntersection(leftSignals.symbols, rightSignals.symbols)
+    && (sameSetIntersection(leftSignals.domains, rightSignals.importedDomains)
+      || sameSetIntersection(rightSignals.domains, leftSignals.importedDomains)
+      || sameSetIntersection(leftSignals.domains, rightSignals.domains));
 }
 
 function nextTaskId(tasks) {
@@ -2805,6 +2996,35 @@ function buildMemoryPromptLines(memory) {
   return lines;
 }
 
+export function buildProjectPlanningPriorLines(memory, run = null) {
+  const lines = [];
+  const failures = memory?.failureAnalytics || {};
+  const trace = memory?.traceSummary || {};
+  if (Number(failures.scopeDriftCount || 0) > 0) {
+    lines.push('- Project-specific prior: recent runs drifted scope. Lock excluded scope and filesLikely before widening the graph.');
+  }
+  if (Number(failures.verificationFailures || 0) > 0) {
+    lines.push('- Project-specific prior: recent runs failed verification. Put explicit mechanical checks close to each code-changing task.');
+  }
+  if (Number(failures.retryCount || 0) > 1 || String(trace.lastDecision || '').trim().toLowerCase() === 'retry') {
+    lines.push('- Project-specific prior: recent runs needed retries. Prefer smaller slices and a materially different approach when a path already failed.');
+  }
+  if (run?.project?.phaseTitle) {
+    lines.push(`- Project-specific prior: keep the plan inside the active phase boundary (${run.project.phaseTitle}).`);
+  }
+  const memoryExamples = (Array.isArray(memory?.searchResults) ? memory.searchResults : [])
+    .filter((item) => ['retry-plan', 'execution-summary', 'review-verdict', 'task-memory', 'artifact-memory'].includes(String(item?.kind || '').trim()))
+    .slice(0, 2)
+    .map((item) => {
+      const bits = [item.title, clipText(item.snippet || '', 120)].filter(Boolean);
+      return bits.join(' | ');
+    });
+  if (memoryExamples.length) {
+    lines.push(`- Grounding examples from project memory: ${memoryExamples.join(' || ')}`);
+  }
+  return lines;
+}
+
 async function resolvePromptMemory(run, query, limit = 4, options = {}) {
   if (!run.memory?.projectKey) {
     return {
@@ -3565,6 +3785,7 @@ function buildPlannerPrompt(run, memory, provider = 'codex') {
     `Spec bundle: ${path.join(runDir(run.id), 'input', 'spec-bundle.md')}`,
     `Project summary: ${path.join(runDir(run.id), 'context', 'project-summary.md')}`,
     ...buildMemoryPromptLines(memory),
+    ...buildProjectPlanningPriorLines(memory, run),
     ...buildHarnessGuidanceLines(run.harnessConfig, 'planner', provider),
     run.projectPath ? `Project root: ${run.projectPath}` : 'Project root: none',
     ...buildProjectPromptLines(run),
@@ -4084,6 +4305,7 @@ function buildAutomaticReplanPrompt(run, memory, checkpoint, provider = 'codex')
     `Harness guidance: ${harnessGuidancePath(run.id)}`,
     `Current checkpoint: ${runCheckpointPath(run.id)}`,
     ...buildMemoryPromptLines(memory),
+    ...buildProjectPlanningPriorLines(memory, run),
     ...buildHarnessGuidanceLines(run.harnessConfig, 'replanner', provider),
     run.projectPath ? `Project root: ${run.projectPath}` : 'Project root: none',
     ...buildProjectPromptLines(run),
@@ -4609,21 +4831,47 @@ async function persistProjectMemory(runId) {
   await applyMemorySnapshot(runId, snapshot);
 }
 
-function pickBatch(tasks, maxParallel, executionPolicy = defaultExecutionPolicy()) {
+export function resolveAdaptiveParallelLimit(run, tasks, maxParallel, executionPolicy = defaultExecutionPolicy()) {
+  const readyTasks = Array.isArray(tasks)
+    ? tasks.filter((task) => task.status === 'ready')
+    : [];
+  const baseLimit = executionPolicy.parallelMode === 'parallel' ? Math.max(1, Number(maxParallel || 1)) : 1;
+  if (baseLimit <= 1) {
+    return { limit: 1, reason: 'sequential-policy' };
+  }
+  const failures = run?.memory?.failureAnalytics || {};
+  const failedCount = Array.isArray(tasks) ? tasks.filter((task) => task.status === 'failed').length : 0;
+  const retryReadyCount = readyTasks.filter((task) => Number(task.attempts || 0) > 0).length;
+  const highDriftCount = Number(run?.metrics?.replanHighDriftCount || 0);
+  if (failedCount > 0 || retryReadyCount > 0 || highDriftCount > 0 || Number(failures.scopeDriftCount || 0) > 0) {
+    return { limit: 1, reason: 'stability-recovery' };
+  }
+  if (Number(failures.verificationFailures || 0) > 1 || Number(failures.retryCount || 0) > 2) {
+    return { limit: Math.min(baseLimit, 1), reason: 'recent-failure-patterns' };
+  }
+  if (readyTasks.length >= baseLimit) {
+    return { limit: baseLimit, reason: 'full-width-safe' };
+  }
+  return { limit: Math.max(1, readyTasks.length), reason: readyTasks.length > 1 ? 'limited-ready-width' : 'single-runnable-task' };
+}
+
+function pickBatch(run, tasks, maxParallel, executionPolicy = defaultExecutionPolicy()) {
   const doneIds = new Set(tasks.filter((task) => isTaskSatisfiedStatus(task.status)).map((task) => task.id));
   const ready = tasks.filter((task) => task.status === 'ready' && (task.dependsOn || []).every((dep) => doneIds.has(dep)));
-  const allowedParallel = executionPolicy.parallelMode === 'parallel' ? maxParallel : 1;
+  const adaptive = resolveAdaptiveParallelLimit(run, tasks, maxParallel, executionPolicy);
+  const allowedParallel = adaptive.limit;
   if (allowedParallel <= 1) {
-    return ready.slice(0, 1);
+    return { batch: ready.slice(0, 1), adaptive };
   }
   const batch = [];
+  const signalCache = new Map();
   for (const task of ready) {
     if (batch.length >= allowedParallel) break;
-    if (batch.every((picked) => !tasksCollide(task, picked))) {
+    if (batch.every((picked) => !tasksCollide(task, picked, run?.projectPath || '', signalCache))) {
       batch.push(task);
     }
   }
-  return batch.length ? batch : ready.slice(0, 1);
+  return { batch: batch.length ? batch : ready.slice(0, 1), adaptive };
 }
 
 function summarizeExecutionFailure(execution) {
@@ -5365,7 +5613,7 @@ async function loopRun(runId, controller) {
         continue;
       }
 
-      const batch = pickBatch(state.tasks, state.settings.maxParallel, state.executionPolicy);
+      const { batch, adaptive } = pickBatch(state, state.tasks, state.settings.maxParallel, state.executionPolicy);
       if (!batch.length) {
         const blockedTasks = describeBlockedTasks(state.tasks);
         await appendLog(runId, 'error', 'No runnable tasks remain. The graph is blocked.', {
@@ -5388,6 +5636,15 @@ async function loopRun(runId, controller) {
         break;
       }
 
+      if ((state.executionPolicy?.parallelMode || 'sequential') === 'parallel'
+        && Number(adaptive?.limit || 1) < Math.max(1, Number(state.settings?.maxParallel || 1))
+        && adaptive?.reason !== 'single-runnable-task') {
+        await appendLog(runId, 'info', 'Adaptive parallelism reduced the current batch width.', {
+          requestedParallel: Number(state.settings?.maxParallel || 1),
+          appliedParallel: Number(adaptive?.limit || 1),
+          reason: adaptive?.reason || 'adaptive'
+        });
+      }
       await Promise.all(batch.map((task) => executeTask(runId, task.id, controller)));
       const checkpoint = await writeRunCheckpoint(runId, 'task-batch-completed');
       const replan = await maybeAutomaticReplan(runId, controller, checkpoint);

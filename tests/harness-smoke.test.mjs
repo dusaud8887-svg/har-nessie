@@ -9,6 +9,7 @@ import {
   analyzeProjectIntake,
   applyPlanPolicy,
   buildActionReplayEnvelope,
+  buildProjectPlanningPriorLines,
   buildCodexExecArgs,
   buildContinuationPromptLines,
   createProject,
@@ -25,11 +26,13 @@ import {
   listProjects,
   parseJsonReply,
   requeueFailedTasks,
+  resolveAdaptiveParallelLimit,
   runBrowserVerification,
   runProjectQualitySweep,
   retryTask,
   skipTask,
   stopRun,
+  tasksCollide,
   updateProject,
   updateHarnessSettings,
   updatePlanDraft
@@ -1966,6 +1969,91 @@ test('applyPlanPolicy downgrades docs-first parallelism when worktree isolation 
 
   assert.equal(policy.parallelMode, 'sequential');
   assert.ok(policy.policyNotes.some((item) => /isolated worktrees are unavailable/i.test(item)));
+});
+
+test('tasksCollide detects import, shared fixture, and shared config conflicts', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-collision-'));
+  try {
+    await fs.mkdir(path.join(tempDir, 'src', 'auth'), { recursive: true });
+    await fs.mkdir(path.join(tempDir, 'src', 'shared'), { recursive: true });
+    await fs.mkdir(path.join(tempDir, 'tests', '__fixtures__', 'auth'), { recursive: true });
+    await fs.writeFile(path.join(tempDir, 'src', 'auth', 'login.ts'), "import { authConfig } from '../shared/config';\nexport function createSession() { return authConfig; }\n", 'utf8');
+    await fs.writeFile(path.join(tempDir, 'src', 'shared', 'config.ts'), "export const authConfig = { enabled: true };\n", 'utf8');
+    await fs.writeFile(path.join(tempDir, 'vitest.config.ts'), "export default {};\n", 'utf8');
+    await fs.writeFile(path.join(tempDir, 'tests', '__fixtures__', 'auth', 'user.json'), '{"id":1}\n', 'utf8');
+    await fs.writeFile(path.join(tempDir, 'tests', '__fixtures__', 'auth', 'session.json'), '{"id":2}\n', 'utf8');
+
+    assert.equal(tasksCollide(
+      { id: 'T001', filesLikely: ['src/auth/login.ts'] },
+      { id: 'T002', filesLikely: ['src/shared/config.ts'] },
+      tempDir
+    ), true);
+    assert.equal(tasksCollide(
+      { id: 'T003', filesLikely: ['tests/__fixtures__/auth/user.json'] },
+      { id: 'T004', filesLikely: ['tests/__fixtures__/auth/session.json'] },
+      tempDir
+    ), true);
+    assert.equal(tasksCollide(
+      { id: 'T005', filesLikely: ['vitest.config.ts'] },
+      { id: 'T006', filesLikely: ['vite.config.ts'] },
+      tempDir
+    ), true);
+    assert.equal(tasksCollide(
+      { id: 'T007', filesLikely: ['docs/README.md'] },
+      { id: 'T008', filesLikely: ['docs/references/README.md'] },
+      tempDir
+    ), false);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('buildProjectPlanningPriorLines summarizes recent failure patterns into planner guidance', () => {
+  const lines = buildProjectPlanningPriorLines({
+    failureAnalytics: {
+      retryCount: 3,
+      verificationFailures: 2,
+      scopeDriftCount: 1
+    },
+    traceSummary: {
+      lastDecision: 'retry'
+    },
+    searchResults: [
+      { kind: 'retry-plan', title: 'Task T011 Retry Plan', snippet: 'switch to a smaller auth slice and verify first' },
+      { kind: 'execution-summary', title: 'Task T009 Execution Summary', snippet: 'scope drift touched unrelated docs and config' }
+    ]
+  }, {
+    project: { phaseTitle: 'Phase 2' }
+  });
+
+  assert.ok(lines.some((item) => /drifted scope/i.test(item)));
+  assert.ok(lines.some((item) => /failed verification/i.test(item)));
+  assert.ok(lines.some((item) => /needed retries/i.test(item)));
+  assert.ok(lines.some((item) => /Phase 2/.test(item)));
+  assert.ok(lines.some((item) => /Grounding examples/.test(item)));
+});
+
+test('resolveAdaptiveParallelLimit reduces fan-out after drift and keeps width on clean runs', () => {
+  const stable = resolveAdaptiveParallelLimit({
+    memory: { failureAnalytics: { retryCount: 0, verificationFailures: 0, scopeDriftCount: 0 } },
+    metrics: { replanHighDriftCount: 0 }
+  }, [
+    { id: 'T001', status: 'ready', attempts: 0 },
+    { id: 'T002', status: 'ready', attempts: 0 },
+    { id: 'T003', status: 'done', attempts: 0 }
+  ], 2, { parallelMode: 'parallel' });
+  const unstable = resolveAdaptiveParallelLimit({
+    memory: { failureAnalytics: { retryCount: 1, verificationFailures: 0, scopeDriftCount: 1 } },
+    metrics: { replanHighDriftCount: 1 }
+  }, [
+    { id: 'T001', status: 'ready', attempts: 0 },
+    { id: 'T002', status: 'ready', attempts: 1 },
+    { id: 'T003', status: 'failed', attempts: 1 }
+  ], 2, { parallelMode: 'parallel' });
+
+  assert.equal(stable.limit, 2);
+  assert.equal(unstable.limit, 1);
+  assert.match(String(unstable.reason || ''), /stability/i);
 });
 
 test('createRun defaults Codex execution settings', async () => {

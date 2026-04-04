@@ -1979,6 +1979,72 @@ test('docs-first preset applies the higher parallel default in the create form',
   assert.equal(document.getElementById('run-max-goal-loops-input').value, '4');
 });
 
+test('settings modal can fill and save preset strategy templates', async () => {
+  const { context, document, fetchStub } = await createUiHarness();
+  vm.runInContext(`
+    projects = [{ id: 'project-alpha', title: 'Alpha', defaultPresetId: 'existing-repo-feature', rootPath: 'D:/alpha', phases: [] }];
+    selectedProjectId = 'project-alpha';
+  `, context);
+  fetchStub.queue('/api/settings', {
+    includeGlobalAgents: true,
+    includeKarpathyGuidelines: true,
+    customConstitution: '',
+    plannerStrategy: '',
+    teamStrategy: '',
+    coordinationProvider: 'codex',
+    workerProvider: 'codex',
+    codexRuntimeProfile: 'yolo',
+    uiLanguage: 'ko',
+    agentLanguage: 'ko',
+    codexNotes: '',
+    claudeNotes: '',
+    geminiNotes: '',
+    claudeModel: '',
+    geminiModel: '',
+    geminiProjectId: ''
+  });
+  fetchStub.queue('/api/settings', {
+    includeGlobalAgents: true,
+    includeKarpathyGuidelines: true,
+    customConstitution: 'saved constitution',
+    plannerStrategy: 'saved planner',
+    teamStrategy: 'saved team',
+    coordinationProvider: 'codex',
+    workerProvider: 'codex',
+    codexRuntimeProfile: 'yolo',
+    uiLanguage: 'ko',
+    agentLanguage: 'ko',
+    codexNotes: '',
+    claudeNotes: '',
+    geminiNotes: '',
+    claudeModel: '',
+    geminiModel: '',
+    geminiProjectId: ''
+  });
+
+  await vm.runInContext('openSettingsModal()', context);
+  assert.equal(document.getElementById('settings-strategy-template').value, 'existing-repo-feature');
+
+  document.getElementById('settings-strategy-template').value = 'docs-spec-first';
+  document.getElementById('apply-strategy-template-btn').dispatchEvent('click');
+
+  assert.match(document.getElementById('custom-constitution').value, /source of record/i);
+  assert.match(document.getElementById('planner-strategy').value, /scope-locking|doc-alignment/i);
+  assert.match(document.getElementById('team-strategy').value, /spec-locker|verifier/i);
+
+  document.getElementById('harness-settings-form').dispatchEvent('submit', {
+    preventDefault() {}
+  });
+  await flush();
+  await flush();
+
+  const saveRequest = fetchStub.requests.find((entry) => entry.url === '/api/settings' && entry.options?.method === 'POST');
+  const body = JSON.parse(String(saveRequest?.options?.body || '{}'));
+  assert.match(body.customConstitution, /source of record/i);
+  assert.match(body.plannerStrategy, /scope-locking|doc-alignment/i);
+  assert.match(body.teamStrategy, /spec-locker|verifier/i);
+});
+
 test('parallel reason explains shared-workspace fallback and directory collisions', async () => {
   const { context } = await createUiHarness();
 
