@@ -1789,6 +1789,7 @@ test('createRun seeds memory analytics fields', async () => {
     assert.equal(typeof run.memory.failureAnalytics, 'object');
     assert.equal(typeof run.memory.traceSummary, 'object');
     assert.equal(typeof run.memory.graphInsights, 'object');
+    assert.equal(typeof run.memory.temporalInsights, 'object');
   } finally {
     if (runId) {
       await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
@@ -1865,6 +1866,8 @@ test('searchRunMemory exposes graph insights from the memory snapshot', async ()
     assert.ok(Array.isArray(snapshot.graphInsights?.topEdges));
     assert.ok(snapshot.graphInsights.topEdges.some((item) => /src\/ui\/login-form\.tsx->src\/auth\/session-service\.ts#buildAuthSession/.test(item.edge)));
     assert.ok(snapshot.graphInsights.topSymbols.some((item) => item.symbol === 'buildAuthSession'));
+    assert.ok(Array.isArray(snapshot.temporalInsights?.activeFiles));
+    assert.ok(snapshot.temporalInsights.activeFiles.some((item) => item.filePath === 'src/ui/login-form.tsx'));
   } finally {
     if (runId) {
       await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
@@ -1872,6 +1875,60 @@ test('searchRunMemory exposes graph insights from the memory snapshot', async ()
     if (projectKey) {
       await fs.rm(path.join(root, 'memory', 'projects', projectKey), { recursive: true, force: true }).catch(() => {});
     }
+  }
+});
+
+test('searchProjectMemory decays stale artifact records and favors recent matching evidence', async () => {
+  const projectKey = `decay-smoke-${Date.now()}`;
+  try {
+    const memory = await ensureProjectMemory(root, projectKey, { projectPath: root });
+    const oldCreatedAt = new Date(Date.now() - (120 * 24 * 60 * 60 * 1000)).toISOString();
+    const recentCreatedAt = new Date(Date.now() - (1 * 24 * 60 * 60 * 1000)).toISOString();
+    await fs.writeFile(memory.artifactIndexFile, [
+      JSON.stringify({
+        schemaVersion: '2',
+        artifactId: 'old-artifact',
+        title: 'Old retry artifact',
+        kind: 'execution-summary',
+        stage: 'review',
+        decision: 'retry',
+        summary: 'legacy login retry',
+        rootCause: 'stale auth branch',
+        keywords: ['login', 'retry', 'session'],
+        changedFiles: ['src/legacy/auth.ts'],
+        filesLikely: ['src/legacy/auth.ts'],
+        graphEdges: ['src/legacy/auth.ts->src/legacy/session.ts#buildLegacySession'],
+        graphSymbols: ['buildLegacySession'],
+        createdAt: oldCreatedAt,
+        updatedAt: oldCreatedAt
+      }),
+      JSON.stringify({
+        schemaVersion: '2',
+        artifactId: 'recent-artifact',
+        title: 'Recent retry artifact',
+        kind: 'execution-summary',
+        stage: 'review',
+        decision: 'retry',
+        summary: 'current login retry',
+        rootCause: 'session builder mismatch',
+        keywords: ['login', 'retry', 'session'],
+        changedFiles: ['src/auth/session-service.ts'],
+        filesLikely: ['src/auth/session-service.ts'],
+        graphEdges: ['src/ui/login-form.tsx->src/auth/session-service.ts#buildAuthSession'],
+        graphSymbols: ['buildAuthSession'],
+        createdAt: recentCreatedAt,
+        updatedAt: recentCreatedAt
+      })
+    ].join('\n') + '\n', 'utf8');
+
+    const snapshot = await searchProjectMemory(root, projectKey, 'login retry session', 5, { projectPath: root }, { reindex: false });
+    const firstArtifact = snapshot.searchResults.find((item) => item.kind === 'artifact-record');
+    assert.equal(firstArtifact?.title, 'Recent retry artifact');
+    assert.equal(snapshot.temporalInsights.activeDecisions[0]?.decision, 'retry');
+    assert.equal(snapshot.temporalInsights.activeFiles[0]?.filePath, 'src/auth/session-service.ts');
+    assert.equal(snapshot.graphInsights.topEdges[0]?.edge, 'src/ui/login-form.tsx->src/auth/session-service.ts#buildAuthSession');
+  } finally {
+    await fs.rm(path.join(root, 'memory', 'projects', projectKey), { recursive: true, force: true }).catch(() => {});
   }
 });
 

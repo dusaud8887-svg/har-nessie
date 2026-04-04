@@ -2975,6 +2975,9 @@ function buildMemoryPromptLines(memory) {
   ];
   if (memory?.failureAnalytics) {
     lines.push(`Failure analytics: retries=${memory.failureAnalytics.retryCount || 0} | verificationFailures=${memory.failureAnalytics.verificationFailures || 0} | scopeDrift=${memory.failureAnalytics.scopeDriftCount || 0}`);
+    if (Number(memory.failureAnalytics.retryPressure || 0) > 0 || Number(memory.failureAnalytics.verificationPressure || 0) > 0 || Number(memory.failureAnalytics.scopeDriftPressure || 0) > 0) {
+      lines.push(`Failure pressure: retry=${memory.failureAnalytics.retryPressure || 0} | verification=${memory.failureAnalytics.verificationPressure || 0} | scopeDrift=${memory.failureAnalytics.scopeDriftPressure || 0}`);
+    }
   }
   if (memory?.traceSummary) {
     lines.push(`Trace memory summary: artifacts=${memory.traceSummary.artifactCount || 0} | tasks=${memory.traceSummary.taskCount || 0} | lastDecision=${memory.traceSummary.lastDecision || 'none'}`);
@@ -2984,6 +2987,11 @@ function buildMemoryPromptLines(memory) {
   }
   if (Array.isArray(memory?.graphInsights?.topSymbols) && memory.graphInsights.topSymbols.length > 0) {
     lines.push(`Graph memory symbols: ${memory.graphInsights.topSymbols.slice(0, 6).map((item) => item.symbol).join(', ')}`);
+  }
+  if (memory?.temporalInsights) {
+    const topDecision = memory.temporalInsights.activeDecisions?.[0];
+    const hotFiles = (memory.temporalInsights.activeFiles || []).slice(0, 3).map((item) => item.filePath).join(', ');
+    lines.push(`Temporal memory: recentShare=${memory.temporalInsights.recentShare || 0} | hottestDecision=${topDecision?.decision || 'none'} | hottestFiles=${hotFiles || 'none'}`);
   }
 
   if (Array.isArray(memory?.searchResults) && memory.searchResults.length > 0) {
@@ -3005,6 +3013,7 @@ export function buildProjectPlanningPriorLines(memory, run = null) {
   const lines = [];
   const failures = memory?.failureAnalytics || {};
   const trace = memory?.traceSummary || {};
+  const temporal = memory?.temporalInsights || {};
   if (Number(failures.scopeDriftCount || 0) > 0) {
     lines.push('- Project-specific prior: recent runs drifted scope. Lock excluded scope and filesLikely before widening the graph.');
   }
@@ -3030,6 +3039,12 @@ export function buildProjectPlanningPriorLines(memory, run = null) {
   if (Array.isArray(memory?.graphInsights?.topEdges) && memory.graphInsights.topEdges.length > 0) {
     lines.push(`- Project-specific prior: recent graph edges touched together: ${memory.graphInsights.topEdges.slice(0, 3).map((item) => item.edge).join(' | ')}`);
   }
+  if (Number(temporal.recentShare || 0) >= 0.55 && Array.isArray(temporal.activeFiles) && temporal.activeFiles.length > 0) {
+    lines.push(`- Project-specific prior: recent memory dominates. Start from these hot files before reopening older areas: ${temporal.activeFiles.slice(0, 3).map((item) => item.filePath).join(' | ')}`);
+  }
+  if (Array.isArray(temporal.activeRootCauses) && temporal.activeRootCauses.length > 0) {
+    lines.push(`- Project-specific prior: recurring recent root causes: ${temporal.activeRootCauses.slice(0, 2).map((item) => item.reason).join(' | ')}`);
+  }
   return lines;
 }
 
@@ -3045,7 +3060,8 @@ async function resolvePromptMemory(run, query, limit = 4, options = {}) {
       searchBackend: 'none',
       failureAnalytics: null,
       traceSummary: null,
-      graphInsights: { topEdges: [], topSymbols: [] }
+      graphInsights: { topEdges: [], topSymbols: [] },
+      temporalInsights: { activeDecisions: [], activeFiles: [], activeRootCauses: [], recentShare: 0 }
     };
   }
   return searchProjectMemory(ROOT_DIR, run.memory.projectKey, query, limit, {
@@ -3070,7 +3086,8 @@ async function applyMemorySnapshot(runId, snapshot) {
       searchBackend: snapshot.searchBackend,
       failureAnalytics: snapshot.failureAnalytics || null,
       traceSummary: snapshot.traceSummary || null,
-      graphInsights: snapshot.graphInsights || { topEdges: [], topSymbols: [] }
+      graphInsights: snapshot.graphInsights || { topEdges: [], topSymbols: [] },
+      temporalInsights: snapshot.temporalInsights || { activeDecisions: [], activeFiles: [], activeRootCauses: [], recentShare: 0 }
     };
     await saveState(fresh);
   });
@@ -6910,7 +6927,8 @@ export async function searchRunMemory(runId, query) {
     dailyDir: snapshot.dailyDir,
     failureAnalytics: snapshot.failureAnalytics || null,
     traceSummary: snapshot.traceSummary || null,
-    graphInsights: snapshot.graphInsights || { topEdges: [], topSymbols: [] }
+    graphInsights: snapshot.graphInsights || { topEdges: [], topSymbols: [] },
+    temporalInsights: snapshot.temporalInsights || { activeDecisions: [], activeFiles: [], activeRootCauses: [], recentShare: 0 }
   };
 }
 
@@ -7251,7 +7269,9 @@ export async function createRun(input) {
       retrievedContext: memorySnapshot.retrievedContext,
       searchBackend: memorySnapshot.searchBackend,
       failureAnalytics: memorySnapshot.failureAnalytics || null,
-      traceSummary: memorySnapshot.traceSummary || null
+      traceSummary: memorySnapshot.traceSummary || null,
+      graphInsights: memorySnapshot.graphInsights || { topEdges: [], topSymbols: [] },
+      temporalInsights: memorySnapshot.temporalInsights || { activeDecisions: [], activeFiles: [], activeRootCauses: [], recentShare: 0 }
     },
     humanLoop: {
       clarifyAnswers: {},

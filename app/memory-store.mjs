@@ -7,6 +7,9 @@ try {
 } catch {}
 
 const indexStateCache = new Map();
+const MEMORY_RECENCY_HALF_LIFE_DAYS = 21;
+const GRAPH_RECENCY_HALF_LIFE_DAYS = 14;
+const MEMORY_RECENCY_FLOOR = 0.18;
 
 function now() {
   return new Date().toISOString();
@@ -63,6 +66,24 @@ function tailText(text, maxChars = 2400) {
 
 function cleanup(text) {
   return String(text || '').replace(/\s+/g, ' ').trim();
+}
+
+function timestampMs(value) {
+  return Date.parse(String(value || '').trim()) || 0;
+}
+
+function recencyWeight(timestamp, options = {}) {
+  const resolvedTimestamp = Number(timestamp || 0);
+  const halfLifeDays = Math.max(1, Number(options.halfLifeDays || MEMORY_RECENCY_HALF_LIFE_DAYS));
+  const floor = Math.min(0.95, Math.max(0, Number(options.floor ?? MEMORY_RECENCY_FLOOR)));
+  if (!resolvedTimestamp) return floor;
+  const ageDays = Math.max(0, (Date.now() - resolvedTimestamp) / (24 * 60 * 60 * 1000));
+  const decayed = Math.pow(0.5, ageDays / halfLifeDays);
+  return Number((floor + ((1 - floor) * decayed)).toFixed(4));
+}
+
+function recencyWeightForRecord(record, options = {}) {
+  return recencyWeight(timestampMs(record?.createdAt || record?.updatedAt || ''), options);
 }
 
 function normalizePath(value) {
@@ -297,6 +318,32 @@ async function readOptionalJson(filePath) {
 
 function uniqueStrings(values) {
   return [...new Set((Array.isArray(values) ? values : []).map((item) => String(item || '').trim()).filter(Boolean))];
+}
+
+function addWeightedCount(map, key, weight) {
+  const normalizedKey = String(key || '').trim();
+  if (!normalizedKey) return;
+  const safeWeight = Math.max(0, Number(weight || 0));
+  const previous = map.get(normalizedKey) || { count: 0, weight: 0 };
+  map.set(normalizedKey, {
+    count: previous.count + 1,
+    weight: Number((previous.weight + safeWeight).toFixed(4))
+  });
+}
+
+function topWeightedEntries(map, fieldName, limit) {
+  return [...map.entries()]
+    .sort((left, right) => {
+      if (right[1].weight !== left[1].weight) return right[1].weight - left[1].weight;
+      if (right[1].count !== left[1].count) return right[1].count - left[1].count;
+      return String(left[0]).localeCompare(String(right[0]));
+    })
+    .slice(0, Math.max(1, Number(limit || 4)))
+    .map(([key, stats]) => ({
+      [fieldName]: key,
+      count: stats.count,
+      weight: Number(stats.weight.toFixed(3))
+    }));
 }
 
 function normalizeSearchPaths(values) {
@@ -691,8 +738,10 @@ function scoreArtifactRecord(record, searchContext, options = {}) {
   if ((record.outOfScopeFiles || []).length) score += 10;
   if (String(record.decision || '') === 'retry') score += 8;
   if (String(record.decision || '') === 'failed') score += 10;
-  const updatedAt = Date.parse(record.createdAt || record.updatedAt || '') || 0;
-  if (updatedAt) score += Math.round(updatedAt / 1e11);
+  score += Math.round(recencyWeightForRecord(record, {
+    halfLifeDays: MEMORY_RECENCY_HALF_LIFE_DAYS,
+    floor: MEMORY_RECENCY_FLOOR
+  }) * 18);
   return score;
 }
 
@@ -721,8 +770,10 @@ function scoreDocResult(result, searchContext, query) {
   if (result.rankingMeta?.match === 'fts') {
     score += Math.max(0, 24 - Math.round(Number(result.rankingMeta.score || 0) * 4));
   }
-  const updatedAt = Date.parse(result.updatedAt || '') || 0;
-  if (updatedAt) score += Math.round(updatedAt / 1e11);
+  score += Math.round(recencyWeight(timestampMs(result.updatedAt || ''), {
+    halfLifeDays: MEMORY_RECENCY_HALF_LIFE_DAYS,
+    floor: MEMORY_RECENCY_FLOOR
+  }) * 14);
   return score;
 }
 
@@ -774,27 +825,66 @@ function buildGraphMemory(taskCodeContext = null) {
 
 function buildGraphInsights(records = []) {
   const recent = [...(Array.isArray(records) ? records : [])]
-    .sort((left, right) => (Date.parse(right.createdAt || right.updatedAt || '') || 0) - (Date.parse(left.createdAt || left.updatedAt || '') || 0))
-    .slice(0, 12);
+    .sort((left, right) => timestampMs(right.createdAt || right.updatedAt || '') - timestampMs(left.createdAt || left.updatedAt || ''))
+    .slice(0, 40);
   const edgeCounts = new Map();
   const symbolCounts = new Map();
   for (const record of recent) {
+    const weight = recencyWeightForRecord(record, {
+      halfLifeDays: GRAPH_RECENCY_HALF_LIFE_DAYS,
+      floor: 0.12
+    });
     for (const edge of record.graphEdges || []) {
-      edgeCounts.set(edge, (edgeCounts.get(edge) || 0) + 1);
+      addWeightedCount(edgeCounts, edge, weight);
     }
     for (const symbol of record.graphSymbols || []) {
-      symbolCounts.set(symbol, (symbolCounts.get(symbol) || 0) + 1);
+      addWeightedCount(symbolCounts, symbol, weight);
     }
   }
   return {
-    topEdges: [...edgeCounts.entries()]
-      .sort((left, right) => right[1] - left[1])
-      .slice(0, 6)
-      .map(([edge, count]) => ({ edge, count })),
-    topSymbols: [...symbolCounts.entries()]
-      .sort((left, right) => right[1] - left[1])
-      .slice(0, 8)
-      .map(([symbol, count]) => ({ symbol, count }))
+    decayHalfLifeDays: GRAPH_RECENCY_HALF_LIFE_DAYS,
+    topEdges: topWeightedEntries(edgeCounts, 'edge', 6),
+    topSymbols: topWeightedEntries(symbolCounts, 'symbol', 8)
+  };
+}
+
+function buildTemporalInsights(records = []) {
+  const source = Array.isArray(records) ? records : [];
+  const decisionCounts = new Map();
+  const fileCounts = new Map();
+  const rootCauseCounts = new Map();
+  const recentWindowDays = 14;
+  const recentCutoff = Date.now() - (recentWindowDays * 24 * 60 * 60 * 1000);
+  let recentWeight = 0;
+  let totalWeight = 0;
+  let newestArtifactAt = '';
+
+  for (const record of source) {
+    const createdAtMs = timestampMs(record.createdAt || record.updatedAt || '');
+    const weight = recencyWeight(createdAtMs, {
+      halfLifeDays: MEMORY_RECENCY_HALF_LIFE_DAYS,
+      floor: MEMORY_RECENCY_FLOOR
+    });
+    totalWeight += weight;
+    if (createdAtMs >= recentCutoff) recentWeight += weight;
+    if (!newestArtifactAt || createdAtMs > timestampMs(newestArtifactAt)) {
+      newestArtifactAt = record.createdAt || record.updatedAt || newestArtifactAt;
+    }
+    addWeightedCount(decisionCounts, record.decision || 'unknown', weight);
+    for (const filePath of [...(record.changedFiles || []), ...(record.outOfScopeFiles || []), ...(record.filesLikely || [])]) {
+      addWeightedCount(fileCounts, filePath, weight);
+    }
+    addWeightedCount(rootCauseCounts, record.rootCause || '', weight);
+  }
+
+  return {
+    decayHalfLifeDays: MEMORY_RECENCY_HALF_LIFE_DAYS,
+    recentWindowDays,
+    recentShare: totalWeight ? Number((recentWeight / totalWeight).toFixed(3)) : 0,
+    newestArtifactAt,
+    activeDecisions: topWeightedEntries(decisionCounts, 'decision', 4),
+    activeFiles: topWeightedEntries(fileCounts, 'filePath', 4),
+    activeRootCauses: topWeightedEntries(rootCauseCounts, 'reason', 4)
   };
 }
 
@@ -873,6 +963,7 @@ async function searchArtifactRecords(paths, query, limit, options = {}, records 
     rankingMeta: {
       source: 'artifact-record',
       score,
+      recencyWeight: recencyWeightForRecord(record),
       verificationOk: record.verificationOk !== false,
       matchedFiles: uniqueStrings(record.filesLikely).slice(0, 4),
       matchedSymbols: uniqueStrings([...(record.symbolHints || []), ...(record.graphSymbols || [])]).slice(0, 4),
@@ -893,16 +984,18 @@ function buildFailureAnalytics(records) {
   const recentRecords = records.filter((record) => (Date.parse(record.createdAt || record.updatedAt || '') || 0) >= recentCutoff);
 
   for (const record of records) {
+    const weight = recencyWeightForRecord(record, {
+      halfLifeDays: MEMORY_RECENCY_HALF_LIFE_DAYS,
+      floor: MEMORY_RECENCY_FLOOR
+    });
     for (const check of record.acceptanceFailures || []) {
-      acceptanceCounts.set(check, (acceptanceCounts.get(check) || 0) + 1);
+      addWeightedCount(acceptanceCounts, check, weight);
     }
     for (const filePath of [...(record.outOfScopeFiles || []), ...(record.changedFiles || [])]) {
-      fileCounts.set(filePath, (fileCounts.get(filePath) || 0) + 1);
+      addWeightedCount(fileCounts, filePath, weight);
     }
-    if (record.rootCause) {
-      rootCauseCounts.set(record.rootCause, (rootCauseCounts.get(record.rootCause) || 0) + 1);
-    }
-    stageCounts.set(record.stage || 'unknown', (stageCounts.get(record.stage || 'unknown') || 0) + 1);
+    addWeightedCount(rootCauseCounts, record.rootCause || '', weight);
+    addWeightedCount(stageCounts, record.stage || 'unknown', weight);
   }
 
   const recentFailure = [...records]
@@ -914,27 +1007,23 @@ function buildFailureAnalytics(records) {
     retryCount: retryRecords.length,
     verificationFailures: failedVerification.length,
     scopeDriftCount: scopeDrift.length,
-    topAcceptanceFailures: [...acceptanceCounts.entries()]
-      .sort((left, right) => right[1] - left[1])
-      .slice(0, 4)
-      .map(([check, count]) => ({ check, count })),
-    topFailureFiles: [...fileCounts.entries()]
-      .sort((left, right) => right[1] - left[1])
-      .slice(0, 4)
-      .map(([filePath, count]) => ({ filePath, count })),
-    topRootCauses: [...rootCauseCounts.entries()]
-      .sort((left, right) => right[1] - left[1])
-      .slice(0, 4)
-      .map(([reason, count]) => ({ reason, count })),
-    stageFailures: [...stageCounts.entries()]
-      .sort((left, right) => right[1] - left[1])
-      .slice(0, 4)
-      .map(([stage, count]) => ({ stage, count })),
+    decayHalfLifeDays: MEMORY_RECENCY_HALF_LIFE_DAYS,
+    retryPressure: Number(retryRecords.reduce((sum, record) => sum + recencyWeightForRecord(record), 0).toFixed(3)),
+    verificationPressure: Number(failedVerification.reduce((sum, record) => sum + recencyWeightForRecord(record), 0).toFixed(3)),
+    scopeDriftPressure: Number(scopeDrift.reduce((sum, record) => sum + recencyWeightForRecord(record), 0).toFixed(3)),
+    topAcceptanceFailures: topWeightedEntries(acceptanceCounts, 'check', 4),
+    topFailureFiles: topWeightedEntries(fileCounts, 'filePath', 4),
+    topRootCauses: topWeightedEntries(rootCauseCounts, 'reason', 4),
+    stageFailures: topWeightedEntries(stageCounts, 'stage', 4),
     longHorizon: {
       windowDays: 14,
       totalFailures: retryRecords.length + failedVerification.length + scopeDrift.length,
       retryRate: records.length ? Number((retryRecords.length / records.length).toFixed(3)) : 0,
-      recentFailures: recentRecords.filter((record) => String(record.decision || '') === 'retry' || record.verificationOk === false || (record.outOfScopeFiles || []).length).length
+      recentFailures: recentRecords.filter((record) => String(record.decision || '') === 'retry' || record.verificationOk === false || (record.outOfScopeFiles || []).length).length,
+      recentFailurePressure: Number(recentRecords
+        .filter((record) => String(record.decision || '') === 'retry' || record.verificationOk === false || (record.outOfScopeFiles || []).length)
+        .reduce((sum, record) => sum + recencyWeightForRecord(record), 0)
+        .toFixed(3))
     },
     recentFailure: recentFailure
       ? {
@@ -980,6 +1069,7 @@ export async function ensureProjectMemory(rootDir, projectKey, meta = {}) {
     failureAnalytics: buildFailureAnalytics([]),
     traceSummary: buildTraceSummary([]),
     graphInsights: buildGraphInsights([]),
+    temporalInsights: buildTemporalInsights([]),
     compaction: {
       originalCount: 0,
       compactedCount: 0,
@@ -1089,6 +1179,7 @@ export async function searchProjectMemory(rootDir, projectKey, query, limit = 5,
     failureAnalytics: buildFailureAnalytics(compaction.records),
     traceSummary: buildTraceSummary(compaction.records),
     graphInsights: buildGraphInsights(compaction.records),
+    temporalInsights: buildTemporalInsights(compaction.records),
     compaction
   };
 }

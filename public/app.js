@@ -3676,6 +3676,8 @@ let runs = [];
       const res = await request(`/api/runs/${selectedRunId}/memory?q=${encodeURIComponent(q)}`);
       const graphEdges = Array.isArray(res.graphInsights?.topEdges) ? res.graphInsights.topEdges.slice(0, 3) : [];
       const graphSymbols = Array.isArray(res.graphInsights?.topSymbols) ? res.graphInsights.topSymbols.slice(0, 5) : [];
+      const temporalFiles = Array.isArray(res.temporalInsights?.activeFiles) ? res.temporalInsights.activeFiles.slice(0, 3) : [];
+      const temporalRootCauses = Array.isArray(res.temporalInsights?.activeRootCauses) ? res.temporalInsights.activeRootCauses.slice(0, 2) : [];
       const graphMarkup = graphEdges.length || graphSymbols.length
         ? `
         <div style="margin-bottom: 12px; padding: 10px; background: #eef6ff; border-radius: 6px; font-size: 13px;">
@@ -3685,13 +3687,23 @@ let runs = [];
         </div>
       `
         : '';
+      const temporalMarkup = temporalFiles.length || temporalRootCauses.length || Number(res.temporalInsights?.recentShare || 0) > 0
+        ? `
+        <div style="margin-bottom: 12px; padding: 10px; background: #f5f7eb; border-radius: 6px; font-size: 13px;">
+          <strong>${t('시간축 메모리 힌트', 'Temporal memory hints')}</strong>
+          <div style="color: var(--muted); margin-top: 4px;">${escapeHtml(`${t('최근 비중', 'Recent share')}: ${Number(res.temporalInsights?.recentShare || 0).toFixed(3)}`)}</div>
+          ${temporalFiles.length ? `<div style="color: var(--muted); margin-top: 4px;">${escapeHtml(temporalFiles.map((item) => item.filePath).join(' | '))}</div>` : ''}
+          ${temporalRootCauses.length ? `<div style="color: var(--muted); margin-top: 4px;">${escapeHtml(temporalRootCauses.map((item) => item.reason).join(' | '))}</div>` : ''}
+        </div>
+      `
+        : '';
       const resultMarkup = (res.searchResults || []).map(h => `
         <div style="margin-bottom: 12px; padding: 10px; background: #f8fafc; border-radius: 6px; font-size: 13px;">
           <strong>${escapeHtml(h.title)}</strong>
           <div style="color: var(--muted); margin-top: 4px;">${escapeHtml(h.snippet)}</div>
         </div>
       `).join('') || t('결과 없음', 'No results');
-      document.getElementById('mem-results').innerHTML = `${graphMarkup}${resultMarkup}`;
+      document.getElementById('mem-results').innerHTML = `${graphMarkup}${temporalMarkup}${resultMarkup}`;
     }
 
     async function refreshSystemInfo() {

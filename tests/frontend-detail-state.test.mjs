@@ -1534,6 +1534,11 @@ test('memory search renders graph memory hints alongside search hits', async () 
     graphInsights: {
       topEdges: [{ edge: 'src/ui/login-form.tsx->src/auth/session-service.ts#buildAuthSession', count: 2 }],
       topSymbols: [{ symbol: 'buildAuthSession', count: 3 }]
+    },
+    temporalInsights: {
+      recentShare: 0.812,
+      activeFiles: [{ filePath: 'src/auth/session-service.ts', count: 2, weight: 1.41 }],
+      activeRootCauses: [{ reason: 'session builder mismatch', count: 1, weight: 0.92 }]
     }
   });
 
@@ -1543,7 +1548,10 @@ test('memory search renders graph memory hints alongside search hits', async () 
 
   const markup = document.getElementById('mem-results').innerHTML;
   assert.match(markup, /Graph memory hints|그래프 메모리 힌트/);
+  assert.match(markup, /Temporal memory hints|시간축 메모리 힌트/);
+  assert.match(markup, /Recent share|최근 비중/);
   assert.match(markup, /buildAuthSession/);
+  assert.match(markup, /session builder mismatch/);
   assert.match(markup, /Graph memory artifact/);
 });
 
