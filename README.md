@@ -112,15 +112,15 @@ memory/projects/<project-key>/
 
 All machine-local. Gitignored by default.
 
-## Validate
-
-```sh
-npm run validate
-```
-
 ## Docs
 
 - [User Guide](./USER_GUIDE.md)
 - [Architecture](./ARCHITECTURE.md)
 - [Operations](./OPERATIONS.md)
 - [Deployment](./DEPLOYMENT.md)
+
+## Development check
+
+```sh
+npm run validate
+```

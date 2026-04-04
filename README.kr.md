@@ -105,15 +105,15 @@ memory/projects/<project-key>/
 
 전부 로컬. 기본적으로 gitignore에 포함됨.
 
-## 점검
-
-```sh
-npm run validate
-```
-
 ## 문서
 
 - [사용자 가이드](./USER_GUIDE.kr.md)
 - [구조 설명](./ARCHITECTURE.kr.md)
 - [운영 가이드](./OPERATIONS.kr.md)
 - [배포 가이드](./DEPLOYMENT.kr.md)
+
+## 개발 확인
+
+```sh
+npm run validate
+```
