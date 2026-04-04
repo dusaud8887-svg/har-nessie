@@ -1654,11 +1654,21 @@ let runs = [];
       const doneIds = new Set(tasks.filter((task) => task.status === 'done' || task.status === 'skipped').map((task) => task.id));
       const ready = tasks.filter((task) => task.status === 'ready' && (task.dependsOn || []).every((dep) => doneIds.has(dep)));
       const worktreeEligible = run.preflight?.project?.worktreeEligible !== false;
+      const failureAnalytics = run.memory?.failureAnalytics || {};
+      const failedCount = tasks.filter((task) => task.status === 'failed').length;
+      const retryReadyCount = ready.filter((task) => Number(task.attempts || 0) > 0).length;
+      const highDriftCount = Number(run.metrics?.replanHighDriftCount || 0);
       if ((run.executionPolicy?.parallelMode || 'sequential') !== 'parallel') {
         if (!worktreeEligible && ((run.profile?.flowProfile || 'sequential') === 'hybrid' || Number(run.settings?.maxParallel || 0) > 1)) {
           return '공유 워크스페이스 상태라 병렬 실행을 잠시 끄고 1개씩 진행합니다.';
         }
         return '현재 계획 패턴이 순차 실행이라 한 번에 1개씩 진행합니다.';
+      }
+      if (failedCount > 0 || retryReadyCount > 0 || highDriftCount > 0 || Number(failureAnalytics.scopeDriftCount || 0) > 0) {
+        return '최근 실패·재시도·drift 신호가 있어 adaptive parallelism이 현재 배치를 1개씩으로 줄였습니다.';
+      }
+      if (Number(failureAnalytics.verificationFailures || 0) > 1 || Number(failureAnalytics.retryCount || 0) > 2) {
+        return '최근 verification 실패 패턴이 누적돼 adaptive parallelism이 병렬 폭을 보수적으로 낮췄습니다.';
       }
       if (ready.length <= 1) {
         return ready.length ? '현재는 바로 실행 가능한 태스크가 1개뿐입니다.' : '현재는 선행 태스크나 실패 태스크 때문에 바로 실행 가능한 태스크가 없습니다.';

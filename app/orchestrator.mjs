@@ -2784,6 +2784,7 @@ function buildHarnessGuidanceDocument(run) {
   const teamBlueprint = run.harnessConfig?.teamBlueprint || deriveTeamBlueprint(run);
   const executionPolicy = run.executionPolicy || defaultExecutionPolicy(run.profile);
   const presetBaseline = presetPolicyBaseline(run);
+  const planningPrior = buildProjectPlanningPriorLines(run.memory, run);
   const providerProfile = resolveRunProviderProfile(run);
   const lines = [
     '# Harness Guidance',
@@ -2844,6 +2845,13 @@ function buildHarnessGuidanceDocument(run) {
   lines.push(`- Constitution: ${presetBaseline.constitution}`);
   lines.push(`- Planner: ${presetBaseline.planner}`);
   lines.push(`- Team: ${presetBaseline.team}`, '');
+
+  lines.push('## Project-Specific Planning Prior', '');
+  if (planningPrior.length) {
+    lines.push(...planningPrior, '');
+  } else {
+    lines.push('- No project-specific prior has been learned yet.', '');
+  }
 
   lines.push('## Effective Prompt Sources', '');
   if (run.harnessConfig?.promptSourceReport?.precedence) {

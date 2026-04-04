@@ -2080,6 +2080,20 @@ test('parallel reason explains shared-workspace fallback and directory collision
     preflight: { project: { worktreeEligible: true } }
   })})`, context);
   assert.match(subsystemReason, /T003-T004/);
+
+  const adaptiveReason = vm.runInContext(`deriveParallelReason(${JSON.stringify({
+    tasks: [
+      { id: 'T010', status: 'ready', dependsOn: [], filesLikely: ['src/a.ts'], title: 'A', attempts: 1 },
+      { id: 'T011', status: 'failed', dependsOn: [], filesLikely: ['src/b.ts'], title: 'B', attempts: 1 }
+    ],
+    settings: { maxParallel: 2 },
+    profile: { flowProfile: 'hybrid' },
+    executionPolicy: { parallelMode: 'parallel' },
+    memory: { failureAnalytics: { retryCount: 2, verificationFailures: 1, scopeDriftCount: 1 } },
+    metrics: { replanHighDriftCount: 1 },
+    preflight: { project: { worktreeEligible: true } }
+  })})`, context);
+  assert.match(adaptiveReason, /adaptive parallelism/i);
 });
 
 test('draft diagnostics shows autonomy trust level and stronger input warnings', async () => {

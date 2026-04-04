@@ -58,10 +58,29 @@ Impact:
 - worktree isolation may be unavailable
 - tasks may run in the shared workspace instead
 - even if a preset prefers parallel execution, the live run may downgrade to one task at a time for safety
+- adaptive parallelism may also keep the live batch at width 1 when recent drift, retries, or verification failures suggest instability
 
 Preferred fix:
 
 - commit, stash, or move the work first
+
+### Parallelism looks lower than the preset
+
+This can happen for three different reasons:
+
+- the preset or plan pattern is sequential
+- shared-workspace fallback disabled parallel execution
+- adaptive parallelism saw recent failures, retries, or scope drift and temporarily reduced the current batch width
+
+Check the run detail message first. It explains which of the three is active.
+
+### Strategy template in settings
+
+The settings modal includes a preset strategy template helper.
+
+- it fills `customConstitution`, `plannerStrategy`, and `teamStrategy`
+- it is machine-local only
+- it does not edit repo files by itself
 
 ### Path is too long
 

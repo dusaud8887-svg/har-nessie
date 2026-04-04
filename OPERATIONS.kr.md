@@ -58,10 +58,29 @@ CLI가 하나 이상 설치되어 있어야 합니다.
 - worktree 격리가 안 될 수 있음
 - shared workspace에서 바로 실행될 수 있음
 - 병렬 실행 기본값이 있어도 실제 run은 안전하게 1개씩으로 내려갈 수 있음
+- 최근 drift, retry, verification 실패가 쌓이면 adaptive parallelism이 현재 배치를 1개씩으로 더 줄일 수 있음
 
 권장 조치:
 
 - 먼저 커밋하거나 stash 하거나 작업을 정리
+
+### preset보다 병렬이 적게 도는 것처럼 보임
+
+이건 보통 세 가지 중 하나입니다.
+
+- preset 또는 계획 패턴 자체가 순차
+- shared workspace fallback 때문에 병렬이 꺼짐
+- adaptive parallelism이 최근 실패, 재시도, scope drift를 보고 현재 배치 폭을 임시로 줄임
+
+먼저 run 상세의 안내 문구를 보면 지금 어떤 이유인지 바로 확인할 수 있습니다.
+
+### settings의 strategy template
+
+settings modal에는 preset 기준 strategy template 채우기 기능이 있습니다.
+
+- `customConstitution`, `plannerStrategy`, `teamStrategy` 3칸을 한 번에 채움
+- 이 PC 로컬 설정에만 적용됨
+- repo 파일을 직접 바꾸지는 않음
 
 ### 경로가 너무 김
 
