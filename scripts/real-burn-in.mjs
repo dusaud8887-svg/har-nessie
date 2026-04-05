@@ -3,6 +3,7 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { RUNS_DIR } from '../app/harness-paths.mjs';
 import {
   approvePlan,
   createProject,
@@ -412,7 +413,7 @@ async function runScenarioC(tempRoot) {
 }
 
 async function runRecoveryCheck(runId) {
-  const runRoot = path.join(root, 'runs', runId);
+  const runRoot = path.join(RUNS_DIR, runId);
   const statePath = path.join(runRoot, 'state.json');
   const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
   const targetTask = Array.isArray(state.tasks) ? state.tasks.find((item) => item.status === 'done') || state.tasks[0] : null;

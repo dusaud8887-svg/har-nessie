@@ -4,6 +4,7 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { RUNS_DIR } from '../app/harness-paths.mjs';
 import {
   approvePlan,
   createRun,
@@ -628,7 +629,8 @@ async function runApprovedScenario(title, objective, projectPath, extra = {}) {
     settings: {
       maxParallel: 1,
       maxTaskAttempts: extra.maxTaskAttempts || 1,
-      maxGoalLoops: extra.maxGoalLoops || 1
+      maxGoalLoops: extra.maxGoalLoops || 1,
+      codexRuntimeProfile: 'yolo'
     }
   });
 
@@ -833,6 +835,7 @@ async function scenarioProviderProfileRecovery(projectPath) {
         maxParallel: 1,
         maxTaskAttempts: 2,
         maxGoalLoops: 1,
+        codexRuntimeProfile: 'yolo',
         geminiProjectId: previousSettings.geminiProjectId || 'fake-gemini-project'
       }
     });
@@ -916,9 +919,14 @@ export async function runLiveReadyDrill() {
   const fakeBin = await installFakeProviders(path.join(tempRoot, 'fake-bin'));
   const env = withPrependedPath(fakeBin.binDir);
   const createdRuns = [];
+  const previousSettings = await getHarnessSettings();
   env.apply(fakeBin.stateFile);
 
   try {
+    await updateHarnessSettings({
+      ...previousSettings,
+      codexRuntimeProfile: 'yolo'
+    });
     const diagnostics = await diagnoseSetup({ projectPath: root, specFiles: '' });
 
     const successProject = await createDrillProject(tempRoot, 'clarify-needed-success');
@@ -967,6 +975,7 @@ export async function runLiveReadyDrill() {
   } finally {
     await Promise.all(createdRuns.map((runId) => waitForRunToSettle(runId, 250, 1500).catch(() => null)));
     await sleep(250);
+    await updateHarnessSettings(previousSettings).catch(() => {});
     env.restore();
     for (const runId of createdRuns) {
       await deleteRun(runId).catch(() => {});
@@ -981,15 +990,20 @@ export async function runCorruptionDrill() {
   const env = withPrependedPath(fakeBin.binDir);
   let runId = '';
   let server = null;
+  const previousSettings = await getHarnessSettings();
   env.apply(fakeBin.stateFile);
 
   try {
+    await updateHarnessSettings({
+      ...previousSettings,
+      codexRuntimeProfile: 'yolo'
+    });
     const projectPath = await createDrillProject(tempRoot, 'corruption-flow');
     const success = await scenarioClarifyApprovalSuccess(projectPath);
     runId = success.runId;
     const completed = await waitForRunToSettle(runId);
     const taskId = completed.tasks[0]?.id || 'T001';
-    const runRoot = path.join(root, 'runs', runId);
+    const runRoot = path.join(RUNS_DIR, runId);
     const taskRoot = path.join(runRoot, 'tasks', taskId);
     const runActionsFile = path.join(runRoot, 'run-actions.jsonl');
     const taskActionsFile = path.join(taskRoot, 'actions.jsonl');
@@ -1031,6 +1045,7 @@ export async function runCorruptionDrill() {
       codeContextMissing: artifacts.codeContext === null
     };
   } finally {
+    await updateHarnessSettings(previousSettings).catch(() => {});
     env.restore();
     if (server) {
       await server.stop().catch(() => {});

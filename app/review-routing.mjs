@@ -1,3 +1,5 @@
+import { acceptanceChecksAutoVerifiable } from './verification-utils.mjs';
+
 function normalizeChangedPaths(changedFiles = []) {
   return changedFiles
     .map((item) => String(item?.path || item || '').trim().replace(/\\/g, '/'))
@@ -86,6 +88,7 @@ function taskCanSucceedWithoutRepoDiff(task) {
 
 export function decideReviewRoute(run, task, changedFiles, scopeSummary, verification) {
   const changedPaths = normalizeChangedPaths(changedFiles);
+  const docsOnlyAutoVerifiable = acceptanceChecksAutoVerifiable(task?.acceptanceChecks || []);
   if (!changedPaths.length) {
     if (taskCanSucceedWithoutRepoDiff(task)) {
       return null;
@@ -113,7 +116,7 @@ export function decideReviewRoute(run, task, changedFiles, scopeSummary, verific
       'rule-blocked'
     );
   }
-  if (!isHighRiskReviewTask(run, task, changedPaths) && isDocsOnlyReviewCandidate(changedPaths)) {
+  if (!isHighRiskReviewTask(run, task, changedPaths) && isDocsOnlyReviewCandidate(changedPaths) && docsOnlyAutoVerifiable) {
     return buildPrescreenReview(
       'approve',
       'Rule-based prescreen auto-approved this low-risk docs-only change.',

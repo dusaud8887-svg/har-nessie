@@ -6,6 +6,7 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { MEMORY_DIR, PROJECTS_DIR, RUNS_DIR } from '../app/harness-paths.mjs';
 import {
   analyzeProjectIntake,
   applyPlanPolicy,
@@ -58,8 +59,12 @@ import {
 } from '../app/orchestrator.mjs';
 import { appendArtifactMemory, ensureProjectMemory, searchProjectMemory } from '../app/memory-store.mjs';
 import { buildAcceptanceMetadata, buildProjectCodeIntelligence, buildTaskActionPolicy, buildTaskCodeContext, extractStaticCodeGraphFacts, inferTaskVerificationTypes, normalizeToolProfile } from '../app/task-action-runtime.mjs';
+import { acceptanceChecksAutoVerifiable, rewriteWindowsCommandForAvailability, windowsCommandPrefersPowerShell } from '../app/verification-utils.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const runsRoot = RUNS_DIR;
+const projectsRoot = PROJECTS_DIR;
+const memoryRoot = MEMORY_DIR;
 
 async function waitForServerReady(baseUrl, timeoutMs = 10000) {
   const startedAt = Date.now();
@@ -118,6 +123,51 @@ async function startHarnessServerForTest() {
   }
 }
 
+test('harness path env overrides redirect mutable state outside the repo root', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-path-overrides-'));
+  const tempMetaDir = path.join(tempRoot, 'meta');
+  const tempRunsDir = path.join(tempRoot, 'runs');
+  const tempProjectsDir = path.join(tempRoot, 'projects');
+  const tempMemoryDir = path.join(tempRoot, 'memory', 'projects');
+
+  try {
+    const probeScript = [
+      "import { HARNESS_META_DIR, MEMORY_DIR, PROJECTS_DIR, RUNS_DIR } from './app/harness-paths.mjs';",
+      'process.stdout.write(JSON.stringify({ HARNESS_META_DIR, RUNS_DIR, PROJECTS_DIR, MEMORY_DIR }));'
+    ].join('\n');
+    const child = spawn(process.execPath, ['--input-type=module', '--eval', probeScript], {
+      cwd: root,
+      env: {
+        ...process.env,
+        HARNESS_META_DIR: tempMetaDir,
+        HARNESS_RUNS_DIR: tempRunsDir,
+        HARNESS_PROJECTS_DIR: tempProjectsDir,
+        HARNESS_MEMORY_DIR: tempMemoryDir
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true
+    });
+    const stdout = [];
+    const stderr = [];
+    child.stdout.on('data', (chunk) => stdout.push(chunk));
+    child.stderr.on('data', (chunk) => stderr.push(chunk));
+
+    const exitCode = await new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('close', (code) => resolve(code ?? 1));
+    });
+
+    assert.equal(exitCode, 0, Buffer.concat(stderr).toString('utf8'));
+    const payload = JSON.parse(Buffer.concat(stdout).toString('utf8'));
+    assert.equal(payload.HARNESS_META_DIR, path.resolve(tempMetaDir));
+    assert.equal(payload.RUNS_DIR, path.resolve(tempRunsDir));
+    assert.equal(payload.PROJECTS_DIR, path.resolve(tempProjectsDir));
+    assert.equal(payload.MEMORY_DIR, path.resolve(tempMemoryDir));
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
 test('server serves every boot asset referenced by index.html', async () => {
   const server = await startHarnessServerForTest();
   try {
@@ -152,7 +202,7 @@ test('getRun exposes generic metrics and hides legacy codex metric aliases', asy
     });
     runId = run.id;
 
-    const statePath = path.join(root, 'runs', run.id, 'state.json');
+    const statePath = path.join(runsRoot, run.id, 'state.json');
     const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
     state.metrics.executionRuns = 3;
     state.metrics.reviews = 2;
@@ -167,7 +217,7 @@ test('getRun exposes generic metrics and hides legacy codex metric aliases', asy
     assert.equal(Object.hasOwn(refreshed.metrics, 'codexReviews'), false);
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
   }
 });
@@ -186,7 +236,7 @@ test('artifact API keeps agent fields primary while reading legacy codex artifac
     });
     runId = run.id;
 
-    const statePath = path.join(root, 'runs', run.id, 'state.json');
+    const statePath = path.join(runsRoot, run.id, 'state.json');
     const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
     state.tasks = [{
       id: 'T001',
@@ -205,7 +255,7 @@ test('artifact API keeps agent fields primary while reading legacy codex artifac
     }];
     await fs.writeFile(statePath, JSON.stringify(state, null, 2), 'utf8');
 
-    const taskDir = path.join(root, 'runs', run.id, 'tasks', 'T001');
+    const taskDir = path.join(runsRoot, run.id, 'tasks', 'T001');
     await fs.mkdir(taskDir, { recursive: true });
     await fs.writeFile(path.join(taskDir, 'codex-prompt.md'), 'legacy prompt body\n', 'utf8');
     await fs.writeFile(path.join(taskDir, 'codex-output.md'), 'legacy output body\n', 'utf8');
@@ -224,7 +274,7 @@ test('artifact API keeps agent fields primary while reading legacy codex artifac
   } finally {
     await server.stop();
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
   }
 });
@@ -243,7 +293,7 @@ test('artifact API exposes extended review taxonomy fields', async () => {
     });
     runId = run.id;
 
-    const statePath = path.join(root, 'runs', run.id, 'state.json');
+    const statePath = path.join(runsRoot, run.id, 'state.json');
     const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
     state.tasks = [{
       id: 'T001',
@@ -262,7 +312,7 @@ test('artifact API exposes extended review taxonomy fields', async () => {
     }];
     await fs.writeFile(statePath, JSON.stringify(state, null, 2), 'utf8');
 
-    const taskDir = path.join(root, 'runs', run.id, 'tasks', 'T001');
+    const taskDir = path.join(runsRoot, run.id, 'tasks', 'T001');
     await fs.mkdir(taskDir, { recursive: true });
     await fs.writeFile(path.join(taskDir, 'review-verdict.json'), JSON.stringify({
       schemaVersion: '1',
@@ -291,7 +341,7 @@ test('artifact API exposes extended review taxonomy fields', async () => {
   } finally {
     await server.stop();
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
   }
 });
@@ -325,7 +375,7 @@ test('artifact API falls back to execution summary changed files when changed-fi
     });
     runId = run.id;
 
-    const statePath = path.join(root, 'runs', run.id, 'state.json');
+    const statePath = path.join(runsRoot, run.id, 'state.json');
     const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
     state.tasks = [{
       id: 'T001',
@@ -346,7 +396,7 @@ test('artifact API falls back to execution summary changed files when changed-fi
     }];
     await fs.writeFile(statePath, JSON.stringify(state, null, 2), 'utf8');
 
-    const taskDir = path.join(root, 'runs', run.id, 'tasks', 'T001');
+    const taskDir = path.join(runsRoot, run.id, 'tasks', 'T001');
     await fs.mkdir(taskDir, { recursive: true });
     await fs.writeFile(path.join(taskDir, 'execution-summary.json'), JSON.stringify({
       schemaVersion: '1',
@@ -363,7 +413,7 @@ test('artifact API falls back to execution summary changed files when changed-fi
   } finally {
     await server.stop();
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
   }
 });
@@ -404,7 +454,7 @@ test('frontend API consumers stay aligned with server route handlers', async () 
 
 test('memory search tolerates hyphenated harness terms', async () => {
   const projectKey = `test-memory-${Date.now()}`;
-  const memoryDir = path.join(root, 'memory', 'projects', projectKey);
+  const memoryDir = path.join(memoryRoot, projectKey);
   try {
     await ensureProjectMemory(root, projectKey, { projectPath: root });
     await fs.writeFile(
@@ -421,7 +471,7 @@ test('memory search tolerates hyphenated harness terms', async () => {
 
 test('memory search skips sqlite reindex when memory docs are unchanged', async () => {
   const projectKey = `test-memory-cache-${Date.now()}`;
-  const memoryDir = path.join(root, 'memory', 'projects', projectKey);
+  const memoryDir = path.join(memoryRoot, projectKey);
   try {
     await ensureProjectMemory(root, projectKey, { projectPath: root });
     await fs.writeFile(
@@ -468,11 +518,11 @@ test('quoted project path and UTF-16 spec file are accepted', async () => {
     runId = run.id;
     assert.equal(run.projectPath, root);
 
-    const specBundle = await fs.readFile(path.join(root, 'runs', run.id, 'input', 'spec-bundle.md'), 'utf8');
+    const specBundle = await fs.readFile(path.join(runsRoot, run.id, 'input', 'spec-bundle.md'), 'utf8');
     assert.match(specBundle, /한글 UTF16 명세 테스트/);
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -497,12 +547,12 @@ test('createRun captures project-local prompt source precedence', async () => {
     assert.equal(run.harnessConfig.promptSourceReport.activeSources[0]?.scope, 'project-local');
     assert.equal(run.harnessConfig.promptSourceReport.activeSources[0]?.label, 'AGENTS.md');
 
-    const guidance = await fs.readFile(path.join(root, 'runs', run.id, 'context', 'harness-guidance.md'), 'utf8');
+    const guidance = await fs.readFile(path.join(runsRoot, run.id, 'context', 'harness-guidance.md'), 'utf8');
     assert.match(guidance, /## Effective Prompt Sources/);
     assert.match(guidance, /\[project-local\] AGENTS\.md/);
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -541,7 +591,7 @@ test('project-backed runs inherit charter, phase, and shared memory identity', a
       assert.ok(project.bootstrap.generated.includes('docs/exec-plans/active/README.md'));
       assert.ok(Array.isArray(project.phases?.[0]?.phaseContract?.deliverables));
       assert.ok(Array.isArray(project.phases?.[0]?.phaseContract?.verification));
-      const phaseContract = await fs.readFile(path.join(root, 'projects', project.id, 'phases', project.phases[0].id, 'phase-contract.md'), 'utf8');
+      const phaseContract = await fs.readFile(path.join(projectsRoot, project.id, 'phases', project.phases[0].id, 'phase-contract.md'), 'utf8');
       const repoAgents = await fs.readFile(path.join(tempDir, 'AGENTS.md'), 'utf8');
       const architecture = await fs.readFile(path.join(tempDir, 'ARCHITECTURE.md'), 'utf8');
       assert.match(repoAgents, /table-of-contents/i);
@@ -576,8 +626,8 @@ test('project-backed runs inherit charter, phase, and shared memory identity', a
       assert.equal(run.profile.freshSessionThreshold, '60m');
       assert.equal(run.executionPolicy.parallelMode, 'sequential');
 
-      const specBundle = await fs.readFile(path.join(root, 'runs', run.id, 'input', 'spec-bundle.md'), 'utf8');
-      const guidance = await fs.readFile(path.join(root, 'runs', run.id, 'context', 'harness-guidance.md'), 'utf8');
+      const specBundle = await fs.readFile(path.join(runsRoot, run.id, 'input', 'spec-bundle.md'), 'utf8');
+      const guidance = await fs.readFile(path.join(runsRoot, run.id, 'context', 'harness-guidance.md'), 'utf8');
       assert.match(specBundle, /# Project Context/);
       assert.match(specBundle, /# Execution Profile/);
       assert.match(specBundle, /Task budget: 5/);
@@ -598,13 +648,13 @@ test('project-backed runs inherit charter, phase, and shared memory identity', a
     assert.equal(loaded.currentPhaseId, project.phases[0].id);
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
     if (projectId) {
-      await fs.rm(path.join(root, 'projects', projectId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(projectsRoot, projectId), { recursive: true, force: true }).catch(() => {});
     }
     if (memoryKey) {
-      await fs.rm(path.join(root, 'memory', 'projects', memoryKey), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(memoryRoot, memoryKey), { recursive: true, force: true }).catch(() => {});
     }
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -634,7 +684,7 @@ test('getProjectOverview raises docs-drift to high after doc updates fall behind
         settings: { maxParallel: 1, maxTaskAttempts: 1, maxGoalLoops: 1 }
       });
       runIds.push(run.id);
-      const statePath = path.join(root, 'runs', run.id, 'state.json');
+      const statePath = path.join(runsRoot, run.id, 'state.json');
       const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
       state.status = 'completed';
       state.updatedAt = updatedAt;
@@ -704,7 +754,7 @@ test('getProjectOverview computes an automation burn-in scorecard from recent au
         chainMeta: { trigger: 'scheduled', reason: 'automation scorecard test' }
       });
       runIds.push(run.id);
-      const statePath = path.join(root, 'runs', run.id, 'state.json');
+      const statePath = path.join(runsRoot, run.id, 'state.json');
       const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
       state.status = status;
       state.updatedAt = updatedAt;
@@ -838,7 +888,7 @@ test('project-backed runs include a continuation pack from recent docs and carry
     });
     firstRunId = firstRun.id;
 
-    const firstRunStatePath = path.join(root, 'runs', firstRun.id, 'state.json');
+    const firstRunStatePath = path.join(runsRoot, firstRun.id, 'state.json');
     const firstRunState = JSON.parse(await fs.readFile(firstRunStatePath, 'utf8'));
     firstRunState.status = 'completed';
     firstRunState.result = {
@@ -896,8 +946,8 @@ test('project-backed runs include a continuation pack from recent docs and carry
     });
     secondRunId = secondRun.id;
 
-    const specBundle = await fs.readFile(path.join(root, 'runs', secondRun.id, 'input', 'spec-bundle.md'), 'utf8');
-    const projectSummary = await fs.readFile(path.join(root, 'runs', secondRun.id, 'context', 'project-summary.md'), 'utf8');
+    const specBundle = await fs.readFile(path.join(runsRoot, secondRun.id, 'input', 'spec-bundle.md'), 'utf8');
+    const projectSummary = await fs.readFile(path.join(runsRoot, secondRun.id, 'context', 'project-summary.md'), 'utf8');
 
     assert.match(specBundle, /## Continuation Pack/);
     assert.match(specBundle, /(Auto-prepare suggested draft|권장 초안 자동 준비)/);
@@ -945,7 +995,7 @@ test('manual quality sweep writes a maintenance artifact and memory summary', as
     });
     runId = run.id;
 
-    const stateFile = path.join(root, 'runs', run.id, 'state.json');
+    const stateFile = path.join(runsRoot, run.id, 'state.json');
     const state = JSON.parse(await fs.readFile(stateFile, 'utf8'));
     state.status = 'failed';
     state.tasks = [
@@ -1016,9 +1066,9 @@ test('manual quality sweep writes a maintenance artifact and memory summary', as
     ];
     await fs.writeFile(stateFile, JSON.stringify(state, null, 2), 'utf8');
 
-    await fs.mkdir(path.join(root, 'runs', run.id, 'tasks', 'T001'), { recursive: true });
-    await fs.mkdir(path.join(root, 'runs', run.id, 'tasks', 'T002'), { recursive: true });
-    await fs.writeFile(path.join(root, 'runs', run.id, 'tasks', 'T001', 'execution-summary.json'), JSON.stringify({
+    await fs.mkdir(path.join(runsRoot, run.id, 'tasks', 'T001'), { recursive: true });
+    await fs.mkdir(path.join(runsRoot, run.id, 'tasks', 'T002'), { recursive: true });
+    await fs.writeFile(path.join(runsRoot, run.id, 'tasks', 'T001', 'execution-summary.json'), JSON.stringify({
       schemaVersion: '1',
       taskId: 'T001',
       verificationOk: false,
@@ -1026,7 +1076,7 @@ test('manual quality sweep writes a maintenance artifact and memory summary', as
       changedFiles: ['src/app.ts'],
       outOfScopeFiles: ['src/stray.ts']
     }, null, 2), 'utf8');
-    await fs.writeFile(path.join(root, 'runs', run.id, 'tasks', 'T002', 'execution-summary.json'), JSON.stringify({
+    await fs.writeFile(path.join(runsRoot, run.id, 'tasks', 'T002', 'execution-summary.json'), JSON.stringify({
       schemaVersion: '1',
       taskId: 'T002',
       verificationOk: true,
@@ -1049,7 +1099,7 @@ test('manual quality sweep writes a maintenance artifact and memory summary', as
 
     const sweepJson = await fs.readFile(result.artifacts.jsonPath, 'utf8');
     const debtTracker = await fs.readFile(result.artifacts.debtTrackerPath, 'utf8');
-    const memoryFile = await fs.readFile(path.join(root, 'memory', 'projects', memoryKey, 'MEMORY.md'), 'utf8');
+    const memoryFile = await fs.readFile(path.join(memoryRoot, memoryKey, 'MEMORY.md'), 'utf8');
     const updatedProject = await getProject(project.id);
     const overview = await getProjectOverview(project.id);
     const foundation = overview.phases.find((entry) => entry.id === 'P001');
@@ -1066,13 +1116,13 @@ test('manual quality sweep writes a maintenance artifact and memory summary', as
     assert.ok(foundation.cleanupLane.some((item) => item.sourceSweepId === result.sweep.sweepId));
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
     if (projectId) {
-      await fs.rm(path.join(root, 'projects', projectId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(projectsRoot, projectId), { recursive: true, force: true }).catch(() => {});
     }
     if (memoryKey) {
-      await fs.rm(path.join(root, 'memory', 'projects', memoryKey), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(memoryRoot, memoryKey), { recursive: true, force: true }).catch(() => {});
     }
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -1106,7 +1156,7 @@ test('updateProject rewrites the phase contract artifact and overview', async ()
       }]
     });
     const overview = await getProjectOverview(project.id);
-    const contractMarkdown = await fs.readFile(path.join(root, 'projects', project.id, 'phases', 'P001', 'phase-contract.md'), 'utf8');
+    const contractMarkdown = await fs.readFile(path.join(projectsRoot, project.id, 'phases', 'P001', 'phase-contract.md'), 'utf8');
 
     assert.equal(updated.phases[0].goal, 'updated phase goal');
     assert.equal(updated.phases[0].phaseContract.goal, 'lock phase scope before implementation');
@@ -1139,10 +1189,10 @@ test('updateProject rewrites the phase contract artifact and overview', async ()
     assert.ok(appendedPhase.phaseContract.verification.length > 0);
   } finally {
     if (projectId) {
-      await fs.rm(path.join(root, 'projects', projectId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(projectsRoot, projectId), { recursive: true, force: true }).catch(() => {});
     }
     if (memoryKey) {
-      await fs.rm(path.join(root, 'memory', 'projects', memoryKey), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(memoryRoot, memoryKey), { recursive: true, force: true }).catch(() => {});
     }
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -1173,10 +1223,10 @@ test('createProject preserves existing repo docs during bootstrap', async () => 
     assert.match(execPlans, /Active Execution Plans/);
   } finally {
     if (projectId) {
-      await fs.rm(path.join(root, 'projects', projectId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(projectsRoot, projectId), { recursive: true, force: true }).catch(() => {});
     }
     if (memoryKey) {
-      await fs.rm(path.join(root, 'memory', 'projects', memoryKey), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(memoryRoot, memoryKey), { recursive: true, force: true }).catch(() => {});
     }
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -1188,7 +1238,7 @@ test('createProject does not overwrite a corrupted existing project state', asyn
   try {
     const title = 'corrupt-project';
     projectId = `${title}-${createHash('sha1').update(`${tempDir}\n${title}`).digest('hex').slice(0, 10)}`;
-    const projectDir = path.join(root, 'projects', projectId);
+    const projectDir = path.join(projectsRoot, projectId);
     await fs.mkdir(projectDir, { recursive: true });
     await fs.writeFile(path.join(projectDir, 'project.json'), '{ invalid json', 'utf8');
 
@@ -1205,7 +1255,7 @@ test('createProject does not overwrite a corrupted existing project state', asyn
     assert.equal(preserved, '{ invalid json');
   } finally {
     if (projectId) {
-      await fs.rm(path.join(root, 'projects', projectId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(projectsRoot, projectId), { recursive: true, force: true }).catch(() => {});
     }
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -1271,7 +1321,7 @@ test('project overview groups runs by phase and exposes carry-over backlog and o
         updatedAt: firstState.updatedAt
       }
     ];
-    await fs.writeFile(path.join(root, 'runs', firstRun.id, 'state.json'), JSON.stringify(firstState, null, 2), 'utf8');
+    await fs.writeFile(path.join(runsRoot, firstRun.id, 'state.json'), JSON.stringify(firstState, null, 2), 'utf8');
 
     const secondRun = await createRun({
       title: 'polish-complete-run',
@@ -1300,7 +1350,7 @@ test('project overview groups runs by phase and exposes carry-over backlog and o
       summary: 'Polish phase complete.',
       goalAchieved: true
     };
-    await fs.writeFile(path.join(root, 'runs', secondRun.id, 'state.json'), JSON.stringify(secondState, null, 2), 'utf8');
+    await fs.writeFile(path.join(runsRoot, secondRun.id, 'state.json'), JSON.stringify(secondState, null, 2), 'utf8');
 
     const thirdRun = await createRun({
       title: 'foundation-review-run',
@@ -1324,7 +1374,7 @@ test('project overview groups runs by phase and exposes carry-over backlog and o
         approvedAt: ''
       }
     };
-    await fs.writeFile(path.join(root, 'runs', thirdRun.id, 'state.json'), JSON.stringify(thirdState, null, 2), 'utf8');
+    await fs.writeFile(path.join(runsRoot, thirdRun.id, 'state.json'), JSON.stringify(thirdState, null, 2), 'utf8');
 
       const overview = await getProjectOverview(project.id);
       assert.equal(overview.project.id, project.id);
@@ -1356,19 +1406,19 @@ test('project overview groups runs by phase and exposes carry-over backlog and o
     assert.equal(polish.recentRuns[0]?.id, secondRun.id);
   } finally {
     if (firstRunId) {
-      await fs.rm(path.join(root, 'runs', firstRunId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, firstRunId), { recursive: true, force: true }).catch(() => {});
     }
     if (secondRunId) {
-      await fs.rm(path.join(root, 'runs', secondRunId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, secondRunId), { recursive: true, force: true }).catch(() => {});
     }
     if (thirdRunId) {
-      await fs.rm(path.join(root, 'runs', thirdRunId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, thirdRunId), { recursive: true, force: true }).catch(() => {});
     }
     if (projectId) {
-      await fs.rm(path.join(root, 'projects', projectId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(projectsRoot, projectId), { recursive: true, force: true }).catch(() => {});
     }
     if (memoryKey) {
-      await fs.rm(path.join(root, 'memory', 'projects', memoryKey), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(memoryRoot, memoryKey), { recursive: true, force: true }).catch(() => {});
     }
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
     }
@@ -1388,7 +1438,7 @@ test('artifact APIs and memory indexing prefer provider-neutral task artifact na
     });
     runId = run.id;
 
-    const taskRoot = path.join(root, 'runs', run.id, 'tasks', 'T001');
+    const taskRoot = path.join(runsRoot, run.id, 'tasks', 'T001');
     await fs.mkdir(taskRoot, { recursive: true });
     await fs.writeFile(path.join(taskRoot, 'agent-prompt.md'), 'Prompt body', 'utf8');
     await fs.writeFile(path.join(taskRoot, 'agent-output.md'), 'Output body', 'utf8');
@@ -1414,15 +1464,15 @@ test('artifact APIs and memory indexing prefer provider-neutral task artifact na
         actionCounts: {}
       }
     }];
-    await fs.writeFile(path.join(root, 'runs', run.id, 'state.json'), JSON.stringify(state, null, 2), 'utf8');
+    await fs.writeFile(path.join(runsRoot, run.id, 'state.json'), JSON.stringify(state, null, 2), 'utf8');
 
     const snapshot = await appendArtifactMemory(root, state, state.tasks[0]);
     assert.ok(snapshot.searchResults.some((item) => item.kind === 'artifact-record'));
-    const manifest = JSON.parse(await fs.readFile(path.join(root, 'runs', run.id, 'artifact-manifest.json'), 'utf8'));
+    const manifest = JSON.parse(await fs.readFile(path.join(runsRoot, run.id, 'artifact-manifest.json'), 'utf8'));
     assert.ok(manifest.entries.some((entry) => entry.kind === 'prompt'));
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -1440,19 +1490,19 @@ test('createRun initializes structured trace file', async () => {
       settings: { maxParallel: 1, maxTaskAttempts: 1, maxGoalLoops: 1 }
     });
     runId = run.id;
-    const trace = await fs.readFile(path.join(root, 'runs', run.id, 'trace.ndjson'), 'utf8');
-    const runActions = await fs.readFile(path.join(root, 'runs', run.id, 'run-actions.jsonl'), 'utf8');
+    const trace = await fs.readFile(path.join(runsRoot, run.id, 'trace.ndjson'), 'utf8');
+    const runActions = await fs.readFile(path.join(runsRoot, run.id, 'run-actions.jsonl'), 'utf8');
     assert.match(trace, /"event":"run\.created"/);
     assert.equal(runActions, '');
     const firstEntry = JSON.parse(trace.trim().split(/\r?\n/)[0]);
     assert.equal(firstEntry.schemaVersion, '2');
     assert.equal(firstEntry.runId, run.id);
     assert.equal(firstEntry.phase, 'run');
-    const guidance = await fs.readFile(path.join(root, 'runs', run.id, 'context', 'harness-guidance.md'), 'utf8');
+    const guidance = await fs.readFile(path.join(runsRoot, run.id, 'context', 'harness-guidance.md'), 'utf8');
     assert.match(guidance, /# Harness Guidance/);
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
   }
 });
@@ -1538,7 +1588,7 @@ test('createRun stores browser verification and dev server config in project con
     assert.equal(run.projectContext.devServer.url, 'http://127.0.0.1:4173');
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
   }
 });
@@ -1628,7 +1678,7 @@ test('createRun stores tool profile in run state', async () => {
     assert.deepEqual(run.toolProfile.allowedActionClasses, ['memory-read', 'code-context', 'verification']);
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
   }
 });
@@ -1727,6 +1777,29 @@ test('decideReviewRoute blocks verification failures before agent review', () =>
   assert.match((review?.findings || []).join('\n'), /automatic verification failed/i);
 });
 
+test('decideReviewRoute does not auto-approve docs-only tasks when acceptance still needs reviewer judgment', () => {
+  const review = decideReviewRoute(
+    { preset: { id: 'docs-spec-first' } },
+    {
+      title: 'Clarify the docs landing page',
+      goal: 'Keep the landing page aligned with the active flow.',
+      acceptanceChecks: ['README reflects the current operator path'],
+      constraints: [],
+      filesLikely: ['README.md']
+    },
+    ['README.md'],
+    {
+      outOfScopeFiles: []
+    },
+    {
+      ok: true,
+      selectedCommands: []
+    }
+  );
+
+  assert.equal(review, null);
+});
+
 test('selectVerificationCommands skips repo-wide validation for docs-only tasks without explicit commands', () => {
   const commands = selectVerificationCommands(
     {
@@ -1770,6 +1843,18 @@ test('selectVerificationCommands prefers explicit acceptance commands for docs-o
   ]);
 });
 
+test('acceptanceChecksAutoVerifiable requires every acceptance check to be command-backed', () => {
+  assert.equal(acceptanceChecksAutoVerifiable([
+    'rg -n "foo" docs/spec.md exits 0',
+    'Test-Path docs/spec.md returns True'
+  ]), true);
+  assert.equal(acceptanceChecksAutoVerifiable([
+    'rg -n "foo" docs/spec.md exits 0',
+    'README reflects the current flow'
+  ]), false);
+  assert.equal(acceptanceChecksAutoVerifiable([]), false);
+});
+
 test('selectVerificationCommands prefers explicit acceptance commands for code tasks', () => {
   const commands = selectVerificationCommands(
     {
@@ -1786,6 +1871,26 @@ test('selectVerificationCommands prefers explicit acceptance commands for code t
   );
 
   assert.deepEqual(commands, ['npm run lint', 'npm run test', 'npm run build']);
+});
+
+test('windowsCommandPrefersPowerShell routes rg and PowerShell built-ins away from cmd.exe parsing', () => {
+  assert.equal(windowsCommandPrefersPowerShell('rg -n "foo|bar" docs/spec.md'), true);
+  assert.equal(windowsCommandPrefersPowerShell('Test-Path docs/spec.md'), true);
+  assert.equal(windowsCommandPrefersPowerShell('Compare-Object $a $b'), true);
+  assert.equal(windowsCommandPrefersPowerShell('$value = 1; echo $value'), true);
+  assert.equal(windowsCommandPrefersPowerShell('npm run lint'), false);
+});
+
+test('rewriteWindowsCommandForAvailability falls back from rg to Select-String when ripgrep is unavailable', () => {
+  const rewritten = rewriteWindowsCommandForAvailability('rg -n "## Later" docs/product/vision-and-scope.md', { rg: false });
+  assert.equal(rewritten.rewritten, true);
+  assert.match(rewritten.commandLine, /Select-String/);
+  assert.match(rewritten.commandLine, /docs\/product\/vision-and-scope\.md/);
+  assert.match(rewritten.note, /rg unavailable/i);
+
+  const untouched = rewriteWindowsCommandForAvailability('rg -n "## Later" docs/product/vision-and-scope.md', { rg: true });
+  assert.equal(untouched.rewritten, false);
+  assert.equal(untouched.commandLine, 'rg -n "## Later" docs/product/vision-and-scope.md');
 });
 
 test('buildTaskCodeContext returns related file symbols and references', async () => {
@@ -2249,7 +2354,7 @@ test('buildCodeContextPromptLines explains graph relationships and scope warning
 
 test('searchProjectMemory compacts duplicate artifact memory and ranks symbol-grounded hits first', async () => {
   const projectKey = `test-memory-ranking-${Date.now()}`;
-  const memoryDir = path.join(root, 'memory', 'projects', projectKey);
+  const memoryDir = path.join(memoryRoot, projectKey);
   try {
     await ensureProjectMemory(root, projectKey, { projectPath: root });
     await fs.writeFile(path.join(memoryDir, 'MEMORY.md'), '# Project Memory\n\nGeneral notes only.\n', 'utf8');
@@ -2356,7 +2461,7 @@ test('searchProjectMemory compacts duplicate artifact memory and ranks symbol-gr
 
 test('searchProjectMemory preserves legacy compacted root-cause variants in analytics', async () => {
   const projectKey = `test-memory-root-causes-${Date.now()}`;
-  const memoryDir = path.join(root, 'memory', 'projects', projectKey);
+  const memoryDir = path.join(memoryRoot, projectKey);
   try {
     await ensureProjectMemory(root, projectKey, { projectPath: root });
     await fs.writeFile(path.join(memoryDir, 'MEMORY.md'), '# Project Memory\n\nRetry notes.\n', 'utf8');
@@ -2409,7 +2514,7 @@ test('searchProjectMemory preserves legacy compacted root-cause variants in anal
 
 test('searchProjectMemory carries root-cause variants into temporal insights with occurrence-aware weight', async () => {
   const projectKey = `test-memory-temporal-root-cause-variants-${Date.now()}`;
-  const memoryDir = path.join(root, 'memory', 'projects', projectKey);
+  const memoryDir = path.join(memoryRoot, projectKey);
   try {
     await ensureProjectMemory(root, projectKey, { projectPath: root });
     await fs.writeFile(path.join(memoryDir, 'MEMORY.md'), '# Project Memory\n\nTemporal root-cause notes.\n', 'utf8');
@@ -2465,7 +2570,7 @@ test('searchProjectMemory carries root-cause variants into temporal insights wit
 
 test('searchProjectMemory boosts repeated variant matches in artifact ranking', async () => {
   const projectKey = `test-memory-variant-score-${Date.now()}`;
-  const memoryDir = path.join(root, 'memory', 'projects', projectKey);
+  const memoryDir = path.join(memoryRoot, projectKey);
   try {
     await ensureProjectMemory(root, projectKey, { projectPath: root });
     await fs.writeFile(path.join(memoryDir, 'MEMORY.md'), '# Project Memory\n\nVariant ranking notes.\n', 'utf8');
@@ -2557,7 +2662,7 @@ test('artifact memory writes manifest, summaries, and searchable records', async
     });
     runId = run.id;
 
-    const statePath = path.join(root, 'runs', run.id, 'state.json');
+    const statePath = path.join(runsRoot, run.id, 'state.json');
     const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
     state.tasks = [{
       id: 'T001',
@@ -2587,7 +2692,7 @@ test('artifact memory writes manifest, summaries, and searchable records', async
     }];
     await fs.writeFile(statePath, JSON.stringify(state, null, 2), 'utf8');
 
-    const taskRoot = path.join(root, 'runs', run.id, 'tasks', 'T001');
+    const taskRoot = path.join(runsRoot, run.id, 'tasks', 'T001');
     await fs.mkdir(taskRoot, { recursive: true });
     await fs.writeFile(path.join(taskRoot, 'codex-prompt.md'), 'Read and execute the task instructions.', 'utf8');
     await fs.writeFile(path.join(taskRoot, 'codex-output.md'), 'Tests failed while checking login flow.', 'utf8');
@@ -2646,8 +2751,8 @@ test('artifact memory writes manifest, summaries, and searchable records', async
       attempt: 1,
       completedAt: new Date().toISOString()
     }, null, 2), 'utf8');
-    await fs.mkdir(path.join(root, 'runs', run.id, 'context', 'code-context'), { recursive: true });
-    await fs.writeFile(path.join(root, 'runs', run.id, 'context', 'code-context', 'T001.json'), JSON.stringify({
+    await fs.mkdir(path.join(runsRoot, run.id, 'context', 'code-context'), { recursive: true });
+    await fs.writeFile(path.join(runsRoot, run.id, 'context', 'code-context', 'T001.json'), JSON.stringify({
       schemaVersion: '2',
       runId: run.id,
       taskId: 'T001',
@@ -2673,10 +2778,10 @@ test('artifact memory writes manifest, summaries, and searchable records', async
 
     const snapshot = await appendArtifactMemory(root, state, state.tasks[0]);
     projectKey = run.memory.projectKey;
-    const manifest = JSON.parse(await fs.readFile(path.join(root, 'runs', run.id, 'artifact-manifest.json'), 'utf8'));
-    const artifactIndex = await fs.readFile(path.join(root, 'memory', 'projects', run.memory.projectKey, 'memory-artifacts.ndjson'), 'utf8');
-    const runMemory = await fs.readFile(path.join(root, 'memory', 'projects', run.memory.projectKey, 'runs', `${run.id}.md`), 'utf8');
-    const taskMemory = await fs.readFile(path.join(root, 'memory', 'projects', run.memory.projectKey, 'tasks', `${run.id}-T001.md`), 'utf8');
+    const manifest = JSON.parse(await fs.readFile(path.join(runsRoot, run.id, 'artifact-manifest.json'), 'utf8'));
+    const artifactIndex = await fs.readFile(path.join(memoryRoot, run.memory.projectKey, 'memory-artifacts.ndjson'), 'utf8');
+    const runMemory = await fs.readFile(path.join(memoryRoot, run.memory.projectKey, 'runs', `${run.id}.md`), 'utf8');
+    const taskMemory = await fs.readFile(path.join(memoryRoot, run.memory.projectKey, 'tasks', `${run.id}-T001.md`), 'utf8');
 
     assert.equal(Array.isArray(manifest.entries), true);
     assert.equal(manifest.entries.some((entry) => entry.kind === 'review-verdict'), true);
@@ -2694,10 +2799,10 @@ test('artifact memory writes manifest, summaries, and searchable records', async
     assert.equal(snapshot.traceSummary.artifactCount >= 1, true);
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
     if (projectKey) {
-      await fs.rm(path.join(root, 'memory', 'projects', projectKey), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(memoryRoot, projectKey), { recursive: true, force: true }).catch(() => {});
     }
   }
 });
@@ -2720,7 +2825,7 @@ test('createRun seeds memory analytics fields', async () => {
     assert.equal(typeof run.memory.temporalInsights, 'object');
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
   }
 });
@@ -2740,10 +2845,10 @@ test('searchRunMemory exposes graph insights from the memory snapshot', async ()
     runId = run.id;
     projectKey = run.memory.projectKey;
 
-    const taskRoot = path.join(root, 'runs', run.id, 'tasks', 'T001');
+    const taskRoot = path.join(runsRoot, run.id, 'tasks', 'T001');
     await fs.mkdir(taskRoot, { recursive: true });
-    await fs.mkdir(path.join(root, 'runs', run.id, 'context', 'code-context'), { recursive: true });
-    await fs.writeFile(path.join(root, 'runs', run.id, 'context', 'code-context', 'T001.json'), JSON.stringify({
+    await fs.mkdir(path.join(runsRoot, run.id, 'context', 'code-context'), { recursive: true });
+    await fs.writeFile(path.join(runsRoot, run.id, 'context', 'code-context', 'T001.json'), JSON.stringify({
       schemaVersion: '2',
       runId: run.id,
       taskId: 'T001',
@@ -2798,10 +2903,10 @@ test('searchRunMemory exposes graph insights from the memory snapshot', async ()
     assert.ok(snapshot.temporalInsights.activeFiles.some((item) => item.filePath === 'src/ui/login-form.tsx'));
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
     if (projectKey) {
-      await fs.rm(path.join(root, 'memory', 'projects', projectKey), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(memoryRoot, projectKey), { recursive: true, force: true }).catch(() => {});
     }
   }
 });
@@ -2856,7 +2961,7 @@ test('searchProjectMemory decays stale artifact records and favors recent matchi
     assert.equal(snapshot.temporalInsights.activeFiles[0]?.filePath, 'src/auth/session-service.ts');
     assert.equal(snapshot.graphInsights.topEdges[0]?.edge, 'src/ui/login-form.tsx->src/auth/session-service.ts#buildAuthSession');
   } finally {
-    await fs.rm(path.join(root, 'memory', 'projects', projectKey), { recursive: true, force: true }).catch(() => {});
+    await fs.rm(path.join(memoryRoot, projectKey), { recursive: true, force: true }).catch(() => {});
   }
 });
 
@@ -2894,7 +2999,7 @@ test('searchProjectMemory builds propagated graph chains from stored edges', asy
     assert.equal(snapshot.graphInsights.propagation?.damping, 0.62);
     assert.equal(snapshot.graphInsights.propagation?.maxDepth, 3);
   } finally {
-    await fs.rm(path.join(root, 'memory', 'projects', projectKey), { recursive: true, force: true }).catch(() => {});
+    await fs.rm(path.join(memoryRoot, projectKey), { recursive: true, force: true }).catch(() => {});
   }
 });
 
@@ -3011,7 +3116,7 @@ test('initHarness recovers stale running state into a resumable checkpoint', asy
       settings: { maxParallel: 1, maxTaskAttempts: 1, maxGoalLoops: 1 }
     });
     runId = run.id;
-    const stateFile = path.join(root, 'runs', runId, 'state.json');
+    const stateFile = path.join(runsRoot, runId, 'state.json');
     const state = JSON.parse(await fs.readFile(stateFile, 'utf8'));
     state.status = 'running';
     state.tasks = [{
@@ -3028,14 +3133,14 @@ test('initHarness recovers stale running state into a resumable checkpoint', asy
     }];
     await fs.writeFile(stateFile, JSON.stringify(state, null, 2), 'utf8');
 
-    const workspaceDir = path.join(root, 'runs', runId, 'tasks', 'T001', 'workspace');
+    const workspaceDir = path.join(runsRoot, runId, 'tasks', 'T001', 'workspace');
     await fs.mkdir(workspaceDir, { recursive: true });
     await fs.writeFile(path.join(workspaceDir, 'scratch.txt'), 'stale workspace', 'utf8');
 
     await initHarness();
 
     const recovered = await getRun(runId);
-    const checkpoint = JSON.parse(await fs.readFile(path.join(root, 'runs', runId, 'run-checkpoint.json'), 'utf8'));
+    const checkpoint = JSON.parse(await fs.readFile(path.join(runsRoot, runId, 'run-checkpoint.json'), 'utf8'));
     const workspaceExists = await fs.access(workspaceDir).then(() => true).catch(() => false);
 
     assert.equal(recovered.status, 'stopped');
@@ -3394,13 +3499,13 @@ test('createRun defaults Codex execution settings', async () => {
     assert.equal(run.agents.find((agent) => agent.name === 'implementer')?.model, run.settings.workerProvider);
     assert.equal(run.agents.find((agent) => agent.name === 'verifier')?.model, run.settings.coordinationProvider);
     assert.equal(run.agents.find((agent) => agent.name === 'goal-judge')?.model, run.settings.coordinationProvider);
-    const guidance = await fs.readFile(path.join(root, 'runs', run.id, 'context', 'harness-guidance.md'), 'utf8');
+    const guidance = await fs.readFile(path.join(runsRoot, run.id, 'context', 'harness-guidance.md'), 'utf8');
     assert.match(guidance, /## Execution Profile/);
     assert.match(guidance, /Task budget: 8/);
     assert.match(guidance, /Diagnosis-first: required/);
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
     await updateHarnessSettings(previousSettings);
   }
@@ -3426,7 +3531,7 @@ test('createRun applies larger goal loop defaults for docs-first and greenfield 
     assert.equal(docsRun.settings.maxGoalLoops, 4);
     assert.equal(docsRun.profile.flowProfile, 'hybrid');
     assert.equal(docsRun.profile.fileBudget, 4);
-    const docsGuidance = await fs.readFile(path.join(root, 'runs', docsRun.id, 'context', 'harness-guidance.md'), 'utf8');
+    const docsGuidance = await fs.readFile(path.join(runsRoot, docsRun.id, 'context', 'harness-guidance.md'), 'utf8');
     assert.match(docsGuidance, /## Preset Baseline/);
     assert.match(docsGuidance, /Constitution: Keep docs and acceptance criteria as the source of record/);
     assert.match(docsGuidance, /Planner: Start with the smallest scope-locking or doc-alignment slice/);
@@ -3444,8 +3549,8 @@ test('createRun applies larger goal loop defaults for docs-first and greenfield 
     assert.equal(greenfieldRun.settings.maxTaskAttempts, 2);
     assert.equal(greenfieldRun.settings.maxGoalLoops, 4);
   } finally {
-    if (docsRunId) await fs.rm(path.join(root, 'runs', docsRunId), { recursive: true, force: true }).catch(() => {});
-    if (greenfieldRunId) await fs.rm(path.join(root, 'runs', greenfieldRunId), { recursive: true, force: true }).catch(() => {});
+    if (docsRunId) await fs.rm(path.join(runsRoot, docsRunId), { recursive: true, force: true }).catch(() => {});
+    if (greenfieldRunId) await fs.rm(path.join(runsRoot, greenfieldRunId), { recursive: true, force: true }).catch(() => {});
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
 });
@@ -3495,7 +3600,7 @@ test('createRun snapshots coordination and worker provider settings', async () =
     assert.equal(run.preflight.providerProfile?.workerProvider, 'gemini');
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
     await updateHarnessSettings(originalSettings);
   }
@@ -3547,7 +3652,7 @@ test('refreshRunPreflight rebinds run provider profile to the current settings',
     assert.equal(byName['goal-judge'], 'codex');
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
     await updateHarnessSettings(originalSettings);
   }
@@ -3601,7 +3706,171 @@ test('startRun follows the current provider settings instead of the saved run pr
     assert.equal(refreshed.preflight.autonomy?.executionReady, false);
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
+    }
+    await updateHarnessSettings(originalSettings);
+  }
+});
+
+test('startRun blocks writable Codex tasks when the runtime profile is Safe read-only', async () => {
+  let runId = '';
+  const originalSettings = await getHarnessSettings(root);
+  try {
+    await updateHarnessSettings({
+      ...originalSettings,
+      uiLanguage: 'en',
+      agentLanguage: 'en',
+      coordinationProvider: 'codex',
+      workerProvider: 'codex',
+      codexRuntimeProfile: 'safe'
+    });
+
+    const run = await createRun({
+      title: 'safe-runtime-write-block-smoke',
+      projectPath: root,
+      objective: 'safe runtime should block writable codex tasks',
+      presetId: 'existing-repo-feature',
+      specText: '',
+      specFiles: '',
+      settings: { maxParallel: 1, maxTaskAttempts: 1, maxGoalLoops: 1 }
+    });
+    runId = run.id;
+
+    await updatePlanDraft(run.id, {
+      summary: 'edit a docs file',
+      executionModel: 'single worker',
+      tasks: [{
+        id: 'T001',
+        title: 'Update README',
+        goal: 'change the docs content',
+        dependsOn: [],
+        filesLikely: ['README.md'],
+        constraints: [],
+        acceptanceChecks: ['README.md is updated']
+      }]
+    });
+
+    await assert.rejects(
+      () => startRun(run.id),
+      /Safe \(read-only\)|Full Auto|Yolo/
+    );
+
+    const refreshed = await getRun(run.id);
+    assert.equal(refreshed.preflight.ready, false);
+    assert.equal(refreshed.preflight.autonomy?.executionReady, false);
+    assert.ok(Array.isArray(refreshed.preflight.blockers) && refreshed.preflight.blockers.length >= 1);
+  } finally {
+    if (runId) {
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
+    }
+    await updateHarnessSettings(originalSettings);
+  }
+});
+
+test('refreshRunPreflight surfaces the Safe read-only blocker for pending writable Codex tasks', async () => {
+  let runId = '';
+  const originalSettings = await getHarnessSettings(root);
+  try {
+    await updateHarnessSettings({
+      ...originalSettings,
+      uiLanguage: 'en',
+      agentLanguage: 'en',
+      coordinationProvider: 'codex',
+      workerProvider: 'codex',
+      codexRuntimeProfile: 'safe'
+    });
+
+    const run = await createRun({
+      title: 'safe-runtime-preflight-block-smoke',
+      projectPath: root,
+      objective: 'safe runtime should flag writable codex tasks in preflight',
+      presetId: 'existing-repo-feature',
+      specText: '',
+      specFiles: '',
+      settings: { maxParallel: 1, maxTaskAttempts: 1, maxGoalLoops: 1 }
+    });
+    runId = run.id;
+
+    await updatePlanDraft(run.id, {
+      summary: 'edit a docs file',
+      executionModel: 'single worker',
+      tasks: [{
+        id: 'T001',
+        title: 'Update README',
+        goal: 'change the docs content',
+        dependsOn: [],
+        filesLikely: ['README.md'],
+        constraints: [],
+        acceptanceChecks: ['README.md is updated']
+      }]
+    });
+
+    const refreshed = await refreshRunPreflight(run.id);
+    assert.equal(refreshed.preflight.ready, false);
+    assert.equal(refreshed.preflight.autonomy?.executionReady, false);
+    assert.ok((refreshed.preflight.blockers || []).some((item) => /Safe \(read-only\)/.test(String(item || ''))));
+  } finally {
+    if (runId) {
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
+    }
+    await updateHarnessSettings(originalSettings);
+  }
+});
+
+test('startRun ignores completed writable tasks when evaluating the Safe read-only blocker', async () => {
+  let runId = '';
+  const originalSettings = await getHarnessSettings(root);
+  try {
+    await updateHarnessSettings({
+      ...originalSettings,
+      uiLanguage: 'en',
+      agentLanguage: 'en',
+      coordinationProvider: 'codex',
+      workerProvider: 'codex',
+      codexRuntimeProfile: 'safe'
+    });
+
+    const run = await createRun({
+      title: 'safe-runtime-completed-task-smoke',
+      projectPath: root,
+      objective: 'completed write tasks should not block restart',
+      presetId: 'existing-repo-feature',
+      specText: '',
+      specFiles: '',
+      settings: { maxParallel: 1, maxTaskAttempts: 1, maxGoalLoops: 1 }
+    });
+    runId = run.id;
+
+    const statePath = path.join(runsRoot, run.id, 'state.json');
+    const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+    state.status = 'stopped';
+    state.tasks = [{
+      id: 'T001',
+      title: 'Update README',
+      goal: 'change the docs content',
+      dependsOn: [],
+      filesLikely: ['README.md'],
+      constraints: [],
+      acceptanceChecks: ['README.md is updated'],
+      attempts: 1,
+      status: 'done',
+      reviewSummary: '',
+      findings: [],
+      lastExecution: {
+        workspaceMode: 'shared',
+        applyResult: 'done',
+        reviewDecision: 'approve'
+      }
+    }];
+    await fs.writeFile(statePath, JSON.stringify(state, null, 2), 'utf8');
+
+    const restarted = await startRun(run.id);
+    assert.equal(restarted.status, 'running');
+    await stopRun(run.id).catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  } finally {
+    if (runId) {
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
     await updateHarnessSettings(originalSettings);
   }
@@ -3666,7 +3935,7 @@ test('maybeAutoAdvanceProjectPhase closes a completed phase and activates the ne
     });
     runId = run.id;
 
-    const statePath = path.join(root, 'runs', run.id, 'state.json');
+    const statePath = path.join(runsRoot, run.id, 'state.json');
     const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
     state.status = 'completed';
     state.result = { goalAchieved: true, summary: 'Phase one goal met.' };
@@ -3738,7 +4007,7 @@ test('maybeAutoAdvanceProjectPhase runs an automatic quality sweep before closin
     });
     runId = run.id;
 
-    const statePath = path.join(root, 'runs', run.id, 'state.json');
+    const statePath = path.join(runsRoot, run.id, 'state.json');
     const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
     state.status = 'completed';
     state.updatedAt = '2026-04-05T09:10:00.000Z';
@@ -3884,7 +4153,7 @@ test('createRun inherits Codex model and fast mode from harness settings', async
     assert.equal(run.harnessConfig.codexFastMode, false);
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
     await updateHarnessSettings(originalSettings);
   }
@@ -3937,10 +4206,52 @@ test('createRun lets project provider defaults override machine provider default
     assert.equal(byName.implementer, 'gemini');
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
     if (projectId) {
-      await fs.rm(path.join(root, 'projects', projectId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(projectsRoot, projectId), { recursive: true, force: true }).catch(() => {});
+    }
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    await updateHarnessSettings(originalSettings);
+  }
+});
+
+test('project provider overrides that match machine defaults are not persisted', async () => {
+  let projectId = '';
+  const originalSettings = await getHarnessSettings(root);
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-project-provider-inherit-'));
+  try {
+    await updateHarnessSettings({
+      ...originalSettings,
+      coordinationProvider: 'codex',
+      workerProvider: 'codex'
+    });
+    const project = await createProject({
+      title: 'Project Provider Inherit',
+      rootPath: tempDir,
+      defaultSettings: {
+        providerProfile: {
+          coordinationProvider: 'codex',
+          workerProvider: 'codex'
+        }
+      },
+      phases: [{ title: 'Foundation', goal: 'ship phase one' }]
+    });
+    projectId = project.id;
+    assert.equal(Object.hasOwn(project.defaultSettings || {}, 'providerProfile'), false);
+
+    await updateProject(project.id, {
+      providerProfile: {
+        coordinationProvider: 'codex',
+        workerProvider: 'codex'
+      }
+    });
+
+    const refreshed = await getProject(project.id);
+    assert.equal(Object.hasOwn(refreshed.defaultSettings || {}, 'providerProfile'), false);
+  } finally {
+    if (projectId) {
+      await fs.rm(path.join(projectsRoot, projectId), { recursive: true, force: true }).catch(() => {});
     }
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
     await updateHarnessSettings(originalSettings);
@@ -3960,7 +4271,7 @@ test('recent logs are hydrated without persisting them into state.json', async (
     });
     runId = run.id;
 
-    const rawState = JSON.parse(await fs.readFile(path.join(root, 'runs', run.id, 'state.json'), 'utf8'));
+    const rawState = JSON.parse(await fs.readFile(path.join(runsRoot, run.id, 'state.json'), 'utf8'));
     assert.equal(Object.hasOwn(rawState, 'logs'), false);
 
     const hydrated = await getRun(run.id);
@@ -3968,7 +4279,7 @@ test('recent logs are hydrated without persisting them into state.json', async (
     assert.match(hydrated.logs.at(-1)?.message || '', /Run created\./);
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
   }
 });
@@ -3986,7 +4297,7 @@ test('manual retry resets attempts and reopens a failed run', async () => {
     });
     runId = run.id;
 
-    const statePath = path.join(root, 'runs', run.id, 'state.json');
+    const statePath = path.join(runsRoot, run.id, 'state.json');
     const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
     state.status = 'failed';
     state.tasks = [{
@@ -4015,7 +4326,7 @@ test('manual retry resets attempts and reopens a failed run', async () => {
     assert.equal(refreshed.tasks[0].attempts, 0);
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
   }
 });
@@ -4033,7 +4344,7 @@ test('requeueFailedTasks resets all failed tasks and reopens the run', async () 
     });
     runId = run.id;
 
-    const statePath = path.join(root, 'runs', run.id, 'state.json');
+    const statePath = path.join(runsRoot, run.id, 'state.json');
     const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
     state.status = 'failed';
     state.tasks = [{
@@ -4078,7 +4389,7 @@ test('requeueFailedTasks resets all failed tasks and reopens the run', async () 
     assert.deepEqual(refreshed.tasks.map((task) => task.attempts), [0, 0]);
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
   }
 });
@@ -4096,7 +4407,7 @@ test('skipTask marks the task as skipped', async () => {
     });
     runId = run.id;
 
-    const statePath = path.join(root, 'runs', run.id, 'state.json');
+    const statePath = path.join(runsRoot, run.id, 'state.json');
     const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
     state.status = 'failed';
     state.tasks = [{
@@ -4125,7 +4436,7 @@ test('skipTask marks the task as skipped', async () => {
     assert.equal(refreshed.tasks[0].lastExecution.reviewDecision, 'skipped');
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
   }
 });
@@ -4143,7 +4454,7 @@ test('updatePlanDraft lets the user edit agents and tasks before execution', asy
     });
     runId = run.id;
 
-    const statePath = path.join(root, 'runs', run.id, 'state.json');
+    const statePath = path.join(runsRoot, run.id, 'state.json');
     const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
     state.status = 'needs_approval';
     state.planSummary = 'old summary';
@@ -4187,7 +4498,7 @@ test('updatePlanDraft lets the user edit agents and tasks before execution', asy
     assert.equal(updated.tasks[0].status, 'ready');
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
   }
 });
@@ -4218,7 +4529,7 @@ test('stopRun writes a resume checkpoint artifact and checkpoint memory', async 
     });
 
     await stopRun(run.id);
-    const checkpoint = JSON.parse(await fs.readFile(path.join(root, 'runs', run.id, 'run-checkpoint.json'), 'utf8'));
+    const checkpoint = JSON.parse(await fs.readFile(path.join(runsRoot, run.id, 'run-checkpoint.json'), 'utf8'));
     const dailyMemory = await fs.readFile(path.join(run.memory.dailyDir, path.basename(run.memory.dailyFile)), 'utf8');
 
     assert.equal(checkpoint.status, 'stopped');
@@ -4227,7 +4538,7 @@ test('stopRun writes a resume checkpoint artifact and checkpoint memory', async 
     assert.match(dailyMemory, /Run Checkpoint/);
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
   }
 });
@@ -4245,7 +4556,7 @@ test('stopRun checkpoint preserves invalid automatic replan diagnostics', async 
     });
     runId = run.id;
 
-    const statePath = path.join(root, 'runs', run.id, 'state.json');
+    const statePath = path.join(runsRoot, run.id, 'state.json');
     const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
     state.status = 'stopped';
     state.autoReplan = {
@@ -4271,14 +4582,14 @@ test('stopRun checkpoint preserves invalid automatic replan diagnostics', async 
     await fs.writeFile(statePath, JSON.stringify(state, null, 2), 'utf8');
 
     await stopRun(run.id);
-    const checkpoint = JSON.parse(await fs.readFile(path.join(root, 'runs', run.id, 'run-checkpoint.json'), 'utf8'));
+    const checkpoint = JSON.parse(await fs.readFile(path.join(runsRoot, run.id, 'run-checkpoint.json'), 'utf8'));
 
     assert.equal(checkpoint.autoReplan?.skipped, true);
     assert.match(String(checkpoint.autoReplan?.parseError || ''), /JSON parse failed/);
     assert.match(String(checkpoint.autoReplan?.rawSnippet || ''), /shouldReplan/);
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
   }
 });
@@ -4296,7 +4607,7 @@ test('updatePlanDraft edits paused backlog while preserving completed tasks', as
     });
     runId = run.id;
 
-    const statePath = path.join(root, 'runs', run.id, 'state.json');
+    const statePath = path.join(runsRoot, run.id, 'state.json');
     const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
     state.status = 'stopped';
     state.tasks = [{
@@ -4360,7 +4671,7 @@ test('updatePlanDraft edits paused backlog while preserving completed tasks', as
     assert.ok(updated.tasks.some((task) => task.title === '새 태스크 추가' && task.status === 'ready'));
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
   }
 });
@@ -4377,7 +4688,7 @@ test('deleteRun removes a non-running run directory', async () => {
       settings: { maxParallel: 1, maxTaskAttempts: 1, maxGoalLoops: 1 }
     });
     runId = run.id;
-    const runPath = path.join(root, 'runs', run.id);
+    const runPath = path.join(runsRoot, run.id);
     await fs.access(runPath);
 
     const result = await deleteRun(run.id);
@@ -4386,7 +4697,7 @@ test('deleteRun removes a non-running run directory', async () => {
     runId = '';
   } finally {
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
   }
 });
@@ -4407,7 +4718,7 @@ test('deleteProject removes project directory and optionally deletes project run
     memoryKey = project.sharedMemoryKey;
 
     await ensureProjectMemory(root, memoryKey, { projectPath: tempDir });
-    await fs.writeFile(path.join(root, 'memory', 'projects', memoryKey, 'MEMORY.md'), '# Project Memory\n\nDelete me.\n', 'utf8');
+    await fs.writeFile(path.join(memoryRoot, memoryKey, 'MEMORY.md'), '# Project Memory\n\nDelete me.\n', 'utf8');
 
     const run = await createRun({
       title: 'delete-project-run',
@@ -4419,9 +4730,9 @@ test('deleteProject removes project directory and optionally deletes project run
     });
     runId = run.id;
 
-    const projectPath = path.join(root, 'projects', project.id);
-    const runPath = path.join(root, 'runs', run.id);
-    const memoryPath = path.join(root, 'memory', 'projects', memoryKey);
+    const projectPath = path.join(projectsRoot, project.id);
+    const runPath = path.join(runsRoot, run.id);
+    const memoryPath = path.join(memoryRoot, memoryKey);
     await fs.access(projectPath);
     await fs.access(runPath);
     await fs.access(memoryPath);
@@ -4439,13 +4750,13 @@ test('deleteProject removes project directory and optionally deletes project run
     memoryKey = '';
   } finally {
     if (projectId) {
-      await fs.rm(path.join(root, 'projects', projectId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(projectsRoot, projectId), { recursive: true, force: true }).catch(() => {});
     }
     if (runId) {
-      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
     }
     if (memoryKey) {
-      await fs.rm(path.join(root, 'memory', 'projects', memoryKey), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(memoryRoot, memoryKey), { recursive: true, force: true }).catch(() => {});
     }
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -4584,7 +4895,7 @@ test('supervisor immediate pass auto-pauses after repeated failed runs and expos
         settings: { maxParallel: 1, maxTaskAttempts: 1, maxGoalLoops: 1 }
       });
       runIds.push(run.id);
-      const statePath = path.join(root, 'runs', run.id, 'state.json');
+      const statePath = path.join(runsRoot, run.id, 'state.json');
       const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
       state.status = 'failed';
       state.updatedAt = updatedAt;

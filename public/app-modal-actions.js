@@ -65,13 +65,11 @@
       .split(',')
       .map((item) => item.trim())
       .filter(Boolean);
+    const coordinationProvider = String(doc.getElementById('project-settings-coordination-provider')?.value || '').trim();
+    const workerProvider = String(doc.getElementById('project-settings-worker-provider')?.value || '').trim();
     const payload = {
       charterText: doc.getElementById('project-settings-charter')?.value || '',
       defaultPresetId: doc.getElementById('project-settings-preset')?.value || 'auto',
-      providerProfile: {
-        coordinationProvider: doc.getElementById('project-settings-coordination-provider')?.value || 'codex',
-        workerProvider: doc.getElementById('project-settings-worker-provider')?.value || 'codex'
-      },
       toolProfile: {
         id: doc.getElementById('project-settings-tool-id')?.value || 'default',
         label: doc.getElementById('project-settings-tool-label')?.value || 'Default',
@@ -97,6 +95,12 @@
         pollIntervalMs: Math.max(5000, Number(doc.getElementById('project-settings-poll-interval')?.value || 30000) || 30000)
       }
     };
+    if (coordinationProvider && workerProvider) {
+      payload.providerProfile = {
+        coordinationProvider,
+        workerProvider
+      };
+    }
     const runLoopEnabled = doc.getElementById('project-settings-run-loop-enabled')?.checked === true;
     if (runLoopEnabled) {
       payload.continuationPolicy.runLoop = {

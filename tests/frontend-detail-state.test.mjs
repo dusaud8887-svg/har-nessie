@@ -1360,6 +1360,83 @@ test('project settings editor saves updated defaults and rerenders the project o
   });
 });
 
+test('project settings editor can clear provider overrides and fall back to machine defaults', async () => {
+  const { context, document, fetchStub } = await createUiHarness();
+  const initialOverview = {
+    project: {
+      id: 'project-beta',
+      title: 'Project Beta',
+      rootPath: 'D:/repos/project-beta',
+      currentPhaseId: 'phase-foundation',
+      defaultPresetId: 'existing-repo-feature',
+      charterText: 'initial beta charter',
+      defaultSettings: {
+        providerProfile: { coordinationProvider: 'claude', workerProvider: 'gemini' }
+      },
+      bootstrap: { enabled: false, generated: [] }
+    },
+    phases: [{
+      id: 'phase-foundation',
+      title: 'Foundation',
+      goal: 'ship the baseline harness',
+      status: 'active',
+      runCounts: { ready: 0, running: 0, stopped: 0, failed: 0, completed: 0 },
+      carryOverTasks: [],
+      pendingReview: [],
+      cleanupLane: [],
+      latestQualitySweep: null,
+      backlogLineage: [],
+      openRisks: [],
+      recentRuns: []
+    }]
+  };
+  const savedOverview = {
+    project: {
+      ...initialOverview.project,
+      defaultSettings: {}
+    },
+    phases: initialOverview.phases
+  };
+
+  fetchStub.queue('/api/projects/project-beta', initialOverview);
+  fetchStub.queue('/api/projects/project-beta', savedOverview);
+  fetchStub.queue('/api/projects/project-beta', savedOverview);
+  fetchStub.queue('/api/projects', [{
+    id: 'project-beta',
+    title: 'Project Beta',
+    status: 'active',
+    rootPath: 'D:/repos/project-beta',
+    currentPhaseId: 'phase-foundation',
+    defaultPresetId: 'existing-repo-feature',
+    phases: [{ id: 'phase-foundation', title: 'Foundation' }]
+  }]);
+
+  vm.runInContext(`
+    projects = [{
+      id: 'project-beta',
+      title: 'Project Beta',
+      status: 'active',
+      rootPath: 'D:/repos/project-beta',
+      currentPhaseId: 'phase-foundation',
+      defaultPresetId: 'existing-repo-feature',
+      phases: [{ id: 'phase-foundation', title: 'Foundation' }]
+    }];
+    renderProjectList();
+  `, context);
+
+  await vm.runInContext(`selectProject('project-beta')`, context);
+
+  document.getElementById('project-settings-coordination-provider').value = '';
+  document.getElementById('project-settings-worker-provider').value = '';
+
+  await vm.runInContext(`saveProjectSettings()`, context);
+
+  const updateRequest = fetchStub.requests.find((entry) => entry.url === '/api/projects/project-beta' && entry.options?.method === 'POST');
+  const updateBody = JSON.parse(String(updateRequest?.options?.body || '{}'));
+  assert.equal(Object.hasOwn(updateBody, 'providerProfile'), false);
+  assert.match(document.getElementById('main-area').innerHTML, /프로젝트에 따로 정한 담당 AI가 없으면 이 PC의 기본값을 그대로 따릅니다/);
+});
+
 test('project board shows browser runtime readiness when available', async () => {
   const { context, document, fetchStub } = await createUiHarness();
   fetchStub.queue('/api/projects/project-ready', {

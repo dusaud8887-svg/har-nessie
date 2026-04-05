@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
 
+import { MEMORY_DIR, RUNS_DIR } from '../app/harness-paths.mjs';
 import { parseCronExpression, cronMatchesNow, findNextCronOccurrence } from '../app/cron-utils.mjs';
 import { createMemoryResolver } from '../app/memory-resolver.mjs';
 import { createSupervisorRuntimeStore } from '../app/supervisor-runtime-store.mjs';
@@ -177,7 +178,7 @@ test('appendArtifactMemory serializes concurrent writes for the same project mem
     run.tasks = tasks;
 
     for (const task of tasks) {
-      const taskDir = path.join(tempRoot, 'runs', run.id, 'tasks', task.id);
+      const taskDir = path.join(RUNS_DIR, run.id, 'tasks', task.id);
       await fs.mkdir(taskDir, { recursive: true });
       await fs.writeFile(path.join(taskDir, 'agent-output.md'), `${task.title} output`, 'utf8');
       await fs.writeFile(path.join(taskDir, 'agent-review.json'), JSON.stringify({
@@ -189,7 +190,7 @@ test('appendArtifactMemory serializes concurrent writes for the same project mem
 
     await Promise.all(tasks.map((task) => appendArtifactMemory(tempRoot, run, task)));
 
-    const indexPath = path.join(tempRoot, 'memory', 'projects', run.memory.projectKey, 'memory-artifacts.ndjson');
+    const indexPath = path.join(MEMORY_DIR, run.memory.projectKey, 'memory-artifacts.ndjson');
     const rows = (await fs.readFile(indexPath, 'utf8'))
       .trim()
       .split(/\r?\n/)
@@ -199,6 +200,8 @@ test('appendArtifactMemory serializes concurrent writes for the same project mem
     assert.ok(taskIds.has('T001'));
     assert.ok(taskIds.has('T002'));
   } finally {
+    await fs.rm(path.join(RUNS_DIR, 'run-concurrent-memory'), { recursive: true, force: true }).catch(() => {});
+    await fs.rm(path.join(MEMORY_DIR, 'proj-concurrent'), { recursive: true, force: true }).catch(() => {});
     await fs.rm(tempRoot, { recursive: true, force: true });
   }
 });

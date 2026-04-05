@@ -72,6 +72,12 @@ import { buildContinuationPromptLines } from './run-continuation.mjs';
 import { createRuntimeObservability } from './runtime-observability.mjs';
 import { createSupervisorLoop } from './supervisor-loop.mjs';
 import { createSupervisorRuntimeStore } from './supervisor-runtime-store.mjs';
+import {
+  classifyAcceptanceChecks,
+  extractAcceptanceVerificationCommands,
+  rewriteWindowsCommandForAvailability,
+  windowsCommandPrefersPowerShell
+} from './verification-utils.mjs';
 
 const bus = new EventEmitter();
 const activeRuns = new Map();
@@ -79,6 +85,7 @@ const runningProjectSupervisors = new Map();
 const harnessSettingsContext = new AsyncLocalStorage();
 const writeLocks = new Map();
 const appendLocks = new Map();
+const windowsCommandAvailabilityCache = new Map();
 const PROJECT_AUTOMATION_TICK_MS = 30_000;
 const PROJECT_AUTOMATION_MAX_DEPTH = 120;
 const RUN_LOCK_TIMEOUT_MS = 60_000;
@@ -155,7 +162,14 @@ const {
   refreshRunMemory
 } = memoryResolver;
 
-export { applyPlanPolicy, defaultExecutionPolicy, buildContinuationPromptLines, decideReviewRoute, isReadOnlyVerificationTask, selectVerificationCommands };
+export {
+  applyPlanPolicy,
+  defaultExecutionPolicy,
+  buildContinuationPromptLines,
+  decideReviewRoute,
+  isReadOnlyVerificationTask,
+  selectVerificationCommands
+};
 
 /**
  * @typedef {Object} RunSummary
@@ -173,6 +187,12 @@ export { applyPlanPolicy, defaultExecutionPolicy, buildContinuationPromptLines, 
 
 function now() {
   return new Date().toISOString();
+}
+
+function buildRunId(title) {
+  const timestamp = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 17);
+  const suffix = Math.random().toString(16).slice(2, 6);
+  return `${timestamp}-${suffix}-${slugify(title)}`;
 }
 
 function runDir(runId) {
@@ -370,10 +390,23 @@ function rebindAgentProviderModels(agents, providerProfile) {
 
 function normalizeProviderProfile(value, fallback = DEFAULT_HARNESS_SETTINGS) {
   if (!value || typeof value !== 'object') return null;
+  const rawCoordinationProvider = String(value.coordinationProvider || '').trim();
+  const rawWorkerProvider = String(value.workerProvider || '').trim();
+  if (!rawCoordinationProvider && !rawWorkerProvider) return null;
   return {
-    coordinationProvider: normalizeAgentProvider(value.coordinationProvider, fallback?.coordinationProvider || 'codex'),
-    workerProvider: normalizeAgentProvider(value.workerProvider, fallback?.workerProvider || 'codex')
+    coordinationProvider: normalizeAgentProvider(rawCoordinationProvider, fallback?.coordinationProvider || 'codex'),
+    workerProvider: normalizeAgentProvider(rawWorkerProvider, fallback?.workerProvider || 'codex')
   };
+}
+
+function normalizeProjectProviderProfileOverride(value, harnessSettings = DEFAULT_HARNESS_SETTINGS) {
+  const normalized = normalizeProviderProfile(value, harnessSettings);
+  if (!normalized) return null;
+  const machineProfile = {
+    coordinationProvider: normalizeAgentProvider(harnessSettings?.coordinationProvider, DEFAULT_HARNESS_SETTINGS.coordinationProvider),
+    workerProvider: normalizeAgentProvider(harnessSettings?.workerProvider, DEFAULT_HARNESS_SETTINGS.workerProvider)
+  };
+  return providerProfilesMatch(normalized, machineProfile) ? null : normalized;
 }
 
 function preflightExecutionReady(preflight) {
@@ -490,7 +523,11 @@ async function syncRunToCurrentSettings(runId, { refreshPreflight = false } = {}
     const state = await loadState(runId);
     const liveSettings = await resolveCurrentRunSettings(state);
     const preflight = refreshPreflight
-      ? await buildPreflight(state.projectPath || '', state.input?.specFiles || [], liveSettings.effectiveHarnessSettings)
+      ? appendWritableCodexBlocker(
+          await buildPreflight(state.projectPath || '', state.input?.specFiles || [], liveSettings.effectiveHarnessSettings),
+          state,
+          liveSettings.effectiveHarnessSettings
+        )
       : null;
     const validationCommands = refreshPreflight
       ? await detectProjectValidationCommands(state.projectPath || '', PROJECT_INTEL_HELPERS)
@@ -906,6 +943,64 @@ function defaultExecutionModelHint(run) {
 function codexRuntimeProfileSettings(value) {
   const profileId = normalizeCodexRuntimeProfile(value, DEFAULT_SETTINGS.codexRuntimeProfile);
   return CODEX_RUNTIME_PROFILES[profileId] || CODEX_RUNTIME_PROFILES[DEFAULT_SETTINGS.codexRuntimeProfile];
+}
+
+function taskNeedsWritableExecution(task) {
+  const status = String(task?.status || '').trim().toLowerCase();
+  if (['done', 'skipped'].includes(status)) return false;
+  return !isReadOnlyVerificationTask(task);
+}
+
+function runHasWritableCodexTasks(run, settings = null) {
+  const effectiveSettings = settings || run?.settings || run?.harnessConfig || {};
+  if (normalizeAgentProvider(effectiveSettings?.workerProvider, 'codex') !== 'codex') return false;
+  if (normalizeCodexRuntimeProfile(effectiveSettings?.codexRuntimeProfile, DEFAULT_SETTINGS.codexRuntimeProfile) !== 'safe') return false;
+  const tasks = Array.isArray(run?.tasks) ? run.tasks : [];
+  return tasks.some((task) => taskNeedsWritableExecution(task));
+}
+
+function appendWritableCodexBlocker(preflight, run, settings = null) {
+  if (!runHasWritableCodexTasks(run, settings)) return preflight;
+  const language = normalizeLanguage(run?.harnessConfig?.uiLanguage || run?.harnessConfig?.agentLanguage, DEFAULT_HARNESS_SETTINGS.uiLanguage);
+  const blocker = localizedText(
+    language,
+    'Codex runtime profile이 Safe(read-only)라서 write task를 실행할 수 없습니다. Settings에서 Codex runtime profile을 Full Auto 또는 Yolo로 바꾼 뒤 다시 시작하세요.',
+    'Codex runtime profile is Safe (read-only), so write tasks cannot run. Change Codex runtime profile to Full Auto or Yolo in Settings, then start the run again.'
+  );
+  return {
+    ...preflight,
+    ready: false,
+    blockers: uniqueBy([...(Array.isArray(preflight?.blockers) ? preflight.blockers : []), blocker], (item) => item),
+    autonomy: {
+      ...(preflight?.autonomy || {}),
+      executionReady: false
+    }
+  };
+}
+
+async function windowsCommandAvailable(command) {
+  const normalized = String(command || '').trim().toLowerCase();
+  if (!normalized) return false;
+  if (windowsCommandAvailabilityCache.has(normalized)) {
+    return windowsCommandAvailabilityCache.get(normalized);
+  }
+  const pending = runProcess('where.exe', [normalized], ROOT_DIR, null, false, null, 5000)
+    .then((result) => result.code === 0)
+    .catch(() => false);
+  windowsCommandAvailabilityCache.set(normalized, pending);
+  return pending;
+}
+
+async function resolveVerificationCommandLine(commandLine) {
+  const normalized = String(commandLine || '').trim();
+  if (process.platform !== 'win32' || !normalized) {
+    return { commandLine: normalized, rewritten: false, note: '' };
+  }
+  const firstToken = normalized.split(/\s+/)[0].toLowerCase();
+  const rgAvailable = ['rg', 'rg.exe'].includes(firstToken)
+    ? await windowsCommandAvailable('rg')
+    : true;
+  return rewriteWindowsCommandForAvailability(normalized, { rgAvailable });
 }
 
 export function buildCodexExecArgs(settings = {}, outputFileName = '') {
@@ -1787,6 +1882,7 @@ async function readJson(filePath) {
 
 async function writeJson(filePath, value) {
   const serialized = JSON.stringify(value, null, 2);
+  await ensureDir(path.dirname(filePath));
   const tempPath = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2, 8)}.tmp`;
   await fs.writeFile(tempPath, serialized, 'utf8');
   try {
@@ -2811,63 +2907,8 @@ function isDocsOnlyTask(task) {
   });
 }
 
-function looksLikeShellCommand(value) {
-  const command = String(value || '').trim();
-  if (!command || /\r|\n/.test(command)) return false;
-  const firstToken = command.split(/\s+/)[0].toLowerCase();
-  return [
-    'npm',
-    'pnpm',
-    'yarn',
-    'bun',
-    'npx',
-    'node',
-    'python',
-    'pytest',
-    'cargo',
-    'go',
-    'dotnet',
-    'mvn',
-    'gradle',
-    './gradlew',
-    'git',
-    'rg',
-    'grep',
-    'findstr',
-    'test-path',
-    'powershell',
-    'pwsh',
-    'cmd',
-    'bash',
-    'sh',
-    'get-childitem',
-    'select-string'
-  ].includes(firstToken);
-}
-
-function extractAcceptanceVerificationCommands(task) {
-  const checks = Array.isArray(task?.acceptanceChecks) ? task.acceptanceChecks : [];
-  const commands = [];
-  for (const rawCheck of checks) {
-    const check = String(rawCheck || '').trim();
-    if (!check) continue;
-    let command = '';
-    let match = check.match(/^`([^`]+)`\s+(?:exits?\s*0|returns?\s+(?:true|false)|passes)\b/i);
-    if (match) {
-      command = match[1];
-    } else {
-      match = check.match(/^(.+?)\s+(?:exits?\s*0|returns?\s+(?:true|false)|passes)\b/i);
-      if (match) command = match[1];
-    }
-    command = String(command || '').trim();
-    if (!looksLikeShellCommand(command)) continue;
-    commands.push(command);
-  }
-  return uniqueBy(commands, (item) => item).slice(0, 3);
-}
-
 function selectVerificationCommands(run, task) {
-  const explicitCommands = extractAcceptanceVerificationCommands(task);
+  const explicitCommands = extractAcceptanceVerificationCommands(task?.acceptanceChecks || [], 4);
   if (explicitCommands.length) return explicitCommands;
 
   if (isDocsOnlyTask(task)) return [];
@@ -3830,6 +3871,17 @@ async function runAgentProvider(provider, prompt, cwd, settings, controller) {
 
 async function runCommandLine(commandLine, cwd, controller) {
   if (process.platform === 'win32') {
+    if (windowsCommandPrefersPowerShell(commandLine)) {
+      return runProcess(
+        'powershell.exe',
+        ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', commandLine],
+        cwd,
+        controller,
+        true,
+        null,
+        COMMAND_TIMEOUT_MS
+      );
+    }
     return runProcess('cmd.exe', ['/d', '/s', '/c', commandLine], cwd, controller, true, null, COMMAND_TIMEOUT_MS);
   }
   return runProcess('/bin/sh', ['-lc', commandLine], cwd, controller, true, null, COMMAND_TIMEOUT_MS);
@@ -4116,6 +4168,10 @@ async function collectExecutionScope(run, task, executionCtx, changedFiles, curr
 
 async function runTaskVerification(run, task, executionCtx, currentTaskDir, controller, actionPolicy, actionState) {
   const commands = selectVerificationCommands(run, task);
+  const acceptanceDescriptors = classifyAcceptanceChecks(task?.acceptanceChecks || []);
+  const uncoveredAcceptanceChecks = acceptanceDescriptors
+    .filter((item) => !item.commandBacked)
+    .map((item) => item.check);
   const verificationTypes = inferTaskVerificationTypes(task, commands);
   const reportFile = path.join(currentTaskDir, 'verification.json');
   const results = [];
@@ -4131,23 +4187,26 @@ async function runTaskVerification(run, task, executionCtx, currentTaskDir, cont
     verificationTypes
   });
   for (const commandLine of commands) {
+    const resolvedCommand = await resolveVerificationCommandLine(commandLine);
     const result = await runTaskAction(
       run.id,
       task.id,
       actionPolicy,
       'verification',
       { command: commandLine, cwd: executionCtx.reviewCwd },
-      () => runCommandLine(commandLine, executionCtx.reviewCwd, controller),
+      () => runCommandLine(resolvedCommand.commandLine, executionCtx.reviewCwd, controller),
       actionState
     );
     results.push({
       command: commandLine,
+      ...(resolvedCommand.rewritten ? { executedCommand: resolvedCommand.commandLine, note: resolvedCommand.note } : {}),
       code: result.code,
       stdout: clipBlock(result.stdout || '', 1800),
       stderr: clipBlock(result.stderr || '', 1200)
     });
     await appendTaskTrajectory(run.id, task.id, 'verification-command', {
       command: commandLine,
+      ...(resolvedCommand.rewritten ? { executedCommand: resolvedCommand.commandLine, note: resolvedCommand.note } : {}),
       code: result.code,
       ok: result.code === 0
     });
@@ -4168,9 +4227,12 @@ async function runTaskVerification(run, task, executionCtx, currentTaskDir, cont
     results,
     ok: shellOk && browserOk,
     verificationTypes,
+    uncoveredAcceptanceChecks,
     browser,
     note: commands.length === 0
-      ? (browser ? `Shell verification skipped; browser verification ${browser.status}.` : 'No automatic verification commands were selected for this task.')
+      ? (browser
+          ? `Shell verification skipped; browser verification ${browser.status}.${uncoveredAcceptanceChecks.length ? ' Some acceptance checks still require reviewer judgment.' : ''}`
+          : `No automatic verification commands were selected for this task.${uncoveredAcceptanceChecks.length ? ' Some acceptance checks still require reviewer judgment.' : ''}`)
       : ((shellOk && browserOk)
         ? 'All selected verification commands passed.'
         : [shellOk ? '' : 'One or more verification commands failed.', browser && browser.ok !== true ? `Browser verification ${browser.status}.` : ''].filter(Boolean).join(' '))
@@ -6742,7 +6804,7 @@ export async function createProject(input = {}) {
   }
 
   const defaultSettings = input.defaultSettings && typeof input.defaultSettings === 'object' ? { ...input.defaultSettings } : {};
-  const providerProfile = normalizeProviderProfile(defaultSettings.providerProfile);
+  const providerProfile = normalizeProjectProviderProfileOverride(defaultSettings.providerProfile, harnessSettings);
   if (providerProfile) defaultSettings.providerProfile = providerProfile;
   else delete defaultSettings.providerProfile;
   defaultSettings.continuationPolicy = normalizeContinuationPolicy(defaultSettings.continuationPolicy);
@@ -6852,7 +6914,7 @@ export async function updateProject(projectIdValue, input = {}) {
     else delete defaultSettings.devServer;
   }
   if (Object.prototype.hasOwnProperty.call(input, 'providerProfile')) {
-    const providerProfile = normalizeProviderProfile(input.providerProfile);
+    const providerProfile = normalizeProjectProviderProfileOverride(input.providerProfile, harnessSettings);
     if (providerProfile) defaultSettings.providerProfile = providerProfile;
     else delete defaultSettings.providerProfile;
   }
@@ -8121,7 +8183,7 @@ export async function skipTask(runId, taskId, reason = '') {
 
 export async function createRun(input) {
   const title = String(input.title || input.objective || 'Harness Run').trim();
-  const runId = `${new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${slugify(title)}`;
+  const runId = buildRunId(title);
   const attachedProject = input.projectId ? await getProject(String(input.projectId || '').trim()) : null;
   const projectPath = input.projectPath ? resolveInputPath(input.projectPath, '') : (attachedProject?.rootPath || '');
   const harnessSettings = await getHarnessSettings(projectPath);
@@ -8469,7 +8531,11 @@ export async function startRun(runId, { additionalRequirements = '' } = {}) {
       }
       const liveSettings = await resolveCurrentRunSettings(state);
       const rebound = applyCurrentRunSettings(state, liveSettings);
-      const refreshedPreflight = await buildPreflight(state.projectPath || '', state.input?.specFiles || [], liveSettings.effectiveHarnessSettings);
+      const refreshedPreflight = appendWritableCodexBlocker(
+        await buildPreflight(state.projectPath || '', state.input?.specFiles || [], liveSettings.effectiveHarnessSettings),
+        state,
+        liveSettings.effectiveHarnessSettings
+      );
       const validationCommands = await detectProjectValidationCommands(state.projectPath || '', PROJECT_INTEL_HELPERS);
       applyCurrentRunSettings(state, liveSettings, { preflight: refreshedPreflight, validationCommands });
       if (rebound.changed) {

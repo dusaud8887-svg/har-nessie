@@ -699,20 +699,22 @@
               <div class="form-group">
                 <label>${escapeHtml(t('기본 계획/검토 담당', 'Default planning/review provider'))}</label>
                 <select id="project-settings-coordination-provider">
-                  <option value="codex" ${(providerProfile?.coordinationProvider || 'codex') === 'codex' ? 'selected' : ''}>Codex</option>
+                  <option value="" ${providerProfile ? '' : 'selected'}>${escapeHtml(t('이 PC 기본값 따름', 'Machine default'))}</option>
+                  <option value="codex" ${providerProfile?.coordinationProvider === 'codex' ? 'selected' : ''}>Codex</option>
                   <option value="claude" ${providerProfile?.coordinationProvider === 'claude' ? 'selected' : ''}>Claude Code CLI</option>
                   <option value="gemini" ${providerProfile?.coordinationProvider === 'gemini' ? 'selected' : ''}>Gemini CLI</option>
                 </select>
-                <div class="helper-text">${escapeHtml(t('이 프로젝트에서 계획, 검토, 완료 판단을 누가 맡을지 정합니다. 대부분은 Codex 그대로 두면 됩니다.', 'Choose who handles planning, review, and completion judgment. Most teams can leave this on Codex.'))}</div>
+                <div class="helper-text">${escapeHtml(t('비워 두면 이 PC 설정을 그대로 따릅니다. 프로젝트마다 따로 고정할 때만 선택하세요.', 'Leave this on Machine default to inherit the PC setting. Only choose an explicit provider when this project must pin its own default.'))}</div>
               </div>
               <div class="form-group">
                 <label>${escapeHtml(t('기본 구현 담당', 'Default implementation provider'))}</label>
                 <select id="project-settings-worker-provider">
-                  <option value="codex" ${(providerProfile?.workerProvider || 'codex') === 'codex' ? 'selected' : ''}>Codex</option>
+                  <option value="" ${providerProfile ? '' : 'selected'}>${escapeHtml(t('이 PC 기본값 따름', 'Machine default'))}</option>
+                  <option value="codex" ${providerProfile?.workerProvider === 'codex' ? 'selected' : ''}>Codex</option>
                   <option value="claude" ${providerProfile?.workerProvider === 'claude' ? 'selected' : ''}>Claude Code CLI</option>
                   <option value="gemini" ${providerProfile?.workerProvider === 'gemini' ? 'selected' : ''}>Gemini CLI</option>
                 </select>
-                <div class="helper-text">${escapeHtml(t('이 프로젝트에서 실제 코드 변경을 누가 맡을지 정합니다. 대부분은 Codex 그대로 두면 됩니다.', 'Choose who makes the implementation changes. Most teams can leave this on Codex.'))}</div>
+                <div class="helper-text">${escapeHtml(t('비워 두면 이 PC 설정을 그대로 따릅니다. 프로젝트마다 따로 고정할 때만 선택하세요.', 'Leave this on Machine default to inherit the PC setting. Only choose an explicit provider when this project must pin its own default.'))}</div>
               </div>
               <div class="form-group">
                 <label>${escapeHtml(t('연속 작업 운영 방식', 'Continuation mode'))}</label>

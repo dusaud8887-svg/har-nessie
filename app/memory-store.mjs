@@ -1,5 +1,6 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { HARNESS_META_DIR, MEMORY_DIR, RUNS_DIR } from './harness-paths.mjs';
 import { GRAPH_INTELLIGENCE_DEFAULTS } from './run-config.mjs';
 import { createRuntimeObservability } from './runtime-observability.mjs';
 
@@ -121,7 +122,7 @@ function toFtsQuery(text) {
 }
 
 function projectPaths(rootDir, projectKey) {
-  const baseDir = path.join(rootDir, 'memory', 'projects', projectKey);
+  const baseDir = path.join(MEMORY_DIR, projectKey);
   return {
     projectKey,
     baseDir,
@@ -132,7 +133,7 @@ function projectPaths(rootDir, projectKey) {
     taskMemoryDir: path.join(baseDir, 'tasks'),
     artifactIndexFile: path.join(baseDir, 'memory-artifacts.ndjson'),
     indexFile: path.join(baseDir, 'memory.sqlite'),
-    legacyFile: path.join(rootDir, 'memory', 'projects', `${projectKey}.md`)
+    legacyFile: path.join(MEMORY_DIR, `${projectKey}.md`)
   };
 }
 
@@ -141,7 +142,7 @@ function rootObservability(rootDir) {
   const existing = rootObservabilityCache.get(normalizedRoot);
   if (existing) return existing;
   const observability = createRuntimeObservability({
-    metaDir: path.join(normalizedRoot, '.harness-web'),
+    metaDir: HARNESS_META_DIR,
     now
   });
   rootObservabilityCache.set(normalizedRoot, observability);
@@ -438,15 +439,15 @@ function normalizeAcceptanceFailures(results) {
 }
 
 function artifactTaskRoot(rootDir, runId, taskId) {
-  return path.join(rootDir, 'runs', runId, 'tasks', taskId);
+  return path.join(RUNS_DIR, runId, 'tasks', taskId);
 }
 
 function taskCodeContextArtifactPath(rootDir, runId, taskId) {
-  return path.join(rootDir, 'runs', runId, 'context', 'code-context', `${taskId}.json`);
+  return path.join(RUNS_DIR, runId, 'context', 'code-context', `${taskId}.json`);
 }
 
 function artifactManifestPath(rootDir, runId) {
-  return path.join(rootDir, 'runs', runId, 'artifact-manifest.json');
+  return path.join(RUNS_DIR, runId, 'artifact-manifest.json');
 }
 
 function artifactSummary(kind, body, json = null) {
@@ -1714,6 +1715,7 @@ export async function appendArtifactMemory(rootDir, run, task) {
       ...((Array.isArray(taskCodeContext?.relatedFiles) ? taskCodeContext.relatedFiles : []).flatMap((entry) => Array.isArray(entry?.symbols) ? entry.symbols : []))
     ]).slice(0, 12);
     const manifestFile = artifactManifestPath(rootDir, run.id);
+    await ensureDir(path.dirname(manifestFile));
     const existingManifest = await readOptionalJson(manifestFile) || {
       schemaVersion: '1',
       runId: run.id,
