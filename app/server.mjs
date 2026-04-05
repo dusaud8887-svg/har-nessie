@@ -700,6 +700,12 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === 'GET' && url.pathname === '/favicon.ico') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
     if (req.method === 'GET' && STATIC_ASSET_PATHS.has(url.pathname)) {
       await sendStatic(res, url.pathname);
       return;

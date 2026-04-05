@@ -53,12 +53,19 @@
 
     function buildResponseError(response, text) {
       const parsed = safeParseJson(text);
+      const statusCode = Number(response?.status || 0);
       if (parsed) {
         const message = parsed?.error?.message || parsed?.error || parsed?.message || response.statusText;
         const requestId = parsed?.requestId ? ` [${parsed.requestId}]` : '';
-        return new Error(`${message}${requestId}`);
+        const error = new Error(`${message}${requestId}`);
+        error.statusCode = statusCode;
+        error.status = statusCode;
+        return error;
       }
-      return new Error(text || response.statusText);
+      const error = new Error(text || response.statusText);
+      error.statusCode = statusCode;
+      error.status = statusCode;
+      return error;
     }
 
     async function request(url, options = {}) {
@@ -2629,7 +2636,29 @@
     async function refreshProjectOverview(projectId, options = {}) {
       if (!projectId) return null;
       const previousOverview = projectOverviewState.get(projectId);
-      const overview = await request('/api/projects/' + projectId);
+      let overview;
+      try {
+        overview = await request('/api/projects/' + projectId);
+      } catch (error) {
+        const statusCode = Number(error?.statusCode || error?.status || 0);
+        if (statusCode !== 404) throw error;
+        projectOverviewState.delete(projectId);
+        recentPhaseTransitionsByProjectId.delete(projectId);
+        if (selectedProjectId === projectId) {
+          selectedProjectId = '';
+          renderProjectList();
+          renderRunList();
+          if (!selectedRunId) renderDetail();
+          setBanner(
+            t(
+              '선택한 프로젝트를 찾을 수 없어 선택을 해제했습니다.',
+              'The selected project no longer exists, so the selection was cleared.'
+            ),
+            'info'
+          );
+        }
+        return null;
+      }
       projectOverviewState.set(projectId, overview);
       const previousHealth = String(previousOverview?.project?.healthDashboard?.status || '').trim();
       const nextHealth = String(overview?.project?.healthDashboard?.status || '').trim();

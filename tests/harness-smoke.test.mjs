@@ -293,6 +293,21 @@ test('artifact API exposes extended review taxonomy fields', async () => {
   }
 });
 
+test('server returns a benign favicon response and 404 for a missing project overview', async () => {
+  const server = await startHarnessServerForTest();
+  try {
+    const faviconResponse = await fetch(`${server.baseUrl}/favicon.ico`);
+    assert.equal(faviconResponse.status, 204);
+
+    const missingProjectResponse = await fetch(`${server.baseUrl}/api/projects/project-missing-smoke`);
+    assert.equal(missingProjectResponse.status, 404);
+    const payload = await missingProjectResponse.json();
+    assert.match(String(payload.error || ''), /Project not found: project-missing-smoke/);
+  } finally {
+    await server.stop();
+  }
+});
+
 test('artifact API falls back to execution summary changed files when changed-files.json is missing', async () => {
   let runId = '';
   const server = await startHarnessServerForTest();
@@ -3615,10 +3630,11 @@ test('buildCodexExecArgs maps runtime profiles to codex CLI flags', () => {
     codexReasoningEffort: 'high',
     codexServiceTier: 'fast'
   }, 'safe.txt');
-  assert.ok(safeArgs.includes('-a'));
-  assert.ok(safeArgs.includes('untrusted'));
-  assert.ok(safeArgs.includes('-s'));
+  assert.equal(safeArgs.includes('-a'), false);
+  assert.ok(safeArgs.includes('approval_policy="untrusted"'));
+  assert.ok(safeArgs.includes('--sandbox'));
   assert.ok(safeArgs.includes('read-only'));
+  assert.ok(safeArgs.includes('service_tier="fast"'));
   assert.equal(safeArgs.includes('--dangerously-bypass-approvals-and-sandbox'), false);
 
   const fullAutoArgs = buildCodexExecArgs({
@@ -3627,8 +3643,9 @@ test('buildCodexExecArgs maps runtime profiles to codex CLI flags', () => {
     codexReasoningEffort: 'high',
     codexServiceTier: 'fast'
   }, 'full.txt');
-  assert.ok(fullAutoArgs.includes('on-request'));
+  assert.ok(fullAutoArgs.includes('approval_policy="on-request"'));
   assert.ok(fullAutoArgs.includes('workspace-write'));
+  assert.ok(fullAutoArgs.includes('--sandbox'));
   assert.equal(fullAutoArgs.includes('--dangerously-bypass-approvals-and-sandbox'), false);
 
   const yoloArgs = buildCodexExecArgs({
@@ -3639,7 +3656,7 @@ test('buildCodexExecArgs maps runtime profiles to codex CLI flags', () => {
   }, 'yolo.txt');
   assert.ok(yoloArgs.includes('--dangerously-bypass-approvals-and-sandbox'));
   assert.ok(yoloArgs.includes('approval_policy="never"'));
-  assert.ok(yoloArgs.includes('sandbox_mode="danger-full-access"'));
+  assert.equal(yoloArgs.includes('--sandbox'), false);
 
   const sparkArgs = buildCodexExecArgs({
     codexRuntimeProfile: 'yolo',
@@ -3649,7 +3666,7 @@ test('buildCodexExecArgs maps runtime profiles to codex CLI flags', () => {
     codexServiceTier: 'fast'
   }, 'spark.txt');
   assert.ok(sparkArgs.includes('gpt-5.3-codex-spark'));
-  assert.ok(sparkArgs.includes('service_tier="default"'));
+  assert.equal(sparkArgs.some((value) => String(value).includes('service_tier=')), false);
 });
 
 test('updateHarnessSettings persists Codex model and fast mode', async () => {

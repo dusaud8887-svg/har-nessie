@@ -710,7 +710,6 @@ export function buildCodexExecArgs(settings = {}, outputFileName = '') {
     settings.codexFastMode,
     String(settings.codexServiceTier || '').trim().toLowerCase() === 'fast'
   );
-  const resolvedServiceTier = resolvedFastMode ? 'fast' : 'default';
   const args = [
     'exec',
     '--skip-git-repo-check',
@@ -719,16 +718,15 @@ export function buildCodexExecArgs(settings = {}, outputFileName = '') {
     '-c',
     `model_reasoning_effort="${settings.codexReasoningEffort || DEFAULT_SETTINGS.codexReasoningEffort}"`,
     '-c',
-    `service_tier="${resolvedServiceTier}"`,
-    '-c',
-    `approval_policy="${runtimeProfile.approvalPolicy}"`,
-    '-c',
-    `sandbox_mode="${runtimeProfile.sandboxMode}"`
+    `approval_policy="${runtimeProfile.approvalPolicy}"`
   ];
+  if (resolvedFastMode) {
+    args.push('-c', 'service_tier="fast"');
+  }
   if (runtimeProfile.id === 'yolo') {
     args.push('--dangerously-bypass-approvals-and-sandbox');
   } else {
-    args.push('-a', runtimeProfile.approvalPolicy, '-s', runtimeProfile.sandboxMode);
+    args.push('--sandbox', runtimeProfile.sandboxMode);
   }
   if (outputFileName) {
     args.push('-o', outputFileName);
@@ -1799,6 +1797,20 @@ async function bootstrapProjectRepoDocs(project) {
 
 async function loadProjectState(projectIdValue) {
   return readJson(projectStatePath(projectIdValue));
+}
+
+async function loadProjectStateOrThrowNotFound(projectIdValue) {
+  try {
+    return await loadProjectState(projectIdValue);
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      const notFound = new Error(`Project not found: ${projectIdValue}`);
+      notFound.code = 'PROJECT_NOT_FOUND';
+      notFound.statusCode = 404;
+      throw notFound;
+    }
+    throw error;
+  }
 }
 
 async function waitForQueuedLock(previous, timeoutMs, scope, context = {}) {
@@ -6474,11 +6486,11 @@ export async function listProjects() {
 }
 
 export async function getProject(projectIdValue) {
-  return loadProjectState(projectIdValue);
+  return loadProjectStateOrThrowNotFound(projectIdValue);
 }
 
 export async function updateProject(projectIdValue, input = {}) {
-  const project = await loadProjectState(projectIdValue);
+  const project = await loadProjectStateOrThrowNotFound(projectIdValue);
   const harnessSettings = await getHarnessSettings(project.rootPath || '');
   const uiLanguage = normalizeLanguage(input.uiLanguage || harnessSettings?.uiLanguage || harnessSettings?.agentLanguage, DEFAULT_HARNESS_SETTINGS.uiLanguage);
   const updatedProject = {
@@ -7458,7 +7470,7 @@ export async function deleteRun(runId) {
 }
 
 export async function deleteProject(projectIdValue, options = {}) {
-  const project = await loadProjectState(projectIdValue);
+  const project = await loadProjectStateOrThrowNotFound(projectIdValue);
   const deleteRuns = options.deleteRuns === true;
   const deleteMemory = options.deleteMemory === true;
   const relatedRuns = (await listRunSummaries()).filter((run) => String(run?.project?.id || '') === String(projectIdValue || ''));

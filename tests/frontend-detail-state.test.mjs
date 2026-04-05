@@ -190,13 +190,17 @@ function createFetchStub() {
     }
     const next = queueForUrl.shift();
     const payload = await (typeof next === 'function' ? next() : next);
+    const status = Number(payload?.__status || 200);
+    const body = Object.prototype.hasOwnProperty.call(payload || {}, '__body') ? payload.__body : payload;
     return {
-      ok: true,
+      ok: status >= 200 && status < 300,
+      status,
+      statusText: status === 404 ? 'Not Found' : '',
       async json() {
-        return payload;
+        return body;
       },
       async text() {
-        return typeof payload === 'string' ? payload : JSON.stringify(payload);
+        return typeof body === 'string' ? body : JSON.stringify(body);
       }
     };
   }
@@ -2783,6 +2787,29 @@ test('refreshProjectOverview shows a banner when project health regresses', asyn
 
   assert.match(document.getElementById('global-banner').innerHTML, /운영 주의|Attention needed/);
   assert.match(document.getElementById('global-banner').innerHTML, /자동화 알림|Automation notice/);
+});
+
+test('refreshProjectOverview clears a stale selected project when the server returns 404', async () => {
+  const { context, document, fetchStub } = await createUiHarness();
+  fetchStub.queue('/api/projects/project-missing', {
+    __status: 404,
+    __body: {
+      error: 'Project not found: project-missing',
+      requestId: 'req-project-missing'
+    }
+  });
+  vm.runInContext(`
+    projects = [{ id: 'project-missing', title: 'Missing Project', status: 'active', rootPath: 'D:/repos/missing', phases: [] }];
+    selectedProjectId = 'project-missing';
+    renderProjectList();
+    renderRunList();
+  `, context);
+
+  await vm.runInContext(`refreshProjectOverview('project-missing', { render: false })`, context);
+
+  assert.equal(vm.runInContext('selectedProjectId', context), '');
+  assert.equal(vm.runInContext(`projectOverviewState.has('project-missing')`, context), false);
+  assert.match(document.getElementById('global-banner').innerHTML, /선택한 프로젝트를 찾을 수 없어 선택을 해제했습니다.|selected project no longer exists/);
 });
 
 test('project overview highlights an automatically advanced phase and shows a toast', async () => {
