@@ -80,6 +80,8 @@ All three major agent CLIs work. Pick whichever you have:
 
 You can mix: one CLI for planning, another for implementation, in the same run.
 
+Global settings also let you keep Codex on `GPT-5.4` by default, switch to `GPT-5.3-Codex-Spark` when you want a faster worker, and toggle Codex fast mode on or off without editing config files by hand.
+
 <p align="center">
   <img src="docs/screenshots/screenshot-create-run.png" alt="Create run — folder, goal, optional constraints" width="80%">
   <br><em>Folder + goal. The harness handles the rest.</em>
@@ -111,6 +113,8 @@ memory/projects/<project-key>/
 ```
 
 All machine-local. Gitignored by default.
+
+That local settings file stores your selected Codex model and Codex fast mode toggle too.
 
 ## Docs
 

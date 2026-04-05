@@ -145,6 +145,17 @@ PDF intake는 OCR이 아니라 텍스트 추출 기반입니다.
 - task 산출물: `runs/<run-id>/tasks/<task-id>/`
 - 프로젝트 메모리: `memory/projects/<project-key>/`
 - 이 PC 전용 설정: `.harness-web/settings.json`
+- 런타임 관찰 로그: `.harness-web/runtime-events.ndjson`
+- Supervisor 런타임 스냅샷: `.harness-web/supervisors.json`
+
+런타임 이벤트와 run 로그의 공통 추적 필드:
+
+- `projectId`
+- `runId`
+- `taskId`
+- `correlationId`
+
+하나의 run 또는 task 흐름을 `logs.ndjson`, `trace.ndjson`, `.harness-web/runtime-events.ndjson` 사이에서 따라갈 때는 `correlationId`를 먼저 보면 됩니다.
 
 ## 실행 프로필
 
@@ -155,7 +166,13 @@ PDF intake는 OCR이 아니라 텍스트 추출 기반입니다.
 - `읽기 전용`
   - 수정 전에 먼저 둘러보고 싶을 때
 
+Codex 전용 설정:
+
+- 모델 선택: 기본은 `GPT-5.4`, 필요하면 `GPT-5.3-Codex-Spark`
+- fast mode 토글: 켜면 fast service tier, 끄면 default service tier
+
 추가 메모:
 
 - `문서 / 명세 먼저` preset은 clean git 저장소라면 제한적으로 병렬 실행(`한 번에 2개`)을 쓸 수 있습니다.
 - 저장소가 dirty 상태면 shared workspace fallback 때문에 같은 preset이어도 순차 실행으로 자동 다운그레이드됩니다.
+- Supervisor 런타임은 `.harness-web/supervisors.json`에 저장되어, 재시작 후에도 paused/running 자동화 상태를 복원합니다.

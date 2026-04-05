@@ -8,8 +8,10 @@ import { fileURLToPath } from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const appScript = await fs.readFile(path.join(root, 'public', 'app.js'), 'utf8');
 const appHelpersScript = await fs.readFile(path.join(root, 'public', 'app-helpers.js'), 'utf8');
+const appStateScript = await fs.readFile(path.join(root, 'public', 'app-state.js'), 'utf8');
 const appArtifactRenderersScript = await fs.readFile(path.join(root, 'public', 'app-artifact-renderers.js'), 'utf8');
 const appProjectRenderersScript = await fs.readFile(path.join(root, 'public', 'app-project-renderers.js'), 'utf8');
+const appRunRenderersScript = await fs.readFile(path.join(root, 'public', 'app-run-renderers.js'), 'utf8');
 const appModalActionsScript = await fs.readFile(path.join(root, 'public', 'app-modal-actions.js'), 'utf8');
 
 function deferred() {
@@ -289,8 +291,10 @@ async function createUiHarness(options = {}) {
     removeItem() {}
   };
   vm.runInContext(appHelpersScript, context, { filename: path.join(root, 'public', 'app-helpers.js') });
+  vm.runInContext(appStateScript, context, { filename: path.join(root, 'public', 'app-state.js') });
   vm.runInContext(appArtifactRenderersScript, context, { filename: path.join(root, 'public', 'app-artifact-renderers.js') });
   vm.runInContext(appProjectRenderersScript, context, { filename: path.join(root, 'public', 'app-project-renderers.js') });
+  vm.runInContext(appRunRenderersScript, context, { filename: path.join(root, 'public', 'app-run-renderers.js') });
   vm.runInContext(appModalActionsScript, context, { filename: path.join(root, 'public', 'app-modal-actions.js') });
   vm.runInContext(appScript, context, { filename: path.join(root, 'public', 'app.js') });
   await flush();
@@ -449,6 +453,22 @@ test('renderArtifactTabs tolerates a missing artifacts payload', async () => {
   assert.doesNotMatch(markup, /TypeError/);
 });
 
+test('renderTaskInsights falls back to task execution changed files when artifacts are missing', async () => {
+  const { context } = await createUiHarness();
+  const markup = vm.runInContext(`
+    renderTaskInsights(${JSON.stringify({
+      ...makeTask('T001', 'changed-file fallback'),
+      status: 'done',
+      lastExecution: {
+        changedFiles: ['docs/spec.md']
+      }
+    })}, undefined)
+  `, context);
+
+  assert.match(markup, /docs\/spec\.md/);
+  assert.doesNotMatch(markup, /아직 변경 파일 없음/);
+});
+
 test('renderArtifactTabs shows timeline entries from trace and trajectory artifacts', async () => {
   const { context } = await createUiHarness();
   const markup = vm.runInContext(`
@@ -492,6 +512,22 @@ test('renderArtifactTabs shows extended review taxonomy sections', async () => {
   assert.match(markup, /브라우저 UX 검토/);
   assert.match(markup, /공통 메모/);
   assert.doesNotMatch(markup, /TypeError/);
+});
+
+test('renderArtifactSummary does not show Passed when verification is unknown', async () => {
+  const { context } = await createUiHarness();
+  const markup = vm.runInContext(`
+    artifactSubTab = 'summary';
+    renderArtifactTabs(${JSON.stringify({
+      executionSummary: {
+        reviewDecision: 'approve',
+        reviewRoute: 'rule-auto-approve'
+      }
+    })}, ${JSON.stringify(makeTask('T001', 'summary without verification'))})
+  `, context);
+
+  assert.match(markup, /검증 결과/);
+  assert.doesNotMatch(markup, /통과/);
 });
 
 test('planning tab shows active prompt source precedence', async () => {
@@ -616,6 +652,107 @@ test('dashboard shows operator progress summary and recovery guide from analytic
   assert.match(markup, /1m 35s/);
 });
 
+test('dashboard shows skipped automatic replan diagnostics when available', async () => {
+  const { context, document } = await createUiHarness();
+  vm.runInContext(`
+    runs = [{
+      ...${JSON.stringify(makeSummary('run-1', '2026-04-02T12:00:00Z'))},
+      status: 'stopped',
+      tasks: [${JSON.stringify(makeTask('T001', 'replan paused task'))}],
+      logs: [],
+      checkpoint: {
+        autoReplan: {
+          skipped: true,
+          summary: 'Skipped automatic replanning because the provider returned invalid JSON.',
+          parseError: 'JSON parse failed.',
+          rawSnippet: '{"shouldReplan":false'
+        }
+      }
+    }];
+    selectedRunId = 'run-1';
+    selectedTaskId = 'T001';
+    selectedTab = 'dashboard';
+  `, context);
+
+  await vm.runInContext('renderDetail()', context);
+  const markup = document.getElementById('content-area').innerHTML;
+
+  assert.match(markup, /자동 재계획 상태/);
+  assert.match(markup, /이번 재계획 pass는 건너뜀/);
+  assert.match(markup, /JSON parse failed/);
+});
+
+test('dashboard surfaces restart recovery when a run was auto-recovered after restart', async () => {
+  const { context, document } = await createUiHarness();
+  vm.runInContext(`
+    runs = [{
+      ...${JSON.stringify(makeSummary('run-recovered', '2026-04-02T12:00:00Z'))},
+      status: 'stopped',
+      tasks: [{
+        ...${JSON.stringify(makeTask('T001', 'resume recovered work'))},
+        status: 'ready',
+        reviewSummary: 'Recovered after harness restart.',
+        findings: ['Recovered after harness restart.']
+      }],
+      logs: [],
+      checkpoint: {
+        trigger: 'recovered-after-restart',
+        resumeHint: 'Read the checkpoint, then resume from T001.'
+      }
+    }];
+    selectedRunId = 'run-recovered';
+    selectedTaskId = 'T001';
+    selectedTab = 'dashboard';
+  `, context);
+
+  await vm.runInContext('renderDetail()', context);
+  const markup = document.getElementById('content-area').innerHTML;
+
+  assert.match(markup, /재시작 복구|Restart recovery/);
+  assert.match(markup, /자동 복구됨|Recovered automatically/);
+  assert.match(markup, /recovered-after-restart/);
+  assert.match(markup, /Read the checkpoint, then resume from T001/);
+  assert.match(markup, /T001/);
+});
+
+test('dashboard renders run-level automation loop progress and lineage', async () => {
+  const { context, document } = await createUiHarness();
+  vm.runInContext(`
+    runs = [{
+      ...${JSON.stringify(makeSummary('run-loop-1', '2026-04-02T12:00:00Z'))},
+      status: 'running',
+      chainedFromRunId: 'run-loop-0',
+      chainMeta: {
+        trigger: 'run-loop',
+        originRunId: 'run-loop-0',
+        reason: 'Run loop continuation from run-loop-0',
+        loop: {
+          enabled: true,
+          mode: 'until-goal',
+          currentRunIndex: 2,
+          maxRuns: 4,
+          consecutiveFailures: 1,
+          maxConsecutiveFailures: 3
+        }
+      },
+      tasks: [${JSON.stringify(makeTask('T001', 'continue looped work'))}],
+      logs: []
+    }];
+    selectedRunId = 'run-loop-1';
+    selectedTaskId = 'T001';
+    selectedTab = 'dashboard';
+  `, context);
+
+  await vm.runInContext('renderDetail()', context);
+  const markup = document.getElementById('content-area').innerHTML;
+
+  assert.match(markup, /자동 진행|Automation/);
+  assert.match(markup, /2\/4/);
+  assert.match(markup, /목표 달성까지 반복|Repeat until goal/);
+  assert.match(markup, /1\/3/);
+  assert.match(markup, /run-loop-0/);
+});
+
 test('renderArtifactTabs shows action and code context tabs', async () => {
   const { context } = await createUiHarness();
   const markup = vm.runInContext(`
@@ -627,8 +764,24 @@ test('renderArtifactTabs shows action and code context tabs', async () => {
       codeContext: {
         summary: 'Top files: src/app.ts',
         queryTokens: ['app'],
+        projectGraph: {
+          indexedFileCount: 12,
+          criticalSymbols: [
+            { symbol: 'buildApp', riskScore: 18.4, importerCount: 6, callerCount: 4, definedIn: ['src/app.ts'] }
+          ]
+        },
         relatedFiles: [
-          { path: 'src/app.ts', score: 82, symbols: ['export function buildApp'], snippet: 'export function buildApp() {}' }
+          {
+            path: 'src/app.ts',
+            score: 82,
+            symbols: ['export function buildApp'],
+            snippet: 'export function buildApp() {}',
+            impact: {
+              importedByCount: 6,
+              calledByCount: 4,
+              exportedSymbolImpact: [{ symbol: 'buildApp', importerCount: 6, callerCount: 4, callCount: 4 }]
+            }
+          }
         ]
       }
     })}, ${JSON.stringify(makeTask('T001', 'timeline task'))})
@@ -637,6 +790,35 @@ test('renderArtifactTabs shows action and code context tabs', async () => {
   assert.match(markup, /액션/);
   assert.match(markup, /verification/);
   assert.doesNotMatch(markup, /TypeError/);
+
+  const contextMarkup = vm.runInContext(`
+    artifactSubTab = 'context';
+    renderArtifactTabs(${JSON.stringify({
+      codeContext: {
+        summary: 'Top files: src/app.ts',
+        queryTokens: ['app'],
+        projectGraph: {
+          indexedFileCount: 12,
+          criticalSymbols: [
+            { symbol: 'buildApp', riskScore: 18.4, importerCount: 6, callerCount: 4, definedIn: ['src/app.ts'] }
+          ]
+        },
+        relatedFiles: [{
+          path: 'src/app.ts',
+          score: 82,
+          symbols: ['export function buildApp'],
+          impact: {
+            importedByCount: 6,
+            calledByCount: 4,
+            exportedSymbolImpact: [{ symbol: 'buildApp', importerCount: 6, callerCount: 4, callCount: 4 }]
+          }
+        }]
+      }
+    })}, ${JSON.stringify(makeTask('T001', 'timeline task'))})
+  `, context);
+
+  assert.match(contextMarkup, /CRITICAL-RISK/);
+  assert.match(contextMarkup, /risk 18\.4/);
 });
 
 test('renderDetail escapes task headers and logs and tolerates null run status', async () => {
@@ -707,6 +889,16 @@ test('needs_approval dashboard shows beginner approval guidance', async () => {
       status: 'needs_approval',
       planSummary: '로그인 버그 재현 후 최소 수정으로 해결합니다.',
       clarify: { architecturePattern: 'pipeline', executionModel: '계획, 구현, 검토 순서로 진행합니다.' },
+      executionPolicy: {
+        policyNotes: ['Diagnosis-first profile injected a read-only scoping task before implementation.'],
+        appliedRules: [{
+          id: 'diagnosis-first',
+          title: 'A diagnosis-first gate task was injected',
+          reason: 'The plan looked broad for the current file budget.',
+          effect: 'Implementation tasks now wait for a read-only scope-lock pass before edits begin.',
+          syntheticTask: { title: 'Diagnose current phase scope and lock implementation boundaries' }
+        }]
+      },
       tasks: [${JSON.stringify(makeTask('T001', '로그인 실패 재현'))}],
       agents: [{ name: 'planner', role: '작업 순서를 정리합니다.', model: 'codex' }],
       logs: []
@@ -725,6 +917,9 @@ test('needs_approval dashboard shows beginner approval guidance', async () => {
   assert.match(markup, /이 계획으로 시작/);
   assert.match(markup, /계획 다시 조정/);
   assert.match(markup, /첫 작업 자세히 보기/);
+  assert.match(markup, /왜 이런 태스크가 추가됐는지|Why the harness changed this plan/);
+  assert.match(markup, /scope-lock pass/);
+  assert.match(markup, /Diagnose current phase scope and lock implementation boundaries/);
 });
 
 test('project detail settings explain which fields most users should change', async () => {
@@ -1154,8 +1349,10 @@ test('project settings editor saves updated defaults and rerenders the project o
   const updateBody = JSON.parse(String(updateRequest?.options?.body || '{}'));
   assert.deepEqual(updateBody.continuationPolicy, {
     mode: 'manual',
+    autoChainOnComplete: false,
     autoQualitySweepOnPhaseComplete: true,
-    keepDocsInSync: false
+    keepDocsInSync: false,
+    maxChainDepth: 0
   });
 });
 
@@ -1529,11 +1726,16 @@ test('memory search renders graph memory hints alongside search hits', async () 
     searchResults: [{
       title: 'Graph memory artifact',
       snippet: 'login flow touched buildAuthSession',
-      kind: 'artifact-record'
+      kind: 'artifact-record',
+      rankingMeta: { occurrenceCount: 3 }
     }],
     graphInsights: {
-      topEdges: [{ edge: 'src/ui/login-form.tsx->src/auth/session-service.ts#buildAuthSession', count: 2 }],
-      topSymbols: [{ symbol: 'buildAuthSession', count: 3 }]
+      topEdges: [{ edge: 'src/ui/login-form.tsx->src/auth/session-service.ts#buildAuthSession', count: 2, riskScore: 19.4 }],
+      topSymbols: [{ symbol: 'buildAuthSession', count: 3, importerCount: 12, callerCount: 9, riskScore: 18.7, definedIn: ['src/auth/session-service.ts'] }]
+    },
+    projectCodeIntelligence: {
+      thresholds: { criticalRisk: 15 },
+      topFiles: [{ path: 'src/auth/session-service.ts', importedByCount: 12, calledByCount: 9 }]
     },
     temporalInsights: {
       recentShare: 0.812,
@@ -1550,6 +1752,12 @@ test('memory search renders graph memory hints alongside search hits', async () 
   assert.match(markup, /Graph memory hints|그래프 메모리 힌트/);
   assert.match(markup, /Temporal memory hints|시간축 메모리 힌트/);
   assert.match(markup, /Recent share|최근 비중/);
+  assert.match(markup, /CRITICAL-RISK &gt;= 15\.0|CRITICAL-RISK >= 15\.0/);
+  assert.match(markup, /risk 18\.7/);
+  assert.match(markup, /importers 12, callers 9/);
+  assert.match(markup, /defined in src\/auth\/session-service\.ts/);
+  assert.match(markup, /High-impact files|고영향 파일/);
+  assert.match(markup, /Occurrence|반복도/);
   assert.match(markup, /buildAuthSession/);
   assert.match(markup, /session builder mismatch/);
   assert.match(markup, /Graph memory artifact/);
@@ -2026,6 +2234,8 @@ test('settings modal can fill and save preset strategy templates', async () => {
     coordinationProvider: 'codex',
     workerProvider: 'codex',
     codexRuntimeProfile: 'yolo',
+    codexModel: 'gpt-5.3-codex-spark',
+    codexFastMode: false,
     uiLanguage: 'ko',
     agentLanguage: 'ko',
     codexNotes: '',
@@ -2044,6 +2254,8 @@ test('settings modal can fill and save preset strategy templates', async () => {
     coordinationProvider: 'codex',
     workerProvider: 'codex',
     codexRuntimeProfile: 'yolo',
+    codexModel: 'gpt-5.3-codex-spark',
+    codexFastMode: false,
     uiLanguage: 'ko',
     agentLanguage: 'ko',
     codexNotes: '',
@@ -2056,6 +2268,8 @@ test('settings modal can fill and save preset strategy templates', async () => {
 
   await vm.runInContext('openSettingsModal()', context);
   assert.equal(document.getElementById('settings-strategy-template').value, 'existing-repo-feature');
+  assert.equal(document.getElementById('codex-model').value, 'gpt-5.3-codex-spark');
+  assert.equal(document.getElementById('codex-fast-mode').checked, false);
 
   document.getElementById('settings-strategy-template').value = 'docs-spec-first';
   document.getElementById('apply-strategy-template-btn').dispatchEvent('click');
@@ -2075,6 +2289,8 @@ test('settings modal can fill and save preset strategy templates', async () => {
   assert.match(body.customConstitution, /source of record/i);
   assert.match(body.plannerStrategy, /scope-locking|doc-alignment/i);
   assert.match(body.teamStrategy, /spec-locker|verifier/i);
+  assert.equal(body.codexModel, 'gpt-5.3-codex-spark');
+  assert.equal(body.codexFastMode, false);
 });
 
 test('parallel reason explains shared-workspace fallback and directory collisions', async () => {
@@ -2405,4 +2621,449 @@ test('project detail can reanalyze an existing project into a first-run draft', 
   assert.equal(document.getElementById('run-title-input').value, 'alpha-intake');
   assert.equal(document.getElementById('run-preset-input').value, 'docs-spec-first');
   assert.equal(document.getElementById('run-spec-files-input').value, 'D:/alpha/README.md');
+});
+
+test('saveProjectSettings includes autoProgress in the request payload', async () => {
+  const { context, document, fetchStub } = await createUiHarness();
+  const baseOverview = {
+    project: {
+      id: 'project-autoprog',
+      title: 'AutoProg Project',
+      rootPath: 'D:/repos/autoprog',
+      currentPhaseId: 'phase-1',
+      defaultPresetId: 'existing-repo-feature',
+      charterText: 'auto progress test',
+      defaultSettings: {
+        continuationPolicy: { mode: 'guided', autoChainOnComplete: false, autoQualitySweepOnPhaseComplete: false, keepDocsInSync: true, maxChainDepth: 3 },
+        autoProgress: { enabled: false, scheduleEnabled: false, scheduleCron: '', pollIntervalMs: 30000 }
+      },
+      bootstrap: { enabled: false, generated: [] }
+    },
+    phases: [{
+      id: 'phase-1',
+      title: 'Foundation',
+      goal: 'build',
+      status: 'active',
+      runCounts: { ready: 0, running: 0, stopped: 0, failed: 0, completed: 0 },
+      carryOverTasks: [],
+      pendingReview: [],
+      cleanupLane: [],
+      latestQualitySweep: null,
+      backlogLineage: [],
+      openRisks: [],
+      recentRuns: []
+    }]
+  };
+
+  fetchStub.queue('/api/projects/project-autoprog', baseOverview);
+  fetchStub.queue('/api/projects/project-autoprog', baseOverview);
+  fetchStub.queue('/api/projects/project-autoprog', baseOverview);
+  fetchStub.queue('/api/projects', [{ id: 'project-autoprog', title: 'AutoProg Project', status: 'active', rootPath: 'D:/repos/autoprog', currentPhaseId: 'phase-1', phases: [{ id: 'phase-1', title: 'Foundation' }] }]);
+
+  vm.runInContext(`
+    projects = [{ id: 'project-autoprog', title: 'AutoProg Project', status: 'active', rootPath: 'D:/repos/autoprog', phases: [{ id: 'phase-1', title: 'Foundation' }], currentPhaseId: 'phase-1' }];
+    renderProjectList();
+  `, context);
+  await vm.runInContext(`selectProject('project-autoprog')`, context);
+
+  document.getElementById('project-settings-supervisor-enabled').checked = true;
+  document.getElementById('project-settings-schedule-enabled').checked = true;
+  document.getElementById('project-settings-schedule-cron').value = '0 9 * * 1-5';
+  document.getElementById('project-settings-poll-interval').value = '60000';
+
+  await vm.runInContext(`saveProjectSettings()`, context);
+
+  const updateRequest = fetchStub.requests.find(
+    (entry) => entry.url === '/api/projects/project-autoprog' && entry.options?.method === 'POST'
+  );
+  const updateBody = JSON.parse(String(updateRequest?.options?.body || '{}'));
+  assert.deepEqual(updateBody.autoProgress, {
+    enabled: true,
+    scheduleEnabled: true,
+    scheduleCron: '0 9 * * 1-5',
+    pollIntervalMs: 60000
+  });
+});
+
+test('project schedule builder applies a guided cadence into the cron field', async () => {
+  const { context, document, fetchStub } = await createUiHarness();
+  const overview = {
+    project: {
+      id: 'project-schedule-builder',
+      title: 'Schedule Builder Project',
+      rootPath: 'D:/repos/schedule-builder',
+      currentPhaseId: 'phase-1',
+      defaultSettings: {
+        continuationPolicy: { mode: 'guided' },
+        autoProgress: { enabled: true, scheduleEnabled: true, scheduleCron: '', pollIntervalMs: 30000 }
+      },
+      bootstrap: { enabled: false, generated: [] }
+    },
+    phases: [{
+      id: 'phase-1',
+      title: 'Foundation',
+      goal: 'build',
+      status: 'active',
+      runCounts: { ready: 0, running: 0, stopped: 0, failed: 0, completed: 0 },
+      carryOverTasks: [],
+      pendingReview: [],
+      cleanupLane: [],
+      latestQualitySweep: null,
+      backlogLineage: [],
+      openRisks: [],
+      recentRuns: []
+    }]
+  };
+
+  fetchStub.queue('/api/projects/project-schedule-builder', overview);
+  vm.runInContext(`
+    projects = [{ id: 'project-schedule-builder', title: 'Schedule Builder Project', status: 'active', rootPath: 'D:/repos/schedule-builder', phases: [{ id: 'phase-1', title: 'Foundation' }], currentPhaseId: 'phase-1' }];
+    renderProjectList();
+  `, context);
+  await vm.runInContext(`selectProject('project-schedule-builder')`, context);
+
+  const settingsMarkup = document.getElementById('main-area').innerHTML;
+  assert.match(settingsMarkup, /빠른 cadence|Quick cadence/);
+  assert.match(settingsMarkup, /project-settings-schedule-builder-mode-weekdays/);
+
+  await vm.runInContext(`applyProjectScheduleBuilderMode('weekdays')`, context);
+  document.getElementById('project-settings-schedule-builder-hour').value = '14';
+  document.getElementById('project-settings-schedule-builder-minute').value = '30';
+  await vm.runInContext('updateProjectScheduleBuilderPreview()', context);
+
+  assert.match(document.getElementById('project-settings-schedule-preview').textContent, /14:30/);
+  assert.match(document.getElementById('project-settings-schedule-preview').textContent, /적용되지 않았습니다|not yet applied/);
+
+  await vm.runInContext('applyProjectScheduleBuilder()', context);
+
+  assert.equal(document.getElementById('project-settings-schedule-cron').value, '30 14 * * 1-5');
+  assert.match(document.getElementById('project-settings-schedule-preview').textContent, /14:30/);
+});
+
+test('refreshProjectOverview shows a banner when project health regresses', async () => {
+  const { context, document, fetchStub } = await createUiHarness();
+  const healthyOverview = {
+    project: {
+      id: 'project-health-alert',
+      title: 'Health Alert Project',
+      rootPath: 'D:/repos/health-alert',
+      currentPhaseId: 'phase-1',
+      defaultSettings: { continuationPolicy: { mode: 'guided' } },
+      healthDashboard: {
+        status: 'healthy',
+        statusLabel: 'Healthy',
+        reminder: { detail: 'Cadence looks healthy.' }
+      },
+      bootstrap: { enabled: false, generated: [] }
+    },
+    phases: [{ id: 'phase-1', title: 'Foundation', goal: 'build', status: 'active', runCounts: { ready: 0, running: 0, stopped: 0, failed: 0, completed: 0 }, carryOverTasks: [], pendingReview: [], cleanupLane: [], latestQualitySweep: null, backlogLineage: [], openRisks: [], recentRuns: [] }]
+  };
+  const attentionOverview = {
+    ...healthyOverview,
+    project: {
+      ...healthyOverview.project,
+      healthDashboard: {
+        status: 'attention',
+        statusLabel: 'Attention needed',
+        reminder: { detail: 'Repeated failures are growing and the automation state needs review.' },
+        repeatedFailures: { summary: 'A repeated failure pattern is active.' },
+        docsDrift: { summary: 'Docs drift signal is increasing.' }
+      }
+    }
+  };
+
+  fetchStub.queue('/api/projects/project-health-alert', healthyOverview);
+  fetchStub.queue('/api/projects/project-health-alert', attentionOverview);
+  vm.runInContext(`
+    projects = [{ id: 'project-health-alert', title: 'Health Alert Project', status: 'active', rootPath: 'D:/repos/health-alert', phases: [{ id: 'phase-1', title: 'Foundation' }], currentPhaseId: 'phase-1' }];
+    renderProjectList();
+  `, context);
+  await vm.runInContext(`selectProject('project-health-alert')`, context);
+  await vm.runInContext(`refreshProjectOverview('project-health-alert')`, context);
+
+  assert.match(document.getElementById('global-banner').innerHTML, /운영 주의|Attention needed/);
+  assert.match(document.getElementById('global-banner').innerHTML, /자동화 알림|Automation notice/);
+});
+
+test('project overview highlights an automatically advanced phase and shows a toast', async () => {
+  const { context, document, fetchStub } = await createUiHarness();
+  const baseOverview = {
+    project: {
+      id: 'project-phase-transition',
+      title: 'Phase Transition Project',
+      rootPath: 'D:/repos/phase-transition',
+      currentPhaseId: 'phase-1',
+      defaultSettings: { continuationPolicy: { mode: 'guided' } },
+      supervisorStatus: { active: false, enabled: true, scheduleEnabled: false, scheduleCron: '', runtime: { history: [] } },
+      healthDashboard: { status: 'healthy', statusLabel: 'Healthy', reminder: { detail: 'Cadence looks healthy.' } },
+      bootstrap: { enabled: false, generated: [] }
+    },
+    phases: [
+      { id: 'phase-1', title: 'Foundation', goal: 'Close the first slice.', status: 'active', runCounts: { ready: 0, running: 0, stopped: 0, failed: 0, completed: 1 }, carryOverTasks: [], pendingReview: [], cleanupLane: [], latestQualitySweep: null, backlogLineage: [], openRisks: [], recentRuns: [] },
+      { id: 'phase-2', title: 'Delivery', goal: 'Start the next slice.', status: 'ready', runCounts: { ready: 0, running: 0, stopped: 0, failed: 0, completed: 0 }, carryOverTasks: [], pendingReview: [], cleanupLane: [], latestQualitySweep: null, backlogLineage: [], openRisks: [], recentRuns: [] }
+    ]
+  };
+  const advancedOverview = {
+    ...baseOverview,
+    project: {
+      ...baseOverview.project,
+      currentPhaseId: 'phase-2',
+      supervisorStatus: {
+        active: false,
+        enabled: true,
+        scheduleEnabled: false,
+        scheduleCron: '',
+        runtime: {
+          history: [{ kind: 'action', detail: 'phase-auto-advanced:phase-1->phase-2', at: '2026-04-05T08:30:00.000Z' }]
+        }
+      }
+    },
+    phases: [
+      { ...baseOverview.phases[0], status: 'done' },
+      { ...baseOverview.phases[1], status: 'active' }
+    ]
+  };
+
+  fetchStub.queue('/api/projects/project-phase-transition', baseOverview);
+  fetchStub.queue('/api/projects/project-phase-transition', advancedOverview);
+  vm.runInContext(`
+    projects = [{ id: 'project-phase-transition', title: 'Phase Transition Project', status: 'active', rootPath: 'D:/repos/phase-transition', phases: [{ id: 'phase-1', title: 'Foundation' }, { id: 'phase-2', title: 'Delivery' }], currentPhaseId: 'phase-1' }];
+    renderProjectList();
+  `, context);
+
+  await vm.runInContext(`selectProject('project-phase-transition')`, context);
+  await vm.runInContext(`refreshProjectOverview('project-phase-transition')`, context);
+
+  const markup = document.getElementById('main-area').innerHTML;
+  assert.match(markup, /자동 전환됨|Auto-advanced/);
+  assert.match(markup, /Delivery/);
+  assert.match(document.getElementById('global-banner').innerHTML, /Delivery|자동으로/);
+});
+
+test('running dashboard renders queue progress and ETA guidance', async () => {
+  const { context, document } = await createUiHarness();
+  vm.runInContext(`
+    runs = [{
+      ...${JSON.stringify(makeSummary('run-queue', '2026-04-05T09:00:00Z'))},
+      title: 'queue-run',
+      status: 'running',
+      settings: { maxParallel: 2 },
+      tasks: [
+        ${JSON.stringify({ ...makeTask('T001', 'active auth fix'), status: 'in_progress' })},
+        ${JSON.stringify(makeTask('T002', 'follow-up verification'))},
+        ${JSON.stringify(makeTask('T003', 'docs sync'))},
+        ${JSON.stringify({ ...makeTask('T004', 'done task'), status: 'done' })}
+      ],
+      logs: []
+    }];
+    selectedRunId = 'run-queue';
+    selectedTab = 'dashboard';
+  `, context);
+
+  await vm.runInContext('renderDetail()', context);
+
+  const markup = document.getElementById('content-area').innerHTML;
+  assert.match(markup, /런 큐 진행|Run queue progress/);
+  assert.match(markup, /예상 남은 흐름|ETA/);
+  assert.match(markup, /T001 active auth fix/);
+  assert.match(markup, /T002 follow-up verification/);
+});
+
+test('project overview renders supervisor status widget when supervisor is enabled', async () => {
+  const { context, document, fetchStub } = await createUiHarness();
+  const overview = {
+    project: {
+      id: 'project-supervisor',
+      title: 'Supervisor Project',
+      rootPath: 'D:/repos/supervisor',
+      currentPhaseId: 'phase-1',
+      defaultPresetId: 'existing-repo-feature',
+      charterText: 'supervisor test',
+      defaultSettings: {
+        autoProgress: { enabled: true, scheduleEnabled: true, scheduleCron: '0 8 * * *', pollIntervalMs: 30000 }
+      },
+      supervisorStatus: {
+        active: true,
+        enabled: true,
+        scheduleEnabled: true,
+        scheduleCron: '0 8 * * *',
+        pollIntervalMs: 30000,
+        nextScheduledAt: '2026-04-05T09:00:00.000Z',
+        maxConsecutiveFailures: 3,
+        runtime: {
+          running: true,
+          lastPolledAt: 0,
+          lastPassAt: '2026-04-05T08:00:00.000Z',
+          lastAction: 'run-started',
+          lastActionAt: '2026-04-05T08:00:00.000Z',
+          lastError: '',
+          lastErrorAt: '',
+          lastRunId: 'run-abc123',
+          nextScheduledAt: '2026-04-05T09:00:00.000Z',
+          history: [
+            { kind: 'action', detail: 'started', at: '2026-04-05T07:50:00.000Z' },
+            { kind: 'action', detail: 'run-started', at: '2026-04-05T08:00:00.000Z', runId: 'run-abc123' }
+          ]
+        }
+      },
+      codeIntelligence: {
+        indexedFileCount: 42,
+        criticalSymbols: [{ symbol: 'buildAuthSession', riskScore: 18.4 }],
+        topFiles: [{ path: 'src/auth/session-service.ts', importedByCount: 12, calledByCount: 9 }]
+      },
+      healthDashboard: {
+        status: 'attention',
+        statusLabel: 'Attention needed',
+        successor: { ready: true, title: 'Next run draft is ready from carry-over work', detail: 'The most natural next step is to close T100 first.' },
+        docsDrift: { level: 'low', summary: 'There is no strong sign of docs and implementation drifting apart yet.', reintakeRecommended: false, recommendedAction: '' },
+        repeatedFailures: { warning: false, summary: 'There is no strong repeated failure pattern yet.', consecutiveFailedRuns: 1 },
+        runtimeObservability: { warning: false, browserPolicyLabel: 'Optional', headline: 'Recent runtime signals look stable.', highlights: [], detail: 'Browser automation is optional, and recent runs do not show major runtime warnings.' },
+        automationScorecard: {
+          status: 'watch',
+          statusLabel: 'Watch',
+          score: 74,
+          successRate: 0.67,
+          recoveryRate: 1,
+          terminalRuns: 3,
+          summary: 'Across the latest 3 automated runs, success is 67% and recovery is 100%.',
+          recommendedAction: 'Automation is working, but still in watch mode. Gather a few more consecutive successful runs.'
+        },
+        reminder: { title: 'Critical symbols active', detail: 'Before the next run, confirm the scope boundary around the critical-risk symbols and high-impact files.' },
+        docsFlow: { label: 'Docs-first project', detail: 'For the next run, keep docs/source-of-record aligned with implementation.' },
+        codeIntelligence: {
+          indexedFileCount: 42,
+          truncated: false,
+          criticalSymbols: [{ symbol: 'buildAuthSession', riskScore: 18.4 }],
+          topFiles: [{ path: 'src/auth/session-service.ts', importedByCount: 12, calledByCount: 9 }]
+        }
+      },
+      bootstrap: { enabled: false, generated: [] }
+    },
+    phases: [{
+      id: 'phase-1',
+      title: 'Foundation',
+      goal: 'build',
+      status: 'active',
+      runCounts: { ready: 0, running: 0, stopped: 0, failed: 0, completed: 0 },
+      carryOverTasks: [],
+      pendingReview: [],
+      cleanupLane: [],
+      latestQualitySweep: null,
+      backlogLineage: [],
+      openRisks: [],
+      recentRuns: []
+    }]
+  };
+
+  fetchStub.queue('/api/projects/project-supervisor', overview);
+  vm.runInContext(`
+    projects = [{ id: 'project-supervisor', title: 'Supervisor Project', status: 'active', rootPath: 'D:/repos/supervisor', phases: [{ id: 'phase-1', title: 'Foundation' }], currentPhaseId: 'phase-1' }];
+    renderProjectList();
+  `, context);
+  await vm.runInContext(`selectProject('project-supervisor')`, context);
+
+  const markup = document.getElementById('main-area').innerHTML;
+  assert.match(markup, /Supervisor/, 'supervisor section must appear');
+  assert.match(markup, /실행 중|Running/, 'active supervisor badge must appear');
+  assert.match(markup, /0 8 \* \* \*/, 'cron schedule must appear');
+  assert.match(markup, /run-started/, 'last action must appear');
+  assert.match(markup, /run-abc123/, 'last run ID must appear');
+  assert.match(markup, /다음 실행|Next run/, 'next scheduled time must appear');
+  assert.match(markup, /최근 자동화 기록|Recent automation history/);
+  assert.match(markup, /Supervisor 중지|Stop supervisor/, 'stop button must appear');
+  assert.match(markup, /자동화 burn-in \/ SLO|Automation burn-in \/ SLO/);
+  assert.match(markup, /74 \/ 100/);
+  assert.match(markup, /67%/);
+  assert.match(markup, /Code intelligence|코드 인텔리전스/);
+  assert.match(markup, /buildAuthSession \(18\.4\)/);
+  assert.match(markup, /src\/auth\/session-service\.ts \(importedBy 12, calledBy 9\)/);
+});
+
+test('project overview shows loop progress, countdown, and supervisor stop reason', async () => {
+  const { context, document, fetchStub } = await createUiHarness();
+  vm.runInContext(`Date.now = () => Date.parse('2026-04-05T08:00:00.000Z')`, context);
+  const overview = {
+    project: {
+      id: 'project-loop-visibility',
+      title: 'Loop Visibility Project',
+      rootPath: 'D:/repos/loop-visibility',
+      currentPhaseId: 'phase-1',
+      defaultSettings: {
+        continuationPolicy: { mode: 'guided', runLoop: { enabled: true, mode: 'until-goal', maxRuns: 5, maxConsecutiveFailures: 3 } },
+        autoProgress: { enabled: true, scheduleEnabled: true, scheduleCron: '0 9 * * *', pollIntervalMs: 30000 }
+      },
+      supervisorStatus: {
+        active: false,
+        enabled: true,
+        scheduleEnabled: true,
+        scheduleCron: '0 9 * * *',
+        nextScheduledAt: '2026-04-05T09:00:00.000Z',
+        runtime: {
+          running: false,
+          lastAction: 'stopped: auto-paused after 3 consecutive failed runs',
+          lastActionAt: '2026-04-05T08:00:00.000Z',
+          pausedReason: 'auto-paused after 3 consecutive failed runs',
+          nextScheduledAt: '2026-04-05T09:00:00.000Z',
+          history: [{ kind: 'action', detail: 'phase-auto-advanced:P001->P002', at: '2026-04-05T07:50:00.000Z' }]
+        }
+      },
+      healthDashboard: {
+        status: 'watch',
+        statusLabel: 'Watch closely',
+        successor: { ready: true, title: 'Next run draft is ready from the current phase goal', detail: 'Continue the current phase.' },
+        docsDrift: { level: 'low', summary: '', reintakeRecommended: false, recommendedAction: '' },
+        repeatedFailures: { warning: false, summary: '', consecutiveFailedRuns: 0 },
+        runtimeObservability: { warning: false, browserPolicyLabel: 'Optional', headline: 'Recent runtime signals look stable.', highlights: [], detail: '' },
+        reminder: { title: 'Cadence looks healthy', detail: 'Continue with the suggested next run.' },
+        docsFlow: { label: 'Implementation-first project', detail: 'Continue from implementation.' },
+        codeIntelligence: { indexedFileCount: 0, truncated: false, criticalSymbols: [], topFiles: [] }
+      },
+      bootstrap: { enabled: false, generated: [] }
+    },
+    phases: [{
+      id: 'phase-1',
+      title: 'Foundation',
+      goal: 'build',
+      status: 'active',
+      runCounts: { ready: 0, running: 0, stopped: 0, failed: 0, completed: 1 },
+      carryOverTasks: [],
+      pendingReview: [],
+      cleanupLane: [],
+      latestQualitySweep: null,
+      backlogLineage: [],
+      openRisks: [],
+      recentRuns: [{
+        id: 'run-loop-1',
+        title: 'looped run',
+        status: 'completed',
+        updatedAt: '2026-04-05T08:00:00.000Z',
+        chainDepth: 2,
+        chainedFromRunId: 'run-loop-0',
+        chainMeta: {
+          loop: {
+            enabled: true,
+            mode: 'until-goal',
+            maxRuns: 5,
+            currentRunIndex: 3,
+            maxConsecutiveFailures: 3,
+            consecutiveFailures: 1
+          },
+          originRunId: 'run-loop-origin'
+        }
+      }]
+    }]
+  };
+
+  fetchStub.queue('/api/projects/project-loop-visibility', overview);
+  vm.runInContext(`
+    projects = [{ id: 'project-loop-visibility', title: 'Loop Visibility Project', status: 'active', rootPath: 'D:/repos/loop-visibility', phases: [{ id: 'phase-1', title: 'Foundation' }], currentPhaseId: 'phase-1' }];
+    renderProjectList();
+  `, context);
+  await vm.runInContext(`selectProject('project-loop-visibility')`, context);
+
+  const markup = document.getElementById('main-area').innerHTML;
+  assert.match(markup, /Supervisor 정지 사유|Supervisor stop reason/);
+  assert.match(markup, /3 \/ 5회|3 \/ 5/);
+  assert.match(markup, /체인 depth 2|chain depth 2/);
+  assert.match(markup, /1시간 남음|1h remaining/);
 });

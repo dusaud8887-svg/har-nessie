@@ -27,6 +27,7 @@ The useful behavior comes from the loop around the model:
 - docs and repo state as structured context
 - mechanical verification after execution
 - review, recovery, and continuation after a result exists
+- runtime observability and persisted supervisor state for restart-safe automation
 
 That is the difference between "an agent answered" and "a run is actually operable."
 

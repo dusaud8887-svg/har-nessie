@@ -21,7 +21,8 @@
       browserReadinessLabel,
       browserReadinessDetail,
       getSelectedProjectId,
-      getProjectOverview
+      getProjectOverview,
+      getRecentPhaseTransition
     } = deps || {};
 
     function continuationModeLabel(value) {
@@ -40,6 +41,15 @@
       const normalized = String(value || '').trim().toLowerCase();
       if (normalized === 'automatic' || value === '자동' || value === 'Automatic') return t('자동', 'Automatic');
       return t('수동', 'Manual');
+    }
+
+    function normalizeMaxChainDepth(value = 0) {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? Math.max(0, Math.floor(parsed)) : 0;
+    }
+
+    function autoChainChoiceLabel(value) {
+      return value === true ? t('활성', 'Enabled') : t('비활성', 'Disabled');
     }
 
     function browserPolicyLabel(value) {
@@ -135,6 +145,51 @@
       return t(text, mappings.get(text) || text);
     }
 
+    function formatCountdown(targetIso) {
+      const targetMs = Date.parse(String(targetIso || '').trim());
+      if (!Number.isFinite(targetMs)) return '';
+      const diffMs = targetMs - Date.now();
+      if (diffMs <= 0) return t('예정 시각이 지났습니다. 다음 tick에서 다시 계산됩니다.', 'The scheduled time has passed. It will be recalculated on the next tick.');
+      const totalMinutes = Math.ceil(diffMs / 60000);
+      const hours = Math.floor(totalMinutes / 60);
+      const minutes = totalMinutes % 60;
+      if (hours <= 0) return t(`${minutes}분 남음`, `${minutes}m remaining`);
+      if (minutes === 0) return t(`${hours}시간 남음`, `${hours}h remaining`);
+      return t(`${hours}시간 ${minutes}분 남음`, `${hours}h ${minutes}m remaining`);
+    }
+
+    function renderProjectLoopPanel(phase) {
+      const recentRuns = Array.isArray(phase?.recentRuns) ? phase.recentRuns : [];
+      const automatedRun = recentRuns.find((run) => run?.chainMeta?.loop?.enabled) || null;
+      if (!automatedRun) return '';
+      const loop = automatedRun.chainMeta.loop || {};
+      const chainDepth = normalizeMaxChainDepth(automatedRun.chainDepth);
+      const modeLabel = loop.mode === 'until-goal'
+        ? t('목표 달성까지', 'Until goal')
+        : t('정해진 횟수', 'Repeat count');
+      return `
+        <div class="card" style="margin-bottom: 14px; border: 1px solid rgba(59,130,246,0.18); background: linear-gradient(180deg, rgba(239,246,255,0.92), rgba(255,255,255,1));">
+          <div class="section-head" style="margin-bottom: 12px;">
+            <div>
+              <span class="eyebrow">${escapeHtml(t('루프 진행', 'Loop progress'))}</span>
+              <h3>${escapeHtml(t(`${Number(loop.currentRunIndex || 1)} / ${Number(loop.maxRuns || 1)}회 | 체인 depth ${chainDepth} | 모드: ${loop.mode === 'until-goal' ? 'until-goal' : 'repeat-count'}`, `${Number(loop.currentRunIndex || 1)} / ${Number(loop.maxRuns || 1)} | chain depth ${chainDepth} | mode: ${loop.mode === 'until-goal' ? 'until-goal' : 'repeat-count'}`))}</h3>
+            </div>
+            <p>${escapeHtml(t('현재 단계의 자동 반복 run 계보와 실패 중단 한계를 따로 보여줍니다.', 'This isolates the active phase loop lineage and failure-stop boundary.'))}</p>
+          </div>
+          <div class="stats-grid">
+            <div class="stat-card"><span class="label">${escapeHtml(t('현재 반복', 'Current loop'))}</span><div class="value">${escapeHtml(`${Number(loop.currentRunIndex || 1)}/${Number(loop.maxRuns || 1)}`)}</div></div>
+            <div class="stat-card"><span class="label">${escapeHtml(t('루프 모드', 'Loop mode'))}</span><div class="value">${escapeHtml(modeLabel)}</div></div>
+            <div class="stat-card"><span class="label">${escapeHtml(t('연속 실패', 'Consecutive failures'))}</span><div class="value">${escapeHtml(`${Number(loop.consecutiveFailures || 0)}/${Number(loop.maxConsecutiveFailures || 0)}`)}</div></div>
+            <div class="stat-card"><span class="label">${escapeHtml(t('기준 run', 'Origin run'))}</span><div class="value">${escapeHtml(automatedRun.chainMeta?.originRunId || automatedRun.id || '-')}</div></div>
+          </div>
+          <div class="stack-list" style="margin-top: 12px;">
+            <div class="stack-item"><strong>${escapeHtml(t('최근 자동 run', 'Latest automated run'))}</strong><div>${escapeHtml(automatedRun.title || automatedRun.id || '-')} · ${escapeHtml(statusLabel(automatedRun.status || 'ready'))}</div></div>
+            ${automatedRun.chainedFromRunId ? `<div class="stack-item"><strong>${escapeHtml(t('이전 계보', 'Previous lineage'))}</strong><div>${escapeHtml(automatedRun.chainedFromRunId)}</div></div>` : ''}
+          </div>
+        </div>
+      `;
+    }
+
     function renderProjectPhaseCard(phase) {
       const counts = phase?.runCounts || {};
       const phaseContract = phase?.phaseContract || null;
@@ -146,9 +201,14 @@
       const latestQualitySweep = phase?.latestQualitySweep || null;
       const recentRuns = Array.isArray(phase?.recentRuns) ? phase.recentRuns : [];
       const currentOverview = getProjectOverview ? getProjectOverview(getSelectedProjectId ? getSelectedProjectId() : '') : null;
+      const recentTransition = getRecentPhaseTransition ? getRecentPhaseTransition(getSelectedProjectId ? getSelectedProjectId() : '') : null;
       const isCurrentPhase = String(currentOverview?.project?.currentPhaseId || '') === String(phase?.id || '');
+      const isAutoAdvancedPhase = isCurrentPhase && String(recentTransition?.phaseId || '') === String(phase?.id || '');
+      const cardTone = isAutoAdvancedPhase
+        ? 'border:1px solid rgba(34,197,94,0.26); background:linear-gradient(180deg, rgba(240,253,244,0.98), rgba(255,255,255,1)); box-shadow:0 18px 34px rgba(34,197,94,0.08);'
+        : '';
       return `
-        <div class="card">
+        <div class="card" style="${cardTone}">
           <div class="section-head" style="align-items: flex-start; margin-bottom: 18px;">
             <div>
               <span class="eyebrow">${escapeHtml(t('단계', 'Phase'))}</span>
@@ -158,6 +218,7 @@
             <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end;">
               <span class="status-badge ${escapeHtml(String(phase?.status || 'ready'))}">${escapeHtml(statusLabel(phase?.status || 'ready'))}</span>
               ${isCurrentPhase ? `<span class="status-badge in_progress">${escapeHtml(t('현재 단계', 'Current phase'))}</span>` : ''}
+              ${isAutoAdvancedPhase ? `<span class="status-badge running">${escapeHtml(t('자동 전환됨', 'Auto-advanced'))}</span>` : ''}
               <span class="status-badge">${escapeHtml(phaseCompletionSummary(phase))}</span>
             </div>
           </div>
@@ -370,6 +431,15 @@
       const continuationMode = continuationModeLabel(continuationPolicy.mode);
       const docsSyncLabel = docsSyncChoiceLabel(continuationPolicy.keepDocsInSync === false ? '선택' : '권장');
       const autoSweepLabel = autoSweepChoiceLabel(continuationPolicy.autoQualitySweepOnPhaseComplete === true ? '자동' : '수동');
+      const autoChainLabel = autoChainChoiceLabel(continuationPolicy.autoChainOnComplete === true);
+      const maxChainDepth = normalizeMaxChainDepth(continuationPolicy.maxChainDepth);
+      const defaultRunLoop = continuationPolicy.runLoop || {};
+      const autoProgress = defaultSettings.autoProgress || {};
+      const supervisorStatus = project?.supervisorStatus || null;
+      const supervisorActive = supervisorStatus?.active === true;
+      const nextScheduledLabel = supervisorStatus?.runtime?.nextScheduledAt || supervisorStatus?.nextScheduledAt || '';
+      const nextScheduledCountdown = formatCountdown(nextScheduledLabel);
+      const supervisorPausedReason = String(supervisorStatus?.runtime?.pausedReason || '').trim();
       return `
         <div class="hero-card">
           <h3>${escapeHtml(t('프로젝트 운영 현황', 'Project operations'))}</h3>
@@ -381,8 +451,28 @@
           <button class="primary" onclick="openCreateModal()">${escapeHtml(t('이 프로젝트로 새 작업 만들기', 'Create a new run in this project'))}</button>
           <button class="secondary-btn" onclick="reintakeProjectUi()" ${isBusy('project-reintake') ? 'disabled' : ''}>${escapeHtml(isBusy('project-reintake') ? t('재분석 중...', 'Re-analyzing...') : t('재분석 후 첫 작업 초안', 'Re-analyze and open draft'))}</button>
           <button class="secondary-btn" onclick="qualitySweepProject()" ${isBusy('quality-sweep') ? 'disabled' : ''}>${escapeHtml(isBusy('quality-sweep') ? t('정리 점검 실행 중...', 'Running quality sweep...') : t('정리 점검 실행', 'Run quality sweep'))}</button>
+          ${supervisorStatus?.enabled ? `<button class="${supervisorActive ? 'secondary-btn' : 'primary'}" onclick="toggleProjectSupervisor()" ${isBusy('supervisor-toggle') ? 'disabled' : ''}>${escapeHtml(isBusy('supervisor-toggle') ? t('처리 중...', 'Working...') : supervisorActive ? t('Supervisor 중지', 'Stop supervisor') : t('Supervisor 시작', 'Start supervisor'))}</button>` : ''}
+          ${supervisorStatus?.enabled ? `<button class="secondary-btn" onclick="runSupervisorNow()" ${isBusy('supervisor-run-now') ? 'disabled' : ''}>${escapeHtml(isBusy('supervisor-run-now') ? t('실행 중...', 'Running...') : t('지금 실행', 'Run now'))}</button>` : ''}
           <button class="danger" onclick="deleteProjectUi()" ${isBusy('delete-project') ? 'disabled' : ''}>${escapeHtml(isBusy('delete-project') ? t('삭제 중...', 'Deleting...') : t('프로젝트 삭제', 'Delete project'))}</button>
         </div>
+        ${supervisorStatus?.enabled ? `
+        <div class="card" style="margin-bottom: 14px; padding: 10px 14px; background: var(--surface-2, #f5f5f5);">
+          <span style="font-weight:600;">${escapeHtml(t('Supervisor', 'Supervisor'))}</span>
+          <span class="status-badge ${supervisorActive ? 'running' : 'stopped'}" style="margin-left:8px;">${escapeHtml(supervisorActive ? t('실행 중', 'Running') : t('중지됨', 'Stopped'))}</span>
+          ${supervisorStatus.scheduleEnabled && supervisorStatus.scheduleCron ? `<span style="margin-left:8px; color:var(--muted); font-size:12px;">${escapeHtml(supervisorStatus.scheduleCron)}</span>` : ''}
+          ${nextScheduledLabel ? `<div style="margin-top:4px; font-size:12px; color:var(--muted);">${escapeHtml(t('다음 실행', 'Next run'))}: ${escapeHtml(formatTimestamp(nextScheduledLabel))}${nextScheduledCountdown ? ` · ${escapeHtml(nextScheduledCountdown)}` : ''}</div>` : ''}
+          ${supervisorPausedReason ? `
+            <div style="margin-top:8px; padding:10px 12px; border-radius:10px; background:rgba(239,68,68,0.08); border:1px solid rgba(239,68,68,0.16); color:var(--danger, #b91c1c);">
+              <strong>${escapeHtml(t('Supervisor 정지 사유', 'Supervisor stop reason'))}</strong>
+              <div style="margin-top:4px; font-size:12px;">${escapeHtml(supervisorPausedReason)}</div>
+            </div>
+          ` : ''}
+          ${supervisorStatus.runtime?.lastAction ? `<div style="margin-top:4px; font-size:12px; color:var(--muted);">${escapeHtml(t('마지막 동작', 'Last action'))}: ${escapeHtml(supervisorStatus.runtime.lastAction)} ${supervisorStatus.runtime.lastActionAt ? `· ${escapeHtml(supervisorStatus.runtime.lastActionAt)}` : ''}</div>` : ''}
+          ${supervisorStatus.runtime?.lastRunId ? `<div style="font-size:12px; color:var(--muted);">${escapeHtml(t('마지막 run', 'Last run'))}: <span style="cursor:pointer; text-decoration:underline;" onclick="selectRun('${escapeHtml(supervisorStatus.runtime.lastRunId)}')">${escapeHtml(supervisorStatus.runtime.lastRunId)}</span></div>` : ''}
+          ${supervisorStatus.runtime?.lastError ? `<div style="font-size:12px; color:var(--danger, red);">${escapeHtml(t('오류', 'Error'))}: ${escapeHtml(supervisorStatus.runtime.lastError)}</div>` : ''}
+          ${Array.isArray(supervisorStatus.runtime?.history) && supervisorStatus.runtime.history.length ? `<div style="margin-top:6px; font-size:12px; color:var(--muted);">${escapeHtml(t('최근 자동화 기록', 'Recent automation history'))}: ${escapeHtml(supervisorStatus.runtime.history.map((item) => `${item.kind} ${item.detail}`).join(' | '))}</div>` : ''}
+        </div>` : ''}
+        ${renderProjectLoopPanel(currentPhase)}
         <div class="overview-grid">
           <div class="focus-card">
             <span class="eyebrow">${escapeHtml(t('다음 우선 조치', 'Next best move'))}</span>
@@ -399,6 +489,13 @@
             <span class="eyebrow">${escapeHtml(t('현재 단계', 'Current phase'))}</span>
             <h4>${escapeHtml(currentPhase?.title || t('활성 단계 없음', 'No active phase'))}</h4>
             <p>${escapeHtml(project?.status === 'completed' ? t('현재는 완료 상태이며 새 단계 추가 또는 재분석으로 재개할 수 있습니다.', 'This project is completed. Add a phase or re-analyze to resume.') : (project?.rootPath || t('root path 없음', 'No root path')))}</p>
+          </div>
+          <div class="focus-card ${Array.isArray(project?.codeIntelligence?.criticalSymbols) && project.codeIntelligence.criticalSymbols.length ? 'danger' : 'safe'}">
+            <span class="eyebrow">${escapeHtml(t('코드 인텔리전스', 'Code intelligence'))}</span>
+            <h4>${escapeHtml(String(project?.codeIntelligence?.criticalSymbols?.length || 0))} / ${escapeHtml(String(project?.codeIntelligence?.topFiles?.length || 0))}</h4>
+            <p>${escapeHtml((Array.isArray(project?.codeIntelligence?.criticalSymbols) && project.codeIntelligence.criticalSymbols.length)
+              ? t('critical-risk 심볼과 고영향 파일이 감지됐습니다. 다음 run 전 scope boundary를 먼저 확인하세요.', 'Critical-risk symbols and high-impact files were detected. Confirm the scope boundary before the next run.')
+              : t('현재 critical-risk 심볼은 크지 않습니다.', 'There are no major critical-risk symbols right now.'))}</p>
           </div>
           <div class="focus-card ${totalRisks ? 'danger' : 'safe'}">
             <span class="eyebrow">${escapeHtml(t('운영 리스크', 'Operational risk'))}</span>
@@ -459,18 +556,38 @@
                 <span class="eyebrow">${escapeHtml(t('반복 실패', 'Repeated failures'))}</span>
                 <h4>${escapeHtml(health.repeatedFailures?.warning ? t('패턴 있음', 'Pattern detected') : t('특이 패턴 없음', 'No major pattern'))}</h4>
                 <p>${escapeHtml(projectHealthText(health.repeatedFailures?.summary || '') || t('반복 실패 정보 없음', 'No repeated failure data'))}</p>
+                ${(Number(health.repeatedFailures?.consecutiveFailedRuns || 0) > 0 || supervisorStatus?.maxConsecutiveFailures) ? `<div style="margin-top:6px; color:var(--muted); font-size:12px;">${escapeHtml(t('연속 실패', 'Consecutive failed runs'))}: ${escapeHtml(String(health.repeatedFailures?.consecutiveFailedRuns || 0))} / ${escapeHtml(String(supervisorStatus?.maxConsecutiveFailures || 0))}</div>` : ''}
               </div>
               <div class="focus-card ${escapeHtml(health.runtimeObservability?.warning ? 'warning' : 'safe')}">
                 <span class="eyebrow">${escapeHtml(t('런타임 관측', 'Runtime observability'))}</span>
                 <h4>${escapeHtml(browserPolicyLabel(health.runtimeObservability?.browserPolicyLabel || ''))}</h4>
                 <p>${escapeHtml(runtimeHeadline(health.runtimeObservability?.headline || ''))}</p>
               </div>
+              <div class="focus-card ${escapeHtml(health.automationScorecard?.status === 'attention' ? 'danger' : (health.automationScorecard?.status === 'watch' ? 'warning' : 'safe'))}">
+                <span class="eyebrow">${escapeHtml(t('자동화 burn-in / SLO', 'Automation burn-in / SLO'))}</span>
+                <h4>${escapeHtml(String(health.automationScorecard?.score || 0))} / 100</h4>
+                <p>${escapeHtml(projectHealthText(health.automationScorecard?.summary || '') || t('자동화 scorecard 정보 없음', 'No automation scorecard yet.'))}</p>
+                <div style="margin-top:6px; color:var(--muted); font-size:12px;">
+                  ${escapeHtml(t('성공률', 'Success'))}: ${escapeHtml(String(Math.round(Number(health.automationScorecard?.successRate || 0) * 100)))}%
+                  · ${escapeHtml(t('복구율', 'Recovery'))}: ${escapeHtml(String(Math.round(Number(health.automationScorecard?.recoveryRate || 0) * 100)))}%
+                  · ${escapeHtml(t('증거 run', 'Proof runs'))}: ${escapeHtml(String(health.automationScorecard?.terminalRuns || 0))}
+                </div>
+              </div>
+              <div class="focus-card ${escapeHtml((health.codeIntelligence?.criticalSymbols || []).length ? 'danger' : 'safe')}">
+                <span class="eyebrow">${escapeHtml(t('전역 심볼 영향도', 'Global symbol impact'))}</span>
+                <h4>${escapeHtml(String(health.codeIntelligence?.indexedFileCount || 0))}${health.codeIntelligence?.truncated ? '+' : ''}</h4>
+                <p>${escapeHtml((health.codeIntelligence?.criticalSymbols || []).length
+                  ? (`CRITICAL-RISK >= ${Number(health.codeIntelligence?.thresholds?.criticalRisk || 15).toFixed(1)} · ` + health.codeIntelligence.criticalSymbols.map((item) => `${item.symbol} (${Number(item.riskScore || 0).toFixed(1)})`).join(' | '))
+                  : t('critical-risk 심볼 없음', 'No critical-risk symbols'))}</p>
+              </div>
             </div>
             <div class="stack-list" style="margin-top: 14px;">
               <div class="stack-item"><strong>${escapeHtml(t('운영 리마인더', 'Reminder'))}</strong><div>${escapeHtml(projectHealthText(health.reminder?.title || '') || t('현재 cadence 양호', 'Cadence looks healthy'))} · ${escapeHtml(projectHealthText(health.reminder?.detail || ''))}</div></div>
+              <div class="stack-item"><strong>${escapeHtml(t('자동화 운영 점수', 'Automation operating score'))}</strong><div>${escapeHtml(`${String(health.automationScorecard?.score || 0)}/100 · ${String(health.automationScorecard?.statusLabel || t('정보 없음', 'No data'))}`)} · ${escapeHtml(projectHealthText(health.automationScorecard?.recommendedAction || '') || t('추가 조치 없음', 'No extra action'))}</div></div>
               <div class="stack-item"><strong>${escapeHtml(t('문서 기준 운영', 'Docs-first flow'))}</strong><div>${escapeHtml(projectHealthText(health.docsFlow?.label || '') || t('정보 없음', 'No data'))} · ${escapeHtml(projectHealthText(health.docsFlow?.detail || ''))}</div></div>
               <div class="stack-item"><strong>${escapeHtml(t('문서 drift 대응', 'Docs drift response'))}</strong><div>${escapeHtml(projectHealthText(health.docsDrift?.recommendedAction || '') || t('추가 조치 없음', 'No extra action'))}</div></div>
               <div class="stack-item"><strong>${escapeHtml(t('런타임 하이라이트', 'Runtime highlights'))}</strong><div>${escapeHtml((health.runtimeObservability?.highlights || []).map((item) => projectHealthText(item)).join(' | ') || projectHealthText(health.runtimeObservability?.detail || '') || t('최근 경고 없음', 'No recent warnings'))}</div></div>
+              <div class="stack-item"><strong>${escapeHtml(t('고영향 파일', 'High-impact files'))}</strong><div>${escapeHtml((health.codeIntelligence?.topFiles || []).map((item) => `${item.path} (importedBy ${item.importedByCount || 0}, calledBy ${item.calledByCount || 0})`).join(' | ') || t('정보 없음', 'No data'))}</div></div>
             </div>
           </div>
         ` : ''}
@@ -483,7 +600,7 @@
                 <div class="stack-list">
                   <div class="stack-item"><strong>${escapeHtml(t('기본 작업 방식', 'Default work style'))}</strong><div>${escapeHtml(describePreset(project?.defaultPresetId || 'auto'))}</div></div>
                   <div class="stack-item"><strong>${escapeHtml(t('기본 담당 AI', 'Default AI pairing'))}</strong><div>${escapeHtml(providerSummary)}</div><div style="color: var(--muted); margin-top: 4px;">${escapeHtml(providerSummaryNote)}</div></div>
-                  <div class="stack-item"><strong>${escapeHtml(t('연속 작업 운영', 'Continuation mode'))}</strong><div>${escapeHtml(continuationMode)}</div><div style="color: var(--muted); margin-top: 4px;">${escapeHtml(t('문서 동기화', 'Docs sync'))} ${escapeHtml(docsSyncLabel)} · ${escapeHtml(t('단계 완료 시 정리 점검', 'Phase-close quality sweep'))} ${escapeHtml(autoSweepLabel)}</div></div>
+                  <div class="stack-item"><strong>${escapeHtml(t('연속 작업 운영', 'Continuation mode'))}</strong><div>${escapeHtml(continuationMode)}</div><div style="color: var(--muted); margin-top: 4px;">${escapeHtml(t('문서 동기화', 'Docs sync'))} ${escapeHtml(docsSyncLabel)} · ${escapeHtml(t('단계 완료 시 정리 점검', 'Phase-close quality sweep'))} ${escapeHtml(autoSweepLabel)} · ${escapeHtml(t('자동 체이닝', 'Auto-chain after run'))} ${escapeHtml(autoChainLabel)} · ${escapeHtml(t('최대 연쇄 수', 'Max chain depth'))} ${escapeHtml(String(maxChainDepth))}${defaultRunLoop?.enabled ? ` · ${escapeHtml(t('기본 루프', 'Default loop'))} ${escapeHtml(defaultRunLoop.mode === 'until-goal' ? t('목표 달성까지', 'Until goal') : t('정해진 횟수', 'Repeat count'))} ${escapeHtml(String(defaultRunLoop.maxRuns || 1))}` : ''}</div></div>
                   <div class="stack-item"><strong>${escapeHtml(t('기본 도구 프로필', 'Default tool profile'))}</strong><div>${escapeHtml(toolProfile?.label || toolProfile?.id || 'default')}</div></div>
                   <div class="stack-item"><strong>${escapeHtml(t('단계 수', 'Phase count'))}</strong><div>${escapeHtml(String(phases.length || 0))}</div></div>
                   <div class="stack-item"><strong>${escapeHtml(t('프로젝트 상태', 'Project status'))}</strong><div>${escapeHtml(project?.status === 'completed' ? t('완료됨', 'Completed') : t('운영 중', 'Active'))}</div></div>
@@ -607,6 +724,40 @@
               </div>
               <div class="form-group">
                 <label style="display:flex; align-items:center; gap:8px;">
+                  <input type="checkbox" id="project-settings-auto-chain" ${continuationPolicy.autoChainOnComplete === true ? 'checked' : ''}>
+                  ${escapeHtml(t('run 완료 후 자동 체이닝', 'Auto-chain after run complete'))}
+                </label>
+                <div class="helper-text">${escapeHtml(t('완료/부분완료 후 제안된 다음 run 자동 생성을 허용합니다.', 'Enable automatic creation of the next run after complete/partial-complete states.'))}</div>
+              </div>
+              <div class="form-group">
+                <label>${escapeHtml(t('최대 자동 체인 깊이', 'Maximum auto-chain depth'))}</label>
+                <input type="number" id="project-settings-max-chain-depth" min="0" step="1" value="${escapeHtml(String(maxChainDepth))}">
+                <div class="helper-text">${escapeHtml(t('0은 무제한입니다. 기본값은 3입니다.', '0 means unlimited. Default is 3.'))}</div>
+              </div>
+              <div class="form-group">
+                <label style="display:flex; align-items:center; gap:8px;">
+                  <input type="checkbox" id="project-settings-run-loop-enabled" ${defaultRunLoop.enabled === true ? 'checked' : ''}>
+                  ${escapeHtml(t('새 run 기본값으로 런 루프 사용', 'Use run loop as the default for new runs'))}
+                </label>
+                <div class="helper-text">${escapeHtml(t('프로젝트에서 새 run을 만들 때 반복 실행 기본값을 같이 채웁니다.', 'Pre-fill run-level repetition defaults when new runs are created in this project.'))}</div>
+              </div>
+              <div class="form-group">
+                <label>${escapeHtml(t('기본 런 루프 방식', 'Default run loop mode'))}</label>
+                <select id="project-settings-run-loop-mode">
+                  <option value="repeat-count" ${defaultRunLoop.mode === 'until-goal' ? '' : 'selected'}>${escapeHtml(t('정해진 횟수 반복', 'Repeat N runs'))}</option>
+                  <option value="until-goal" ${defaultRunLoop.mode === 'until-goal' ? 'selected' : ''}>${escapeHtml(t('목표 달성까지 반복', 'Repeat until goal achieved'))}</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>${escapeHtml(t('기본 최대 루프 횟수', 'Default max loop runs'))}</label>
+                <input type="number" id="project-settings-run-loop-max-runs" min="1" step="1" value="${escapeHtml(String(defaultRunLoop.maxRuns || 3))}">
+              </div>
+              <div class="form-group">
+                <label>${escapeHtml(t('기본 연속 실패 중단 횟수', 'Default failure-stop count'))}</label>
+                <input type="number" id="project-settings-run-loop-max-failures" min="1" step="1" value="${escapeHtml(String(defaultRunLoop.maxConsecutiveFailures || 3))}">
+              </div>
+              <div class="form-group">
+                <label style="display:flex; align-items:center; gap:8px;">
                   <input type="checkbox" id="project-settings-doc-sync" ${continuationPolicy.keepDocsInSync === false ? '' : 'checked'}>
                   ${escapeHtml(t('docs 기반 작업이면 문서 갱신도 다음 작업에 이어받기', 'Carry docs updates into the next run for docs-based work'))}
                 </label>
@@ -618,6 +769,91 @@
                   ${escapeHtml(t('단계 완료 시 정리 점검 자동 실행', 'Run quality sweep automatically when a phase closes'))}
                 </label>
                 <div class="helper-text">${escapeHtml(t('단계를 닫을 때 cleanup 후보와 남은 위험을 자동으로 정리합니다.', 'When a phase closes, automatically surface cleanup items and remaining risks.'))}</div>
+              </div>
+              <div class="form-group" style="border-top: 1px solid var(--border); padding-top: 12px; margin-top: 4px;">
+                <label style="display:flex; align-items:center; gap:8px; font-weight:600;">
+                  <input type="checkbox" id="project-settings-supervisor-enabled" ${autoProgress.enabled === true ? 'checked' : ''}>
+                  ${escapeHtml(t('Supervisor 자동 실행', 'Supervisor auto-run'))}
+                </label>
+                <div class="helper-text">${escapeHtml(t('활성화하면 서버가 cron 스케줄에 맞춰 이 프로젝트의 다음 run을 자동으로 시작합니다.', 'When enabled, the server automatically starts the next run for this project according to the cron schedule.'))}</div>
+              </div>
+              <div class="form-group">
+                <label style="display:flex; align-items:center; gap:8px;">
+                  <input type="checkbox" id="project-settings-schedule-enabled" ${autoProgress.scheduleEnabled === true ? 'checked' : ''}>
+                  ${escapeHtml(t('Cron 스케줄 사용', 'Use cron schedule'))}
+                </label>
+                <div class="helper-text">${escapeHtml(t('스케줄 기반 실행을 활성화합니다. Supervisor 자동 실행도 함께 켜야 합니다.', 'Enable schedule-based execution. Supervisor auto-run must also be enabled.'))}</div>
+              </div>
+              <div class="form-group">
+                <label>${escapeHtml(t('Cron 표현식', 'Cron expression'))}</label>
+                <input id="project-settings-schedule-cron" value="${escapeHtml(autoProgress.scheduleCron || '')}" placeholder="0 9 * * 1-5" oninput="onProjectScheduleCronInput()">
+                <div class="helper-text">${escapeHtml(t('표준 5필드 cron 형식. 예: 0 9 * * 1-5 = 평일 오전 9시. 비워두면 스케줄 없이 supervisor만 대기합니다.', 'Standard 5-field cron. e.g. 0 9 * * 1-5 = weekdays at 9am. Leave blank to run supervisor without a schedule.'))}</div>
+              </div>
+              <div class="form-group">
+                <label>${escapeHtml(t('빠른 스케줄 프리셋', 'Quick schedule preset'))}</label>
+                <select id="project-settings-schedule-preset" onchange="applyProjectSchedulePreset(this.value)">
+                  <option value="">${escapeHtml(t('직접 입력', 'Custom'))}</option>
+                  <option value="0 9 * * 1-5">${escapeHtml(t('평일 오전 9시', 'Weekdays 9:00'))}</option>
+                  <option value="0 14 * * 1-5">${escapeHtml(t('평일 오후 2시', 'Weekdays 14:00'))}</option>
+                  <option value="0 10 * * *">${escapeHtml(t('매일 오전 10시', 'Daily 10:00'))}</option>
+                  <option value="*/30 * * * *">${escapeHtml(t('30분마다', 'Every 30 minutes'))}</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>${escapeHtml(t('시각적 Cron 빌더', 'Visual cron builder'))}</label>
+                <div style="padding:14px; border-radius:18px; background:linear-gradient(180deg, rgba(248,250,252,0.98), rgba(255,255,255,1)); border:1px solid rgba(15,23,42,0.08); box-shadow:0 18px 34px rgba(15,23,42,0.06);">
+                  <div style="font-size:11px; letter-spacing:0.08em; text-transform:uppercase; color:var(--muted); margin-bottom:10px;">${escapeHtml(t('빠른 cadence', 'Quick cadence'))}</div>
+                  <div style="display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px;">
+                    <button type="button" id="project-settings-schedule-builder-mode-weekdays" class="secondary-btn" style="border-radius:999px;" onclick="applyProjectScheduleBuilderMode('weekdays')">${escapeHtml(t('평일', 'Weekdays'))}</button>
+                    <button type="button" id="project-settings-schedule-builder-mode-daily" class="secondary-btn" style="border-radius:999px;" onclick="applyProjectScheduleBuilderMode('daily')">${escapeHtml(t('매일', 'Daily'))}</button>
+                    <button type="button" id="project-settings-schedule-builder-mode-hourly" class="secondary-btn" style="border-radius:999px;" onclick="applyProjectScheduleBuilderMode('hourly')">${escapeHtml(t('매시간', 'Hourly'))}</button>
+                    <button type="button" id="project-settings-schedule-builder-mode-every-30-min" class="secondary-btn" style="border-radius:999px;" onclick="applyProjectScheduleBuilderMode('every-30-min')">${escapeHtml(t('30분마다', 'Every 30 min'))}</button>
+                    <button type="button" id="project-settings-schedule-builder-mode-custom" class="secondary-btn" style="border-radius:999px;" onclick="applyProjectScheduleBuilderMode('custom')">${escapeHtml(t('사용자 정의', 'Custom'))}</button>
+                  </div>
+                  <div style="display:grid; grid-template-columns: 1.3fr 1fr 1fr auto; gap:8px; align-items:end;">
+                    <div>
+                      <div style="font-size:12px; color:var(--muted); margin-bottom:6px;">${escapeHtml(t('빌더 모드', 'Builder mode'))}</div>
+                      <select id="project-settings-schedule-builder-mode" onchange="applyProjectScheduleBuilderMode(this.value)">
+                        <option value="custom">${escapeHtml(t('사용자 정의', 'Custom'))}</option>
+                        <option value="weekdays">${escapeHtml(t('평일', 'Weekdays'))}</option>
+                        <option value="daily">${escapeHtml(t('매일', 'Daily'))}</option>
+                        <option value="hourly">${escapeHtml(t('매시간', 'Hourly'))}</option>
+                        <option value="every-30-min">${escapeHtml(t('30분마다', 'Every 30 min'))}</option>
+                      </select>
+                    </div>
+                    <div>
+                      <div style="font-size:12px; color:var(--muted); margin-bottom:6px;">${escapeHtml(t('시각', 'Hour'))}</div>
+                      <select id="project-settings-schedule-builder-hour" onchange="updateProjectScheduleBuilderPreview()">
+                        ${Array.from({ length: 24 }, (_, index) => `<option value="${index}">${String(index).padStart(2, '0')}</option>`).join('')}
+                      </select>
+                    </div>
+                    <div>
+                      <div style="font-size:12px; color:var(--muted); margin-bottom:6px;">${escapeHtml(t('분', 'Minute'))}</div>
+                      <select id="project-settings-schedule-builder-minute" onchange="updateProjectScheduleBuilderPreview()">
+                        ${Array.from({ length: 60 }, (_, minute) => `<option value="${minute}">${String(minute).padStart(2, '0')}</option>`).join('')}
+                      </select>
+                    </div>
+                    <button type="button" class="primary" onclick="applyProjectScheduleBuilder()">${escapeHtml(t('Cron 적용', 'Apply cron'))}</button>
+                  </div>
+                </div>
+                <div class="helper-text">${escapeHtml(t('cadence 버튼 또는 드롭다운으로 주기를 고르고, 시간 드롭다운을 맞춘 뒤 Cron 적용을 누르세요.', 'Choose a cadence from the pills or dropdown, set the time dropdowns, then apply it into the cron field.'))}</div>
+                <div id="project-settings-schedule-preview" class="helper-text">${escapeHtml(t('직접 cron을 입력하거나 아래 빌더를 적용하세요.', 'Enter a cron expression or apply the builder below.'))}</div>
+              </div>
+              <div class="form-group">
+                <label>${escapeHtml(t('Supervisor 점검 주기 (ms)', 'Supervisor poll interval (ms)'))}</label>
+                <input type="number" id="project-settings-poll-interval" min="5000" step="5000" value="${escapeHtml(String(autoProgress.pollIntervalMs || 30000))}">
+                <div class="helper-text">${escapeHtml(t('Supervisor가 cron 일치 여부를 확인하는 주기. 최소 5000ms. 기본값 30000ms.', 'How often the supervisor checks whether the cron schedule matches. Min 5000ms, default 30000ms.'))}</div>
+              </div>
+              <div class="form-group">
+                <label style="display:flex; align-items:center; gap:8px;">
+                  <input type="checkbox" id="project-settings-pause-on-failures" ${autoProgress.pauseOnRepeatedFailures === false ? '' : 'checked'}>
+                  ${escapeHtml(t('반복 실패 시 자동 일시중지', 'Auto-pause on repeated failures'))}
+                </label>
+                <div class="helper-text">${escapeHtml(t('연속 실패 run이 누적되면 supervisor를 자동으로 멈추고 사람 개입을 기다립니다.', 'When failed runs pile up in a row, pause the supervisor automatically and wait for a human to intervene.'))}</div>
+              </div>
+              <div class="form-group">
+                <label>${escapeHtml(t('자동 일시중지 기준 run 수', 'Pause after consecutive failed runs'))}</label>
+                <input type="number" id="project-settings-max-failures" min="1" step="1" value="${escapeHtml(String(autoProgress.maxConsecutiveFailures || 3))}">
               </div>
               <div class="form-group">
                 <label>${escapeHtml(t('고급: 도구 제한 ID', 'Advanced: tool profile ID'))}</label>

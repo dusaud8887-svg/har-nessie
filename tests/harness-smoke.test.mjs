@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
@@ -9,20 +10,27 @@ import {
   analyzeProjectIntake,
   applyPlanPolicy,
   buildActionReplayEnvelope,
+  buildAutomaticReplanParseFailure,
+  deriveAutoChainDraftFromPhase,
   buildProjectPlanningPriorLines,
+  buildCodeContextPromptLines,
   buildCodexExecArgs,
   buildContinuationPromptLines,
+  buildRetryContext,
   createProject,
   createRun,
   decideReviewRoute,
+  deriveExecutionGraphSignals,
   deleteProject,
   deleteRun,
   diagnoseSetup,
   evaluateFreshSessionState,
   getProject,
   getProjectOverview,
+  getProjectSupervisorStatus,
   getRun,
   getHarnessSettings,
+  initHarness,
   listProjects,
   parseJsonReply,
   requeueFailedTasks,
@@ -31,15 +39,22 @@ import {
   runProjectQualitySweep,
   retryTask,
   searchRunMemory,
+  shouldRunAutomaticReplan,
   skipTask,
+  startProjectSupervisor,
+  stopProjectSupervisor,
   stopRun,
+  stopRunChain,
+  triggerProjectSupervisorPass,
   tasksCollide,
+  materializePlannedTasks,
+  maybeAutoAdvanceProjectPhase,
   updateProject,
   updateHarnessSettings,
   updatePlanDraft
 } from '../app/orchestrator.mjs';
 import { appendArtifactMemory, ensureProjectMemory, searchProjectMemory } from '../app/memory-store.mjs';
-import { buildAcceptanceMetadata, buildTaskActionPolicy, buildTaskCodeContext, inferTaskVerificationTypes, normalizeToolProfile } from '../app/task-action-runtime.mjs';
+import { buildAcceptanceMetadata, buildProjectCodeIntelligence, buildTaskActionPolicy, buildTaskCodeContext, extractStaticCodeGraphFacts, inferTaskVerificationTypes, normalizeToolProfile } from '../app/task-action-runtime.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -278,6 +293,97 @@ test('artifact API exposes extended review taxonomy fields', async () => {
   }
 });
 
+test('artifact API falls back to execution summary changed files when changed-files.json is missing', async () => {
+  let runId = '';
+  const server = await startHarnessServerForTest();
+  try {
+    const run = await createRun({
+      title: 'artifact-api-changed-files-fallback-smoke',
+      projectPath: root,
+      objective: 'artifact api changed files fallback smoke',
+      specText: '',
+      specFiles: '',
+      settings: { maxParallel: 1, maxTaskAttempts: 1, maxGoalLoops: 1 }
+    });
+    runId = run.id;
+
+    const statePath = path.join(root, 'runs', run.id, 'state.json');
+    const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+    state.tasks = [{
+      id: 'T001',
+      title: 'Changed files fallback task',
+      goal: 'Expose changed files even when only execution summary exists',
+      dependsOn: [],
+      filesLikely: [],
+      constraints: [],
+      acceptanceChecks: [],
+      status: 'done',
+      attempts: 1,
+      reviewSummary: '',
+      findings: [],
+      checkpointNotes: [],
+      lastExecution: {
+        changedFiles: ['docs/fallback.md']
+      }
+    }];
+    await fs.writeFile(statePath, JSON.stringify(state, null, 2), 'utf8');
+
+    const taskDir = path.join(root, 'runs', run.id, 'tasks', 'T001');
+    await fs.mkdir(taskDir, { recursive: true });
+    await fs.writeFile(path.join(taskDir, 'execution-summary.json'), JSON.stringify({
+      schemaVersion: '1',
+      taskId: 'T001',
+      changedFiles: ['docs/fallback.md']
+    }, null, 2), 'utf8');
+
+    const response = await fetch(`${server.baseUrl}/api/runs/${run.id}/tasks/T001/artifacts`);
+    assert.equal(response.status, 200);
+    const payload = await response.json();
+
+    assert.deepEqual(payload.changedFiles, [{ path: 'docs/fallback.md' }]);
+    assert.deepEqual(payload.executionSummary.changedFiles, ['docs/fallback.md']);
+  } finally {
+    await server.stop();
+    if (runId) {
+      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+    }
+  }
+});
+
+test('frontend API consumers stay aligned with server route handlers', async () => {
+  const frontendSources = [
+    await fs.readFile(path.join(root, 'public', 'app.js'), 'utf8'),
+    await fs.readFile(path.join(root, 'public', 'app-modal-actions.js'), 'utf8')
+  ].join('\n');
+  const serverSource = await fs.readFile(path.join(root, 'app', 'server.mjs'), 'utf8');
+
+  const routePairs = [
+    ['/api/events', "url.pathname === '/api/events'"],
+    ['/api/runs', "url.pathname === '/api/runs'"],
+    ['/api/system', "url.pathname === '/api/system'"],
+    ['/api/settings', "url.pathname === '/api/settings'"],
+    ['/api/diagnostics', "url.pathname === '/api/diagnostics'"],
+    ['/api/projects', "url.pathname === '/api/projects'"],
+    ['/api/projects/intake', "url.pathname === '/api/projects/intake'"],
+    ['/api/pick-folder', "url.pathname === '/api/pick-folder'"],
+    ['/approve-plan', "url.pathname.endsWith('/approve-plan')"],
+    ['/clarify-answers', "url.pathname.endsWith('/clarify-answers')"],
+    ['/plan-edit', "url.pathname.endsWith('/plan-edit')"],
+    ['/requeue-failed', "url.pathname.endsWith('/requeue-failed')"],
+    ['/start', "url.pathname.endsWith('/start')"],
+    ['/stop', "url.pathname.endsWith('/stop')"],
+    ['/memory', "url.pathname.endsWith('/memory')"],
+    ['/tasks/', "url.pathname.includes('/tasks/') && url.pathname.endsWith('/artifacts')"],
+    ['/retry', "url.pathname.endsWith('/retry')"],
+    ['/skip', "url.pathname.endsWith('/skip')"]
+  ];
+
+  for (const [frontendNeedle, serverNeedle] of routePairs) {
+    assert.match(frontendSources, new RegExp(frontendNeedle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.match(serverSource, new RegExp(serverNeedle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  }
+});
+
 test('memory search tolerates hyphenated harness terms', async () => {
   const projectKey = `test-memory-${Date.now()}`;
   const memoryDir = path.join(root, 'memory', 'projects', projectKey);
@@ -482,6 +588,152 @@ test('project-backed runs inherit charter, phase, and shared memory identity', a
     if (memoryKey) {
       await fs.rm(path.join(root, 'memory', 'projects', memoryKey), { recursive: true, force: true }).catch(() => {});
     }
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('getProjectOverview raises docs-drift to high after doc updates fall behind repeated code-only runs', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-docs-drift-'));
+  let projectId = '';
+  const runIds = [];
+  try {
+    const project = await createProject({
+      title: 'docs-drift-test',
+      rootPath: tempDir,
+      phases: [{ title: 'Foundation', goal: 'Keep docs aligned.' }]
+    });
+    projectId = project.id;
+    const phaseId = project.phases?.[0]?.id || '';
+
+    const seedRun = async (title, updatedAt, changedFiles) => {
+      const run = await createRun({
+        projectId,
+        phaseId,
+        title,
+        objective: title,
+        specText: '',
+        specFiles: '',
+        settings: { maxParallel: 1, maxTaskAttempts: 1, maxGoalLoops: 1 }
+      });
+      runIds.push(run.id);
+      const statePath = path.join(root, 'runs', run.id, 'state.json');
+      const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+      state.status = 'completed';
+      state.updatedAt = updatedAt;
+      state.result = { goalAchieved: true, summary: `${title} completed.` };
+      state.tasks = [{
+        id: 'T001',
+        title,
+        goal: title,
+        dependsOn: [],
+        filesLikely: changedFiles,
+        constraints: [],
+        acceptanceChecks: [],
+        status: 'done',
+        attempts: 1,
+        findings: [],
+        reviewSummary: 'done',
+        checkpointNotes: [],
+        lastExecution: {
+          changedFiles,
+          verification: { ok: true }
+        }
+      }];
+      await fs.writeFile(statePath, JSON.stringify(state, null, 2), 'utf8');
+    };
+
+    await seedRun('docs-baseline', '2026-04-05T07:00:00.000Z', ['docs/spec.md']);
+    await seedRun('code-only-one', '2026-04-05T08:00:00.000Z', ['src/auth/session-service.ts']);
+    await seedRun('code-only-two', '2026-04-05T09:00:00.000Z', ['src/auth/session-route.ts']);
+
+    const overview = await getProjectOverview(projectId);
+
+    assert.equal(overview.project.healthDashboard.docsDrift.level, 'high');
+    assert.equal(overview.project.healthDashboard.docsDrift.reintakeRecommended, true);
+    assert.match(String(overview.project.healthDashboard.docsDrift.summary || ''), /docs drift/i);
+  } finally {
+    await stopProjectSupervisor(projectId).catch(() => {});
+    for (const runId of runIds) {
+      await deleteRun(runId).catch(() => {});
+    }
+    if (projectId) await deleteProject(projectId).catch(() => {});
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('getProjectOverview computes an automation burn-in scorecard from recent automated runs', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-automation-scorecard-'));
+  let projectId = '';
+  const runIds = [];
+  try {
+    const project = await createProject({
+      title: 'automation-scorecard-test',
+      rootPath: tempDir,
+      phases: [{ title: 'Foundation', goal: 'Prove automation stability.' }]
+    });
+    projectId = project.id;
+    const phaseId = project.phases?.[0]?.id || '';
+
+    const seedAutomatedRun = async (title, status, updatedAt, goalAchieved) => {
+      const run = await createRun({
+        projectId,
+        phaseId,
+        title,
+        objective: title,
+        specText: '',
+        specFiles: '',
+        settings: { maxParallel: 1, maxTaskAttempts: 1, maxGoalLoops: 1 },
+        chainMeta: { trigger: 'scheduled', reason: 'automation scorecard test' }
+      });
+      runIds.push(run.id);
+      const statePath = path.join(root, 'runs', run.id, 'state.json');
+      const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+      state.status = status;
+      state.updatedAt = updatedAt;
+      state.chainDepth = 1;
+      state.result = { goalAchieved, summary: `${title} ${status}` };
+      state.tasks = [{
+        id: 'T001',
+        title,
+        goal: title,
+        dependsOn: [],
+        filesLikely: ['README.md'],
+        constraints: [],
+        acceptanceChecks: [],
+        status: status === 'completed' ? 'done' : 'failed',
+        attempts: 1,
+        findings: status === 'completed' ? [] : ['verification failed'],
+        reviewSummary: status,
+        checkpointNotes: [],
+        lastExecution: {
+          changedFiles: ['README.md'],
+          verification: { ok: status === 'completed' }
+        }
+      }];
+      await fs.writeFile(statePath, JSON.stringify(state, null, 2), 'utf8');
+    };
+
+    await seedAutomatedRun('auto-fail', 'failed', '2026-04-05T08:00:00.000Z', false);
+    await seedAutomatedRun('auto-recover', 'completed', '2026-04-05T09:00:00.000Z', true);
+    await seedAutomatedRun('auto-steady', 'completed', '2026-04-05T10:00:00.000Z', true);
+
+    const overview = await getProjectOverview(projectId);
+    const scorecard = overview.project.healthDashboard.automationScorecard;
+
+    assert.equal(scorecard.terminalRuns, 3);
+    assert.equal(scorecard.successfulRuns, 2);
+    assert.equal(scorecard.recoveredRuns, 1);
+    assert.equal(scorecard.proofReady, true);
+    assert.equal(scorecard.status, 'healthy');
+    assert.equal(scorecard.successRate, 0.667);
+    assert.equal(scorecard.recoveryRate, 1);
+    assert.ok(Number(scorecard.score || 0) >= 80);
+  } finally {
+    await stopProjectSupervisor(projectId).catch(() => {});
+    for (const runId of runIds) {
+      await deleteRun(runId).catch(() => {});
+    }
+    if (projectId) await deleteProject(projectId).catch(() => {});
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
 });
@@ -907,6 +1159,35 @@ test('createProject preserves existing repo docs during bootstrap', async () => 
     }
     if (memoryKey) {
       await fs.rm(path.join(root, 'memory', 'projects', memoryKey), { recursive: true, force: true }).catch(() => {});
+    }
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('createProject does not overwrite a corrupted existing project state', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-project-corrupt-state-'));
+  let projectId = '';
+  try {
+    const title = 'corrupt-project';
+    projectId = `${title}-${createHash('sha1').update(`${tempDir}\n${title}`).digest('hex').slice(0, 10)}`;
+    const projectDir = path.join(root, 'projects', projectId);
+    await fs.mkdir(projectDir, { recursive: true });
+    await fs.writeFile(path.join(projectDir, 'project.json'), '{ invalid json', 'utf8');
+
+    await assert.rejects(
+      () => createProject({
+        title,
+        rootPath: tempDir,
+        charterText: 'should not overwrite corrupted state'
+      }),
+      /Unexpected token|JSON/
+    );
+
+    const preserved = await fs.readFile(path.join(projectDir, 'project.json'), 'utf8');
+    assert.equal(preserved, '{ invalid json');
+  } finally {
+    if (projectId) {
+      await fs.rm(path.join(root, 'projects', projectId), { recursive: true, force: true }).catch(() => {});
     }
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -1463,6 +1744,7 @@ test('buildTaskCodeContext returns related file symbols and references', async (
     assert.equal(context.relatedFiles[0].codeGraph.imports[0].target, 'src/token-utils.ts');
     assert.ok(context.relatedFiles[0].codeGraph.exports.includes('buildAuthSession'));
     assert.ok(context.relatedFiles[0].codeGraph.importedSymbols.includes('buildToken'));
+    assert.ok(context.relatedFiles[0].codeGraph.calls.includes('buildToken'));
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -1507,6 +1789,383 @@ test('buildTaskCodeContext keeps distinct file casing on Unix-like platforms', a
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
+});
+
+test('buildTaskCodeContext computes repo-wide symbol impact counts', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-global-impact-'));
+  try {
+    await fs.mkdir(path.join(tempDir, 'src', 'auth'), { recursive: true });
+    await fs.mkdir(path.join(tempDir, 'src', 'ui'), { recursive: true });
+    await fs.mkdir(path.join(tempDir, 'src', 'api'), { recursive: true });
+    await fs.writeFile(path.join(tempDir, 'src', 'auth', 'session-service.ts'), [
+      'export function buildAuthSession(userId) {',
+      '  return `session:${userId}`;',
+      '}'
+    ].join('\n'), 'utf8');
+    await fs.writeFile(path.join(tempDir, 'src', 'ui', 'login-form.tsx'), [
+      "import { buildAuthSession } from '../auth/session-service';",
+      'export function LoginForm(userId) {',
+      '  return buildAuthSession(userId);',
+      '}'
+    ].join('\n'), 'utf8');
+    await fs.writeFile(path.join(tempDir, 'src', 'api', 'login-route.ts'), [
+      "import { buildAuthSession } from '../auth/session-service';",
+      'export function loginRoute(userId) {',
+      '  return buildAuthSession(userId);',
+      '}'
+    ].join('\n'), 'utf8');
+
+    const context = await buildTaskCodeContext({
+      id: 'run-global-impact',
+      projectPath: tempDir
+    }, {
+      id: 'T125',
+      title: 'Adjust auth session handling globally',
+      goal: 'Change buildAuthSession behavior',
+      filesLikely: ['src/auth/session-service.ts'],
+      acceptanceChecks: ['buildAuthSession returns a session string']
+    });
+
+    const sessionFile = context.relatedFiles.find((item) => item.path === 'src/auth/session-service.ts');
+    assert.ok(sessionFile, 'session-service.ts must be in related files');
+    assert.equal(sessionFile.impact.importedByCount, 2);
+    assert.equal(sessionFile.impact.calledByCount, 2);
+    assert.equal(sessionFile.impact.exportedSymbolImpact[0]?.symbol, 'buildAuthSession');
+    assert.equal(sessionFile.impact.exportedSymbolImpact[0]?.importerCount, 2);
+    assert.equal(sessionFile.impact.exportedSymbolImpact[0]?.callerCount, 2);
+    assert.equal(sessionFile.impact.exportedSymbolImpact[0]?.callCount, 2);
+    assert.equal(context.projectGraph.indexedFileCount, 3);
+    assert.equal(context.projectGraph.topSymbols[0]?.symbol, 'buildAuthSession');
+    assert.equal(context.projectGraph.topSymbols[0]?.importerCount, 2);
+    assert.equal(context.projectGraph.topSymbols[0]?.callerCount, 2);
+    assert.equal(context.projectGraph.criticalSymbols.length, 0);
+    assert.equal(context.projectGraph.topFiles[0]?.calledByCount, 2);
+    assert.match(context.summary, /global symbol impact indexed files: 3/);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('buildProjectCodeIntelligence reuses unchanged files and preserves call impact', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-project-intel-cache-'));
+  try {
+    await fs.mkdir(path.join(tempDir, 'src'), { recursive: true });
+    await fs.writeFile(path.join(tempDir, 'src', 'session-service.ts'), [
+      'export function buildAuthSession(userId) {',
+      '  return `session:${userId}`;',
+      '}'
+    ].join('\n'), 'utf8');
+    await fs.writeFile(path.join(tempDir, 'src', 'login-form.tsx'), [
+      "import { buildAuthSession } from './session-service';",
+      'export function LoginForm(userId) {',
+      '  return buildAuthSession(userId);',
+      '}'
+    ].join('\n'), 'utf8');
+
+    const first = await buildProjectCodeIntelligence(tempDir);
+    const second = await buildProjectCodeIntelligence(tempDir);
+
+    assert.equal(first.topSymbols[0]?.symbol, 'buildAuthSession');
+    assert.equal(first.topSymbols[0]?.callerCount, 1);
+    assert.equal(first.topSymbols[0]?.callCount, 1);
+    assert.equal(first.thresholds?.criticalRisk, 15);
+    assert.equal(second.cache.hit, true);
+    assert.equal(second.cache.refreshedFiles, 0);
+    assert.ok(second.cache.reusedFiles >= 2);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('deriveExecutionGraphSignals surfaces scope boundary warnings and weighted symbol risk', () => {
+  const task = {
+    id: 'T201',
+    title: 'Adjust login session flow',
+    goal: 'Update buildAuthSession behavior safely',
+    filesLikely: ['src/ui/login-form.tsx']
+  };
+  const codeContext = {
+    summary: 'Top files: src/ui/login-form.tsx',
+    projectGraph: {
+      indexedFileCount: 24,
+      truncated: false,
+      topSymbols: [{ symbol: 'buildAuthSession', importerCount: 12, callerCount: 12, callCount: 12, importerFiles: ['src/ui/login-form.tsx'] }],
+      criticalSymbols: [{ symbol: 'buildAuthSession', riskScore: 50.5, importerCount: 12, callerCount: 12, callCount: 12, definedIn: ['src/auth/session-service.ts'] }],
+      topFiles: [{ path: 'src/auth/session-service.ts', importedByCount: 12, calledByCount: 12, importedByFiles: ['src/ui/login-form.tsx'] }],
+      topEdges: [{ targetPath: 'src/auth/session-service.ts', importedSymbols: ['buildAuthSession'], importerCount: 12, callerCount: 12, callCount: 12 }]
+    },
+    relatedFiles: [{
+      path: 'src/ui/login-form.tsx',
+      codeGraph: {
+        imports: [{ target: 'src/auth/session-service.ts', importedSymbols: ['buildAuthSession'] }],
+        exports: ['LoginForm'],
+        declarations: ['LoginForm'],
+        importedSymbols: ['buildAuthSession'],
+        calls: ['buildAuthSession']
+      },
+      impact: {
+        importedByCount: 0,
+        importedByFiles: [],
+        exportedSymbolImpact: [],
+        calledByCount: 0,
+        calledByFiles: [],
+        importedSymbolImpact: [{ symbol: 'buildAuthSession', importerCount: 12, callerCount: 12, callCount: 12, importerFiles: ['src/ui/login-form.tsx'] }],
+        calledSymbolImpact: [{ symbol: 'buildAuthSession', importerCount: 12, callerCount: 12, callCount: 12, definedIn: ['src/auth/session-service.ts'] }],
+        outgoingEdgeImpact: [{
+          target: 'src/auth/session-service.ts',
+          importedSymbols: ['buildAuthSession'],
+          importerCount: 12,
+          callerCount: 12,
+          callCount: 12,
+          importerFiles: ['src/ui/login-form.tsx', 'src/api/login-route.ts'],
+          callerFiles: ['src/ui/login-form.tsx', 'src/api/login-route.ts']
+        }]
+      },
+      symbols: ['export function LoginForm']
+    }]
+  };
+  const memory = {
+    graphInsights: {
+      topEdges: [{ edge: 'src/ui/login-form.tsx->src/auth/session-service.ts#buildAuthSession', count: 3, weight: 1.4 }],
+      topSymbols: [{ symbol: 'buildAuthSession', count: 4, weight: 1.7 }]
+    },
+    temporalInsights: {
+      recentShare: 0.82,
+      activeFiles: [{ filePath: 'src/auth/session-service.ts' }]
+    }
+  };
+
+  const signals = deriveExecutionGraphSignals(task, codeContext, memory);
+
+  assert.ok(signals.relationshipLines.some((line) => /src\/ui\/login-form\.tsx -> src\/auth\/session-service\.ts via buildAuthSession \(current imports=12, call refs=12, active callers=12/.test(line)));
+  assert.ok(signals.symbolRiskLines.some((line) => /buildAuthSession: in src\/auth\/session-service\.ts scope exports it, 12 importers, 12 active callers/.test(line)));
+  assert.ok(signals.criticalSymbolRiskLines.some((line) => /risk=/.test(line)));
+  assert.ok(signals.dependencyWarnings.some((line) => /filesLikely excludes src\/auth\/session-service\.ts/.test(line)));
+  assert.ok(signals.retryLines.some((line) => /Re-enter through buildAuthSession \(risk=/.test(line)));
+  assert.ok(signals.retryLines.some((line) => /\(temporal hot\)/.test(line)));
+  assert.ok(signals.retryLines.some((line) => /Recent memory is concentrated on src\/auth\/session-service\.ts/.test(line)));
+});
+
+test('extractStaticCodeGraphFacts captures named exports, default exports, and destructured require symbols', () => {
+  const facts = extractStaticCodeGraphFacts(`
+    const { verifyToken, loadUser } = require('./token');
+    import auth.session as session_alias
+    export { verifyToken };
+    export default function buildSession() {}
+    export default buildSession;
+  `);
+
+  assert.ok(facts.importedSymbols.includes('verifyToken'));
+  assert.ok(facts.importedSymbols.includes('loadUser'));
+  assert.ok(facts.importedSymbols.includes('session'));
+  assert.ok(facts.importedSymbols.includes('session_alias'));
+  assert.ok(facts.exports.includes('verifyToken'));
+  assert.ok(facts.exports.includes('buildSession'));
+  assert.ok(facts.declarations.includes('buildSession'));
+});
+
+test('buildProjectPlanningPriorLines includes global symbol impact guidance', () => {
+  const lines = buildProjectPlanningPriorLines({
+    graphInsights: { topEdges: [], topSymbols: [] },
+    temporalInsights: { activeFiles: [], activeRootCauses: [], recentShare: 0 },
+    failureAnalytics: {},
+    traceSummary: {}
+  }, {
+    project: { phaseTitle: 'Auth Hardening' }
+  }, {
+    criticalSymbols: [{ symbol: 'buildAuthSession', riskScore: 22.4, importerCount: 12, callerCount: 8, definedIn: ['src/auth/session-service.ts'] }],
+    topSymbols: [{ symbol: 'buildAuthSession', riskScore: 22.4, importerCount: 12, callerCount: 8, definedIn: ['src/auth/session-service.ts'] }],
+    topFiles: [{ path: 'src/auth/session-service.ts', importedByCount: 12, calledByCount: 8 }],
+    topEdges: [{ targetPath: 'src/auth/session-service.ts', importedSymbols: ['buildAuthSession'], importerCount: 12, callerCount: 8 }]
+  });
+
+  assert.ok(lines.some((line) => /critical symbols with repo-wide impact: buildAuthSession \(exported from src\/auth\/session-service\.ts, imported by 12 file\(s\), called by 8 file\(s\), risk=22\.4\)/.test(line)));
+  assert.ok(lines.some((line) => /high-impact files: src\/auth\/session-service\.ts \(importedBy=12, calledBy=8\)/.test(line)));
+  assert.ok(lines.some((line) => /repo-wide hot edges: src\/auth\/session-service\.ts#buildAuthSession \(importers=12, callers=8\)/.test(line)));
+});
+
+test('buildRetryContext includes graph-aware retry guidance', () => {
+  const task = {
+    id: 'T202',
+    attempts: 2,
+    reviewSummary: 'Verification failed in login retry flow.',
+    findings: ['Scope drift hit auth service unexpectedly.'],
+    filesLikely: ['src/ui/login-form.tsx'],
+    lastExecution: {
+      acceptanceCheckResults: [{ check: 'npm test exits 0', status: 'fail', note: 'session mismatch' }]
+    }
+  };
+  const codeContext = {
+    relatedFiles: [{
+      path: 'src/ui/login-form.tsx',
+      codeGraph: {
+        imports: [{ target: 'src/auth/session-service.ts', importedSymbols: ['buildAuthSession'] }],
+        exports: ['LoginForm'],
+        declarations: ['LoginForm'],
+        importedSymbols: ['buildAuthSession']
+      },
+      symbols: ['export function LoginForm']
+    }]
+  };
+  const memory = {
+    graphInsights: {
+      topEdges: [{ edge: 'src/ui/login-form.tsx->src/auth/session-service.ts#buildAuthSession', count: 2, weight: 1.1 }],
+      topSymbols: [{ symbol: 'buildAuthSession', count: 3, weight: 1.5 }]
+    },
+    temporalInsights: {
+      recentShare: 0.7,
+      activeFiles: [{ filePath: 'src/auth/session-service.ts' }]
+    }
+  };
+
+  const lines = buildRetryContext(task, memory, codeContext);
+
+  assert.ok(lines.some((line) => /Previous acceptance check results: npm test exits 0: fail/.test(line)));
+  assert.ok(lines.some((line) => /Prior graph relationships: src\/ui\/login-form\.tsx -> src\/auth\/session-service\.ts/.test(line)));
+  assert.ok(lines.some((line) => /Re-enter through buildAuthSession \(risk=/.test(line)));
+  assert.ok(lines.some((line) => /Recent memory is concentrated on src\/auth\/session-service\.ts/.test(line)));
+});
+
+test('deriveExecutionGraphSignals reorders displayed symbol risk lines toward recent memory within the top pool', () => {
+  const task = {
+    id: 'T250',
+    filesLikely: ['src/ui/login-form.tsx']
+  };
+  const codeContext = {
+    relatedFiles: [{
+      path: 'src/ui/login-form.tsx',
+      impact: {
+        exportedSymbolImpact: [
+          { symbol: 'alpha', importerCount: 10, callerCount: 0, callCount: 0, definedIn: ['src/ui/login-form.tsx'] },
+          { symbol: 'beta', importerCount: 9, callerCount: 0, callCount: 0, definedIn: ['src/ui/login-form.tsx'] },
+          { symbol: 'gamma', importerCount: 8, callerCount: 0, callCount: 0, definedIn: ['src/ui/login-form.tsx'] },
+          { symbol: 'delta', importerCount: 7, callerCount: 0, callCount: 0, definedIn: ['src/ui/login-form.tsx'] },
+          { symbol: 'buildAuthSession', importerCount: 1, callerCount: 0, callCount: 0, definedIn: ['src/auth/session-service.ts'] }
+        ]
+      },
+      codeGraph: {
+        declarations: ['alpha', 'beta', 'gamma', 'delta', 'buildAuthSession'],
+        exports: [],
+        importedSymbols: [],
+        imports: []
+      },
+      symbols: ['export function LoginForm']
+    }],
+    projectGraph: {
+      topSymbols: [
+        { symbol: 'alpha', importerCount: 10, callerCount: 0, callCount: 0, definedIn: ['src/ui/login-form.tsx'] },
+        { symbol: 'beta', importerCount: 9, callerCount: 0, callCount: 0, definedIn: ['src/ui/login-form.tsx'] },
+        { symbol: 'gamma', importerCount: 8, callerCount: 0, callCount: 0, definedIn: ['src/ui/login-form.tsx'] },
+        { symbol: 'delta', importerCount: 7, callerCount: 0, callCount: 0, definedIn: ['src/ui/login-form.tsx'] },
+        { symbol: 'buildAuthSession', importerCount: 1, callerCount: 0, callCount: 0, definedIn: ['src/auth/session-service.ts'] }
+      ],
+      topFiles: []
+    },
+    symbolHints: ['alpha', 'beta', 'gamma', 'delta', 'buildAuthSession']
+  };
+  const memory = {
+    graphInsights: {
+      topEdges: [],
+      topSymbols: [{ symbol: 'buildAuthSession', count: 3, weight: 3.4 }]
+    },
+    temporalInsights: { recentShare: 0.2, activeFiles: [] }
+  };
+
+  const signals = deriveExecutionGraphSignals(task, codeContext, memory);
+
+  assert.match(signals.symbolRiskLines[0] || '', /buildAuthSession/);
+});
+
+test('deriveExecutionGraphSignals trims low-signal symbol lines when risk falls off sharply', () => {
+  const task = {
+    id: 'T251',
+    filesLikely: ['src/ui/login-form.tsx']
+  };
+  const codeContext = {
+    relatedFiles: [{
+      path: 'src/ui/login-form.tsx',
+      impact: {
+        exportedSymbolImpact: [
+          { symbol: 'alpha', importerCount: 10, callerCount: 0, callCount: 0, definedIn: ['src/ui/login-form.tsx'] },
+          { symbol: 'beta', importerCount: 3, callerCount: 0, callCount: 0, definedIn: ['src/ui/login-form.tsx'] },
+          { symbol: 'gamma', importerCount: 2, callerCount: 0, callCount: 0, definedIn: ['src/ui/login-form.tsx'] },
+          { symbol: 'delta', importerCount: 1, callerCount: 0, callCount: 0, definedIn: ['src/ui/login-form.tsx'] }
+        ]
+      },
+      codeGraph: {
+        declarations: ['alpha', 'beta', 'gamma', 'delta'],
+        exports: [],
+        importedSymbols: [],
+        imports: []
+      },
+      symbols: ['export function LoginForm']
+    }],
+    projectGraph: {
+      topSymbols: [
+        { symbol: 'alpha', importerCount: 10, callerCount: 0, callCount: 0, definedIn: ['src/ui/login-form.tsx'] },
+        { symbol: 'beta', importerCount: 3, callerCount: 0, callCount: 0, definedIn: ['src/ui/login-form.tsx'] },
+        { symbol: 'gamma', importerCount: 2, callerCount: 0, callCount: 0, definedIn: ['src/ui/login-form.tsx'] },
+        { symbol: 'delta', importerCount: 1, callerCount: 0, callCount: 0, definedIn: ['src/ui/login-form.tsx'] }
+      ],
+      topFiles: []
+    },
+    symbolHints: ['alpha', 'beta', 'gamma', 'delta']
+  };
+
+  const signals = deriveExecutionGraphSignals(task, codeContext, {
+    graphInsights: { topEdges: [], topSymbols: [] },
+    temporalInsights: { recentShare: 0.1, activeFiles: [] }
+  });
+
+  assert.equal(signals.symbolRiskLines.length, 2);
+  assert.match(signals.symbolRiskLines[0] || '', /alpha/);
+  assert.match(signals.symbolRiskLines[1] || '', /beta/);
+});
+
+test('buildCodeContextPromptLines explains graph relationships and scope warnings', () => {
+  const task = {
+    id: 'T203',
+    filesLikely: ['src/ui/login-form.tsx']
+  };
+  const codeContext = {
+    summary: 'Top files: src/ui/login-form.tsx',
+    projectGraph: {
+      indexedFileCount: 120,
+      truncated: true,
+      cache: { hit: true, reusedFiles: 80, refreshedFiles: 40 }
+    },
+    relatedFiles: [{
+      path: 'src/ui/login-form.tsx',
+      codeGraph: {
+        imports: [{ target: 'src/auth/session-service.ts', importedSymbols: ['buildAuthSession'] }],
+        exports: ['LoginForm'],
+        declarations: ['LoginForm'],
+        importedSymbols: ['buildAuthSession']
+      },
+      symbols: ['export function LoginForm']
+    }]
+  };
+  const memory = {
+    graphInsights: {
+      topEdges: [{ edge: 'src/ui/login-form.tsx->src/auth/session-service.ts#buildAuthSession', count: 2, weight: 1.2 }],
+      topSymbols: [{ symbol: 'buildAuthSession', count: 2, weight: 1.3 }]
+    },
+    temporalInsights: {
+      recentShare: 0.3,
+      activeFiles: []
+    }
+  };
+
+  const lines = buildCodeContextPromptLines(codeContext, memory, task);
+
+  assert.ok(lines.some((line) => /Project symbol impact index: files=120 \(partial due to file cap\) \| cache hit, reused=80, refreshed=40/.test(line)));
+  assert.ok(lines.some((line) => /Graph confidence note: the repo-wide graph is partial in this run/i.test(line)));
+  assert.ok(lines.includes('Graph relationships to watch:'));
+  assert.ok(lines.some((line) => /src\/ui\/login-form\.tsx -> src\/auth\/session-service\.ts/.test(line)));
+  assert.ok(lines.includes('High-impact symbols to verify first:'));
+  assert.ok(lines.some((line) => /buildAuthSession/.test(line)));
+  assert.ok(lines.includes('Scope boundary warnings:'));
+  assert.ok(lines.some((line) => /filesLikely excludes src\/auth\/session-service\.ts/.test(line)));
 });
 
 test('searchProjectMemory compacts duplicate artifact memory and ranks symbol-grounded hits first', async () => {
@@ -1607,9 +2266,199 @@ test('searchProjectMemory compacts duplicate artifact memory and ranks symbol-gr
 
     assert.equal(result.compaction.removedCount, 1);
     assert.equal(result.searchResults[0]?.kind, 'artifact-record');
+    assert.equal(result.searchResults[0]?.rankingMeta?.occurrenceCount, 2);
     assert.ok(result.searchResults[0]?.rankingMeta?.matchedSymbols.includes('buildAuthSession'));
     assert.equal(result.failureAnalytics.longHorizon.windowDays, 14);
-    assert.equal(result.failureAnalytics.retryCount, 1);
+    assert.equal(result.failureAnalytics.retryCount, 2);
+  } finally {
+    await fs.rm(memoryDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('searchProjectMemory preserves legacy compacted root-cause variants in analytics', async () => {
+  const projectKey = `test-memory-root-causes-${Date.now()}`;
+  const memoryDir = path.join(root, 'memory', 'projects', projectKey);
+  try {
+    await ensureProjectMemory(root, projectKey, { projectPath: root });
+    await fs.writeFile(path.join(memoryDir, 'MEMORY.md'), '# Project Memory\n\nRetry notes.\n', 'utf8');
+    await fs.writeFile(path.join(memoryDir, 'memory-artifacts.ndjson'), [
+      JSON.stringify({
+        schemaVersion: '2',
+        artifactId: 'legacy-artifact',
+        projectKey,
+        runId: 'run-legacy',
+        taskId: 'T-auth',
+        kind: 'review-verdict',
+        stage: 'review',
+        title: 'Task T-auth Review Verdict',
+        summary: 'Session retry kept failing',
+        summaryVariants: ['Session retry kept failing', 'Clock skew also appeared once'],
+        keywords: ['auth', 'retry'],
+        filesLikely: ['src/auth-service.ts'],
+        decision: 'retry',
+        verificationOk: false,
+        rootCause: 'verification failure',
+        rootCauseVariants: ['verification failure', 'clock skew'],
+        occurrenceCount: 3,
+        taskTitle: 'Fix auth session retry flow',
+        taskStatus: 'failed',
+        changedFiles: ['src/auth-service.ts'],
+        outOfScopeFiles: [],
+        acceptanceFailures: ['npm test exits 0'],
+        sourcePath: path.join(memoryDir, 'runs', 'run-legacy.md'),
+        createdAt: '2026-04-03T00:00:00.000Z',
+        symbolHints: ['buildAuthSession']
+      })
+    ].join('\n') + '\n', 'utf8');
+
+    const result = await searchProjectMemory(
+      root,
+      projectKey,
+      'auth retry verification failure clock skew',
+      5,
+      { projectPath: root },
+      { taskId: 'T-auth', stage: 'review', symbolHints: ['buildAuthSession'] }
+    );
+
+    assert.ok(result.failureAnalytics.topRootCauses.some((item) => item.reason === 'verification failure'));
+    assert.ok(result.failureAnalytics.topRootCauses.some((item) => item.reason === 'clock skew'));
+    assert.equal(result.searchResults[0]?.rankingMeta?.occurrenceCount, 3);
+  } finally {
+    await fs.rm(memoryDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('searchProjectMemory carries root-cause variants into temporal insights with occurrence-aware weight', async () => {
+  const projectKey = `test-memory-temporal-root-cause-variants-${Date.now()}`;
+  const memoryDir = path.join(root, 'memory', 'projects', projectKey);
+  try {
+    await ensureProjectMemory(root, projectKey, { projectPath: root });
+    await fs.writeFile(path.join(memoryDir, 'MEMORY.md'), '# Project Memory\n\nTemporal root-cause notes.\n', 'utf8');
+    await fs.writeFile(path.join(memoryDir, 'memory-artifacts.ndjson'), [
+      JSON.stringify({
+        schemaVersion: '2',
+        artifactId: 'temporal-variant-artifact',
+        projectKey,
+        runId: 'run-temporal',
+        taskId: 'T-auth',
+        kind: 'review-verdict',
+        stage: 'review',
+        title: 'Task T-auth Review Verdict',
+        summary: 'Session retry kept failing',
+        keywords: ['auth', 'retry'],
+        filesLikely: ['src/auth-service.ts'],
+        decision: 'retry',
+        verificationOk: false,
+        rootCause: 'verification failure',
+        rootCauseVariants: ['verification failure', 'clock skew'],
+        occurrenceCount: 4,
+        taskTitle: 'Fix auth session retry flow',
+        taskStatus: 'failed',
+        changedFiles: ['src/auth-service.ts'],
+        outOfScopeFiles: [],
+        acceptanceFailures: [],
+        sourcePath: path.join(memoryDir, 'runs', 'run-temporal.md'),
+        createdAt: '2026-04-04T00:00:00.000Z'
+      })
+    ].join('\n') + '\n', 'utf8');
+
+    const result = await searchProjectMemory(
+      root,
+      projectKey,
+      'auth retry verification failure clock skew',
+      5,
+      { projectPath: root },
+      { taskId: 'T-auth', stage: 'review' }
+    );
+
+    const activeRootCauses = result.temporalInsights?.activeRootCauses || [];
+    assert.ok(activeRootCauses.some((item) => item.reason === 'verification failure'));
+    const clockSkew = activeRootCauses.find((item) => item.reason === 'clock skew');
+    const failureClockSkew = (result.failureAnalytics?.topRootCauses || []).find((item) => item.reason === 'clock skew');
+    assert.ok(clockSkew);
+    assert.ok(failureClockSkew);
+    assert.ok(Number(clockSkew.weight || 0) > 1, 'variant root cause should carry occurrence-aware temporal weight');
+    assert.ok(Number(failureClockSkew.weight || 0) > 1, 'failure analytics should use the same occurrence-aware root-cause weighting');
+  } finally {
+    await fs.rm(memoryDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('searchProjectMemory boosts repeated variant matches in artifact ranking', async () => {
+  const projectKey = `test-memory-variant-score-${Date.now()}`;
+  const memoryDir = path.join(root, 'memory', 'projects', projectKey);
+  try {
+    await ensureProjectMemory(root, projectKey, { projectPath: root });
+    await fs.writeFile(path.join(memoryDir, 'MEMORY.md'), '# Project Memory\n\nVariant ranking notes.\n', 'utf8');
+    await fs.writeFile(path.join(memoryDir, 'memory-artifacts.ndjson'), [
+      JSON.stringify({
+        schemaVersion: '2',
+        artifactId: 'variant-heavy',
+        projectKey,
+        runId: 'run-variant',
+        taskId: 'T-auth',
+        kind: 'review-verdict',
+        stage: 'review',
+        title: 'Task T-auth Review Verdict',
+        summary: 'Retry issue',
+        summaryVariants: ['Clock skew caused retry', 'Clock skew caused retry again'],
+        summaryVariantCounts: { 'Clock skew caused retry': 2, 'Clock skew caused retry again': 1 },
+        keywords: ['auth'],
+        filesLikely: ['src/auth-service.ts'],
+        decision: 'retry',
+        verificationOk: false,
+        rootCause: 'clock skew',
+        rootCauseVariants: ['clock skew'],
+        rootCauseVariantCounts: { 'clock skew': 3 },
+        occurrenceCount: 3,
+        taskTitle: 'Fix auth retry flow',
+        taskStatus: 'failed',
+        changedFiles: ['src/auth-service.ts'],
+        outOfScopeFiles: [],
+        acceptanceFailures: [],
+        sourcePath: path.join(memoryDir, 'runs', 'run-variant.md'),
+        createdAt: '2026-04-04T00:00:00.000Z',
+        symbolHints: ['buildAuthSession']
+      }),
+      JSON.stringify({
+        schemaVersion: '2',
+        artifactId: 'variant-light',
+        projectKey,
+        runId: 'run-light',
+        taskId: 'T-auth',
+        kind: 'review-verdict',
+        stage: 'review',
+        title: 'Task T-auth Review Verdict',
+        summary: 'General retry issue',
+        keywords: ['auth'],
+        filesLikely: ['src/auth-service.ts'],
+        decision: 'retry',
+        verificationOk: false,
+        rootCause: 'transient issue',
+        occurrenceCount: 1,
+        taskTitle: 'Fix auth retry flow',
+        taskStatus: 'failed',
+        changedFiles: ['src/auth-service.ts'],
+        outOfScopeFiles: [],
+        acceptanceFailures: [],
+        sourcePath: path.join(memoryDir, 'runs', 'run-light.md'),
+        createdAt: '2026-04-04T01:00:00.000Z',
+        symbolHints: ['buildAuthSession']
+      })
+    ].join('\n') + '\n', 'utf8');
+
+    const result = await searchProjectMemory(
+      root,
+      projectKey,
+      'clock skew auth retry',
+      5,
+      { projectPath: root },
+      { taskId: 'T-auth', stage: 'review', symbolHints: ['buildAuthSession'] }
+    );
+
+    assert.equal(result.searchResults[0]?.title, 'Task T-auth Review Verdict');
+    assert.equal(result.searchResults[0]?.rankingMeta?.occurrenceCount, 3);
+    assert.match(result.searchResults[0]?.snippet || '', /clock skew/i);
   } finally {
     await fs.rm(memoryDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -1932,6 +2781,44 @@ test('searchProjectMemory decays stale artifact records and favors recent matchi
   }
 });
 
+test('searchProjectMemory builds propagated graph chains from stored edges', async () => {
+  const projectKey = `graph-chain-${Date.now()}`;
+  try {
+    const memory = await ensureProjectMemory(root, projectKey, { projectPath: root });
+    const createdAt = new Date(Date.now() - (1 * 60 * 60 * 1000)).toISOString();
+    await fs.writeFile(memory.artifactIndexFile, [
+      JSON.stringify({
+        schemaVersion: '2',
+        artifactId: 'graph-artifact',
+        title: 'Graph chain artifact',
+        kind: 'execution-summary',
+        stage: 'review',
+        decision: 'retry',
+        summary: 'login retry chain',
+        rootCause: 'session builder mismatch',
+        keywords: ['login', 'retry', 'session'],
+        changedFiles: ['src/ui/login-form.tsx'],
+        filesLikely: ['src/ui/login-form.tsx'],
+        graphEdges: [
+          'src/ui/login-form.tsx->src/auth/session-service.ts#buildAuthSession',
+          'src/auth/session-service.ts->src/auth/session.ts#createSession'
+        ],
+        graphSymbols: ['buildAuthSession', 'createSession'],
+        createdAt,
+        updatedAt: createdAt
+      })
+    ].join('\n') + '\n', 'utf8');
+
+    const snapshot = await searchProjectMemory(root, projectKey, 'login retry session', 5, { projectPath: root }, { reindex: false });
+    assert.ok(snapshot.graphInsights.topPaths.some((item) => /src\/ui\/login-form\.tsx -> src\/auth\/session-service\.ts -> src\/auth\/session\.ts/.test(item.path)));
+    assert.ok(snapshot.graphInsights.propagatedSymbols.some((item) => item.symbol === 'createSession'));
+    assert.equal(snapshot.graphInsights.propagation?.damping, 0.62);
+    assert.equal(snapshot.graphInsights.propagation?.maxDepth, 3);
+  } finally {
+    await fs.rm(path.join(root, 'memory', 'projects', projectKey), { recursive: true, force: true }).catch(() => {});
+  }
+});
+
 test('continuation prompt lines compact recent task state and direct resume guidance', () => {
   const lines = buildContinuationPromptLines({
     tasks: [{
@@ -2004,6 +2891,7 @@ test('applyPlanPolicy injects a read-only verification task when code changes la
   assert.equal(policy.syntheticTasks.includes('verification-nudge'), true);
   assert.equal(rawTasks.at(-1).title, 'Verify the integrated changes mechanically');
   assert.match(rawTasks.at(-1).constraints.join(' | '), /Do not edit any files/);
+  assert.equal(policy.appliedRules.some((rule) => rule.id === 'verification-nudge' && /mechanical verification task/i.test(rule.title)), true);
 });
 
 test('applyPlanPolicy injects diagnosis-first scoping work for broad greenfield plans', () => {
@@ -2027,7 +2915,59 @@ test('applyPlanPolicy injects diagnosis-first scoping work for broad greenfield 
   assert.equal(rawTasks[0].title, 'Diagnose current phase scope and lock implementation boundaries');
   assert.ok(policy.syntheticTasks.includes('diagnosis-first'));
   assert.ok(policy.policyNotes.some((item) => /Diagnosis-first profile/i.test(item)));
+  assert.equal(policy.appliedRules.some((rule) => rule.id === 'diagnosis-first' && /scope-lock pass/i.test(rule.effect)), true);
   assert.equal(policy.parallelMode, 'sequential');
+});
+
+test('initHarness recovers stale running state into a resumable checkpoint', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-restart-recovery-'));
+  let runId = '';
+  try {
+    const run = await createRun({
+      title: 'restart-recovery-smoke',
+      projectPath: tempDir,
+      objective: 'recover stale in-flight work after a restart',
+      specText: '',
+      specFiles: '',
+      settings: { maxParallel: 1, maxTaskAttempts: 1, maxGoalLoops: 1 }
+    });
+    runId = run.id;
+    const stateFile = path.join(root, 'runs', runId, 'state.json');
+    const state = JSON.parse(await fs.readFile(stateFile, 'utf8'));
+    state.status = 'running';
+    state.tasks = [{
+      id: 'T001',
+      title: 'Resume recovered work',
+      goal: 'Resume safely after restart',
+      status: 'in_progress',
+      attempts: 1,
+      findings: [],
+      constraints: [],
+      acceptanceChecks: [],
+      checkpointNotes: [],
+      lastExecution: { workspaceMode: 'workspace-copy' }
+    }];
+    await fs.writeFile(stateFile, JSON.stringify(state, null, 2), 'utf8');
+
+    const workspaceDir = path.join(root, 'runs', runId, 'tasks', 'T001', 'workspace');
+    await fs.mkdir(workspaceDir, { recursive: true });
+    await fs.writeFile(path.join(workspaceDir, 'scratch.txt'), 'stale workspace', 'utf8');
+
+    await initHarness();
+
+    const recovered = await getRun(runId);
+    const checkpoint = JSON.parse(await fs.readFile(path.join(root, 'runs', runId, 'run-checkpoint.json'), 'utf8'));
+    const workspaceExists = await fs.access(workspaceDir).then(() => true).catch(() => false);
+
+    assert.equal(recovered.status, 'stopped');
+    assert.equal(recovered.tasks[0]?.status, 'ready');
+    assert.match(String(recovered.tasks[0]?.reviewSummary || ''), /Recovered after harness restart/i);
+    assert.equal(checkpoint.trigger, 'recovered-after-restart');
+    assert.equal(workspaceExists, false);
+  } finally {
+    if (runId) await deleteRun(runId).catch(() => {});
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
 });
 
 test('applyPlanPolicy gates synthetic diagnosis work before parallel implementation tasks', () => {
@@ -2065,6 +3005,42 @@ test('evaluateFreshSessionState recommends a fresh run after threshold crossings
 
   assert.equal(result.recommended, true);
   assert.match(result.reason, /fresh run recommended/i);
+});
+
+test('shouldRunAutomaticReplan respects phase-boundary threshold', () => {
+  assert.equal(shouldRunAutomaticReplan({
+    profile: { replanThreshold: 'phase-boundary' },
+    tasks: [
+      { id: 'T001', status: 'done' },
+      { id: 'T002', status: 'ready' }
+    ]
+  }), false);
+
+  assert.equal(shouldRunAutomaticReplan({
+    profile: { replanThreshold: 'phase-boundary' },
+    tasks: [
+      { id: 'T001', status: 'done' },
+      { id: 'T002', status: 'failed' }
+    ]
+  }), true);
+
+  assert.equal(shouldRunAutomaticReplan({
+    profile: { replanThreshold: 'task-batch' },
+    tasks: [
+      { id: 'T001', status: 'ready' }
+    ]
+  }), true);
+});
+
+test('buildAutomaticReplanParseFailure keeps malformed replans as safe no-op metadata', () => {
+  const failure = buildAutomaticReplanParseFailure(
+    new Error('JSON parse failed.\nAttempts: Unterminated string in JSON at position 42'),
+    '{ "shouldReplan": false, "summary": "partial'
+  );
+
+  assert.match(failure.summary, /Skipped automatic replanning/i);
+  assert.match(failure.parseError, /JSON parse failed/i);
+  assert.match(failure.rawSnippet, /shouldReplan/);
 });
 
 test('applyPlanPolicy skips verification nudge for docs-only plans', () => {
@@ -2211,6 +3187,75 @@ test('buildProjectPlanningPriorLines summarizes recent failure patterns into pla
   assert.ok(lines.some((item) => /Grounding examples/.test(item)));
 });
 
+test('deriveAutoChainDraftFromPhase injects prior run memory into continuation spec text', () => {
+  const draft = deriveAutoChainDraftFromPhase({
+    title: 'auth-project'
+  }, {
+    phaseTitle: 'Auth hardening',
+    phaseGoal: 'stabilize login retries',
+    carryOverTasks: [{
+      taskId: 'T014',
+      title: 'stabilize session retry flow',
+      filesLikely: ['src/auth/session-service.ts']
+    }],
+    phaseContract: {}
+  }, {
+    keepDocsInSync: true
+  }, {
+    failureAnalytics: {
+      retryCount: 3,
+      verificationFailures: 1,
+      scopeDriftCount: 2,
+      topRootCauses: [{ reason: 'session retry verification failure' }],
+      topFailureFiles: [{ filePath: 'src/auth/session-service.ts' }]
+    },
+    temporalInsights: {
+      activeFiles: [{ filePath: 'src/auth/session-service.ts' }],
+      recentShare: 0.72
+    },
+    graphInsights: {
+      topPaths: [{ path: 'src/ui/login-form.tsx -> src/auth/session-service.ts -> src/auth/session.ts' }],
+      propagatedFiles: [{ filePath: 'src/auth/session.ts' }],
+      propagatedSymbols: [{ symbol: 'buildAuthSession' }]
+    }
+  });
+
+  assert.match(draft.specText, /## Prior Run Memory/);
+  assert.match(draft.specText, /session retry verification failure/);
+  assert.match(draft.specText, /src\/auth\/session-service\.ts/);
+  assert.match(draft.specText, /src\/ui\/login-form\.tsx -> src\/auth\/session-service\.ts -> src\/auth\/session\.ts/);
+  assert.match(draft.specText, /src\/auth\/session\.ts/);
+  assert.match(draft.specText, /buildAuthSession/);
+});
+
+test('materializePlannedTasks strengthens scope constraints and seeds filesLikely from memory', () => {
+  const tasks = materializePlannedTasks([{
+    title: 'Investigate retry issue',
+    goal: 'narrow the failing login path',
+    filesLikely: [],
+    constraints: []
+  }], {
+    fileBudget: 2,
+    memory: {
+      failureAnalytics: {
+        retryCount: 3,
+        scopeDriftCount: 3,
+        scopeDriftPressure: 1.2,
+        topFailureFiles: [{ filePath: 'src/auth/session-service.ts' }]
+      },
+      temporalInsights: {
+        activeFiles: [{ filePath: 'src/ui/login-form.tsx' }],
+        recentShare: 0.68
+      }
+    }
+  });
+
+  assert.deepEqual(tasks[0].filesLikely, ['src/ui/login-form.tsx', 'src/auth/session-service.ts']);
+  assert.ok(tasks[0].constraints.some((item) => /Hard scope boundary/.test(item)));
+  assert.ok(tasks[0].constraints.some((item) => /highest-probability failure cause/.test(item)));
+  assert.ok(tasks[0].checkpointNotes.some((item) => /Temporal hot files/.test(item)));
+});
+
 test('resolveAdaptiveParallelLimit reduces fan-out after drift and keeps width on clean runs', () => {
   const stable = resolveAdaptiveParallelLimit({
     memory: { failureAnalytics: { retryCount: 0, verificationFailures: 0, scopeDriftCount: 0 } },
@@ -2236,7 +3281,15 @@ test('resolveAdaptiveParallelLimit reduces fan-out after drift and keeps width o
 
 test('createRun defaults Codex execution settings', async () => {
   let runId = '';
+  const previousSettings = await getHarnessSettings();
   try {
+    await updateHarnessSettings({
+      ...previousSettings,
+      codexModel: 'gpt-5.4',
+      codexFastMode: true,
+      codexReasoningEffort: 'high',
+      codexServiceTier: 'fast'
+    });
     const run = await createRun({
       title: 'codex-default-settings-smoke',
       projectPath: root,
@@ -2250,6 +3303,7 @@ test('createRun defaults Codex execution settings', async () => {
     assert.equal(run.settings.maxTaskAttempts, 2);
     assert.equal(run.settings.maxGoalLoops, 4);
     assert.equal(run.settings.codexModel, 'gpt-5.4');
+    assert.equal(run.settings.codexFastMode, true);
     assert.equal(run.settings.codexReasoningEffort, 'high');
     assert.equal(run.settings.codexServiceTier, 'fast');
     assert.equal(run.profile.flowProfile, 'sequential');
@@ -2269,6 +3323,7 @@ test('createRun defaults Codex execution settings', async () => {
     if (runId) {
       await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
     }
+    await updateHarnessSettings(previousSettings);
   }
 });
 
@@ -2367,6 +3422,176 @@ test('createRun snapshots coordination and worker provider settings', async () =
   }
 });
 
+test('createRun persists run-level loop metadata for automation progress', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-run-loop-'));
+  let runId = '';
+  try {
+    const run = await createRun({
+      title: 'looped-run',
+      projectPath: tempDir,
+      objective: 'exercise run loop metadata',
+      specText: '',
+      specFiles: '',
+      settings: { maxParallel: 1, maxTaskAttempts: 1, maxGoalLoops: 1 },
+      runLoop: {
+        enabled: true,
+        mode: 'until-goal',
+        maxRuns: 4,
+        maxConsecutiveFailures: 2
+      }
+    });
+    runId = run.id;
+    const reloaded = await getRun(run.id);
+    assert.equal(reloaded.chainMeta?.loop?.enabled, true);
+    assert.equal(reloaded.chainMeta?.loop?.mode, 'until-goal');
+    assert.equal(reloaded.chainMeta?.loop?.maxRuns, 4);
+    assert.equal(reloaded.chainMeta?.loop?.maxConsecutiveFailures, 2);
+    assert.equal(reloaded.chainMeta?.loop?.currentRunIndex, 1);
+    assert.equal(reloaded.chainMeta?.originRunId, run.id);
+  } finally {
+    if (runId) await deleteRun(runId).catch(() => {});
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('maybeAutoAdvanceProjectPhase closes a completed phase and activates the next phase', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-phase-advance-'));
+  let projectId = '';
+  let runId = '';
+  try {
+    const project = await createProject({
+      title: 'phase-advance-test',
+      rootPath: tempDir,
+      phases: [
+        { title: 'Foundation', goal: 'Close the initial slice.' },
+        { title: 'Delivery', goal: 'Start the next slice.' }
+      ]
+    });
+    projectId = project.id;
+    const phaseOneId = project.phases?.[0]?.id || '';
+    const phaseTwoId = project.phases?.[1]?.id || '';
+    const run = await createRun({
+      projectId,
+      phaseId: phaseOneId,
+      title: 'phase-close-run',
+      objective: 'finish phase one',
+      specText: '',
+      specFiles: '',
+      settings: { maxParallel: 1, maxTaskAttempts: 1, maxGoalLoops: 1 }
+    });
+    runId = run.id;
+
+    const statePath = path.join(root, 'runs', run.id, 'state.json');
+    const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+    state.status = 'completed';
+    state.result = { goalAchieved: true, summary: 'Phase one goal met.' };
+    state.tasks = [{
+      id: 'T001',
+      title: 'Done task',
+      goal: 'Finish the phase',
+      dependsOn: [],
+      filesLikely: ['README.md'],
+      constraints: [],
+      acceptanceChecks: ['README updated'],
+      status: 'done',
+      attempts: 1,
+      findings: [],
+      reviewSummary: 'done',
+      checkpointNotes: [],
+      lastExecution: {
+        changedFiles: ['README.md'],
+        verification: { ok: true }
+      }
+    }];
+    await fs.writeFile(statePath, JSON.stringify(state, null, 2), 'utf8');
+
+    const updatedRun = await getRun(run.id);
+    const outcome = await maybeAutoAdvanceProjectPhase(project, [updatedRun], { runId: run.id });
+    const refreshed = await getProject(projectId);
+    const overview = await getProjectOverview(projectId);
+
+    assert.equal(outcome.advanced, true);
+    assert.equal(refreshed.currentPhaseId, phaseTwoId);
+    assert.equal(refreshed.phases.find((phase) => phase.id === phaseOneId)?.status, 'done');
+    assert.equal(refreshed.phases.find((phase) => phase.id === phaseTwoId)?.status, 'active');
+    assert.match(String(overview.project.supervisorStatus?.runtime?.lastAction || ''), /phase-auto-advanced/i);
+  } finally {
+    await stopProjectSupervisor(projectId).catch(() => {});
+    if (runId) await deleteRun(runId).catch(() => {});
+    if (projectId) await deleteProject(projectId).catch(() => {});
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('maybeAutoAdvanceProjectPhase runs an automatic quality sweep before closing a phase', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-phase-auto-sweep-'));
+  let projectId = '';
+  let runId = '';
+  try {
+    await fs.writeFile(path.join(tempDir, 'README.md'), '# Phase Sweep\n', 'utf8');
+    const project = await createProject({
+      title: 'phase-auto-sweep-test',
+      rootPath: tempDir,
+      phases: [
+        { title: 'Foundation', goal: 'Close the first slice.' },
+        { title: 'Delivery', goal: 'Start the next slice.' }
+      ]
+    });
+    projectId = project.id;
+    await updateProject(project.id, {
+      continuationPolicy: { mode: 'guided', autoQualitySweepOnPhaseComplete: true }
+    });
+    const phaseOneId = project.phases?.[0]?.id || '';
+    const run = await createRun({
+      projectId,
+      phaseId: phaseOneId,
+      title: 'phase-auto-sweep-run',
+      objective: 'finish phase one and trigger the sweep',
+      specText: '',
+      specFiles: '',
+      settings: { maxParallel: 1, maxTaskAttempts: 1, maxGoalLoops: 1 }
+    });
+    runId = run.id;
+
+    const statePath = path.join(root, 'runs', run.id, 'state.json');
+    const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+    state.status = 'completed';
+    state.updatedAt = '2026-04-05T09:10:00.000Z';
+    state.result = { goalAchieved: true, summary: 'Phase one finished cleanly.' };
+    state.tasks = [{
+      id: 'T001',
+      title: 'Close the slice',
+      goal: 'Land the finishing doc update',
+      dependsOn: [],
+      filesLikely: ['README.md'],
+      constraints: [],
+      acceptanceChecks: ['README updated'],
+      status: 'done',
+      attempts: 1,
+      findings: [],
+      reviewSummary: 'done',
+      checkpointNotes: [],
+      lastExecution: {
+        changedFiles: ['README.md'],
+        verification: { ok: true }
+      }
+    }];
+    await fs.writeFile(statePath, JSON.stringify(state, null, 2), 'utf8');
+
+    const updatedRun = await getRun(run.id);
+    const outcome = await maybeAutoAdvanceProjectPhase(await getProject(project.id), [updatedRun], { runId: run.id });
+    const refreshed = await getProject(project.id);
+
+    assert.equal(outcome.qualitySweepRan, true);
+    assert.ok(refreshed.maintenance?.latestQualitySweep?.sweepId, 'latest quality sweep should be recorded');
+  } finally {
+    await stopProjectSupervisor(projectId).catch(() => {});
+    if (runId) await deleteRun(runId).catch(() => {});
+    if (projectId) await deleteProject(projectId).catch(() => {});
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
 test('updateHarnessSettings persists the codex runtime profile', async () => {
   const originalSettings = await getHarnessSettings(root);
   try {
@@ -2415,6 +3640,67 @@ test('buildCodexExecArgs maps runtime profiles to codex CLI flags', () => {
   assert.ok(yoloArgs.includes('--dangerously-bypass-approvals-and-sandbox'));
   assert.ok(yoloArgs.includes('approval_policy="never"'));
   assert.ok(yoloArgs.includes('sandbox_mode="danger-full-access"'));
+
+  const sparkArgs = buildCodexExecArgs({
+    codexRuntimeProfile: 'yolo',
+    codexModel: 'gpt-5.3-codex-spark',
+    codexFastMode: false,
+    codexReasoningEffort: 'high',
+    codexServiceTier: 'fast'
+  }, 'spark.txt');
+  assert.ok(sparkArgs.includes('gpt-5.3-codex-spark'));
+  assert.ok(sparkArgs.includes('service_tier="default"'));
+});
+
+test('updateHarnessSettings persists Codex model and fast mode', async () => {
+  const originalSettings = await getHarnessSettings(root);
+  try {
+    const updated = await updateHarnessSettings({
+      ...originalSettings,
+      codexModel: 'gpt-5.3-codex-spark',
+      codexFastMode: false
+    });
+    assert.equal(updated.codexModel, 'gpt-5.3-codex-spark');
+    assert.equal(updated.codexFastMode, false);
+
+    const reloaded = await getHarnessSettings(root);
+    assert.equal(reloaded.codexModel, 'gpt-5.3-codex-spark');
+    assert.equal(reloaded.codexFastMode, false);
+  } finally {
+    await updateHarnessSettings(originalSettings);
+  }
+});
+
+test('createRun inherits Codex model and fast mode from harness settings', async () => {
+  let runId = '';
+  const originalSettings = await getHarnessSettings(root);
+  try {
+    await updateHarnessSettings({
+      ...originalSettings,
+      codexModel: 'gpt-5.3-codex-spark',
+      codexFastMode: false
+    });
+    const run = await createRun({
+      title: 'codex-model-fast-mode-inheritance',
+      projectPath: root,
+      objective: 'inherit Codex model settings',
+      presetId: 'greenfield-app',
+      specText: '',
+      specFiles: '',
+      settings: { maxParallel: 1, maxTaskAttempts: 1, maxGoalLoops: 1 }
+    });
+    runId = run.id;
+    assert.equal(run.settings.codexModel, 'gpt-5.3-codex-spark');
+    assert.equal(run.settings.codexFastMode, false);
+    assert.equal(run.settings.codexServiceTier, 'default');
+    assert.equal(run.harnessConfig.codexModel, 'gpt-5.3-codex-spark');
+    assert.equal(run.harnessConfig.codexFastMode, false);
+  } finally {
+    if (runId) {
+      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+    }
+    await updateHarnessSettings(originalSettings);
+  }
 });
 
 test('createRun lets project provider defaults override machine provider defaults', async () => {
@@ -2759,6 +4045,57 @@ test('stopRun writes a resume checkpoint artifact and checkpoint memory', async 
   }
 });
 
+test('stopRun checkpoint preserves invalid automatic replan diagnostics', async () => {
+  let runId = '';
+  try {
+    const run = await createRun({
+      title: 'checkpoint-replan-diagnostics-smoke',
+      projectPath: root,
+      objective: 'checkpoint replan diagnostics smoke',
+      specText: '',
+      specFiles: '',
+      settings: { maxParallel: 1, maxTaskAttempts: 1, maxGoalLoops: 1 }
+    });
+    runId = run.id;
+
+    const statePath = path.join(root, 'runs', run.id, 'state.json');
+    const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+    state.status = 'stopped';
+    state.autoReplan = {
+      lastRunAt: '2026-04-05T00:00:00.000Z',
+      latest: {
+        at: '2026-04-05T00:00:00.000Z',
+        applied: false,
+        pauseForHuman: false,
+        skipped: true,
+        driftRisk: 'medium',
+        summary: 'Skipped automatic replanning because the provider returned invalid JSON.',
+        pauseReason: '',
+        objectiveStillValid: true,
+        freshSessionRecommended: false,
+        changedTaskIds: [],
+        newTaskIds: [],
+        preserve: [],
+        whyNow: [],
+        parseError: 'JSON parse failed.',
+        rawSnippet: '{"shouldReplan":false'
+      }
+    };
+    await fs.writeFile(statePath, JSON.stringify(state, null, 2), 'utf8');
+
+    await stopRun(run.id);
+    const checkpoint = JSON.parse(await fs.readFile(path.join(root, 'runs', run.id, 'run-checkpoint.json'), 'utf8'));
+
+    assert.equal(checkpoint.autoReplan?.skipped, true);
+    assert.match(String(checkpoint.autoReplan?.parseError || ''), /JSON parse failed/);
+    assert.match(String(checkpoint.autoReplan?.rawSnippet || ''), /shouldReplan/);
+  } finally {
+    if (runId) {
+      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+    }
+  }
+});
+
 test('updatePlanDraft edits paused backlog while preserving completed tasks', async () => {
   let runId = '';
   try {
@@ -2923,6 +4260,293 @@ test('deleteProject removes project directory and optionally deletes project run
     if (memoryKey) {
       await fs.rm(path.join(root, 'memory', 'projects', memoryKey), { recursive: true, force: true }).catch(() => {});
     }
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('cronMatchesNow correctly matches standard cron expressions via autoProgress round-trip', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-cron-'));
+  let projectId = '';
+  try {
+    const proj = await createProject({ title: 'cron-test', rootPath: tempDir });
+    projectId = proj.id;
+    const updated = await updateProject(projectId, {
+      autoProgress: { enabled: true, scheduleEnabled: true, scheduleCron: '0 9 * * 1-5', pollIntervalMs: 60000 }
+    });
+    assert.equal(updated.defaultSettings.autoProgress.enabled, true);
+    assert.equal(updated.defaultSettings.autoProgress.scheduleEnabled, true);
+    assert.equal(updated.defaultSettings.autoProgress.scheduleCron, '0 9 * * 1-5');
+    assert.ok(updated.defaultSettings.autoProgress.pollIntervalMs >= 5000);
+  } finally {
+    if (projectId) await deleteProject(projectId).catch(() => {});
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('updateProject persists autoProgress settings correctly', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-autoprog-'));
+  let projectId = '';
+  try {
+    const proj = await createProject({ title: 'auto-progress-test', rootPath: tempDir });
+    projectId = proj.id;
+    const updated = await updateProject(projectId, {
+      autoProgress: { enabled: true, scheduleEnabled: true, scheduleCron: '*/30 * * * *', pollIntervalMs: 30000 }
+    });
+    assert.equal(updated.defaultSettings.autoProgress.enabled, true);
+    assert.equal(updated.defaultSettings.autoProgress.scheduleCron, '*/30 * * * *');
+    const disabled = await updateProject(projectId, { autoProgress: { enabled: false } });
+    assert.equal(disabled.defaultSettings.autoProgress.enabled, false);
+  } finally {
+    if (projectId) await deleteProject(projectId).catch(() => {});
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('autoChainOnComplete defaults to false unless explicitly set', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-autochain-default-'));
+  let projectId = '';
+  try {
+    const proj = await createProject({ title: 'autochain-default-test', rootPath: tempDir });
+    projectId = proj.id;
+    const updated = await updateProject(projectId, { continuationPolicy: { mode: 'guided' } });
+    assert.equal(updated.defaultSettings.continuationPolicy.autoChainOnComplete, false,
+      'autoChainOnComplete must default to false even when mode=guided');
+  } finally {
+    if (projectId) await deleteProject(projectId).catch(() => {});
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('stopRunChain marks chainStopped on run state', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-chain-'));
+  let projectId = '';
+  let runId = '';
+  try {
+    const proj = await createProject({ title: 'chain-stop-test', rootPath: tempDir });
+    projectId = proj.id;
+    const run = await createRun({
+      projectId, phaseId: proj.phases?.[0]?.id || '',
+      title: 'chain-test-run', objective: 'test auto-chain stop', specText: '', specFiles: ''
+    });
+    runId = run.id;
+    assert.equal(run.chainDepth ?? 0, 0);
+    assert.equal(run.chainedFromRunId ?? null, null);
+    const stopped = await stopRunChain(runId, { reason: 'unit test stop' });
+    assert.equal(stopped.chainMeta?.chainStopped, true);
+    assert.ok(String(stopped.chainMeta?.reason || '').includes('unit test stop'));
+  } finally {
+    if (runId) await deleteRun(runId).catch(() => {});
+    if (projectId) await deleteProject(projectId).catch(() => {});
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('startProjectSupervisor and stopProjectSupervisor update runtime state', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-supervisor-'));
+  let projectId = '';
+  try {
+    const proj = await createProject({ title: 'supervisor-test', rootPath: tempDir });
+    projectId = proj.id;
+    await updateProject(projectId, { autoProgress: { enabled: true, scheduleEnabled: false, scheduleCron: '' } });
+    const started = await startProjectSupervisor(projectId);
+    assert.equal(started.started, true);
+    assert.equal(started.projectId, projectId);
+    const status = getProjectSupervisorStatus(projectId);
+    assert.equal(status.running, true);
+    const stopped = await stopProjectSupervisor(projectId, { reason: 'test teardown' });
+    assert.equal(stopped.stopped, true);
+    const statusAfter = getProjectSupervisorStatus(projectId);
+    assert.equal(statusAfter.running, false);
+  } finally {
+    await stopProjectSupervisor(projectId).catch(() => {});
+    if (projectId) await deleteProject(projectId).catch(() => {});
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('supervisor immediate pass auto-pauses after repeated failed runs and exposes the failure pattern', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-supervisor-pause-'));
+  let projectId = '';
+  const runIds = [];
+  try {
+    const project = await createProject({
+      title: 'supervisor-pause-test',
+      rootPath: tempDir,
+      phases: [{ title: 'Foundation', goal: 'Recover from repeated failures.' }]
+    });
+    projectId = project.id;
+    await updateProject(projectId, {
+      autoProgress: {
+        enabled: true,
+        scheduleEnabled: false,
+        scheduleCron: '',
+        pauseOnRepeatedFailures: true,
+        maxConsecutiveFailures: 2
+      }
+    });
+    const phaseId = project.phases?.[0]?.id || '';
+
+    const seedFailedRun = async (title, updatedAt) => {
+      const run = await createRun({
+        projectId,
+        phaseId,
+        title,
+        objective: title,
+        specText: '',
+        specFiles: '',
+        settings: { maxParallel: 1, maxTaskAttempts: 1, maxGoalLoops: 1 }
+      });
+      runIds.push(run.id);
+      const statePath = path.join(root, 'runs', run.id, 'state.json');
+      const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+      state.status = 'failed';
+      state.updatedAt = updatedAt;
+      state.result = { goalAchieved: false, summary: 'Verification still fails.' };
+      state.tasks = [{
+        id: 'T001',
+        title,
+        goal: 'Fix the same failing path',
+        dependsOn: [],
+        filesLikely: ['src/auth/session-service.ts'],
+        constraints: [],
+        acceptanceChecks: ['npm test passes'],
+        status: 'failed',
+        attempts: 1,
+        findings: ['verification failed in auth session'],
+        reviewSummary: 'verification failed in auth session',
+        checkpointNotes: [],
+        lastExecution: {
+          changedFiles: ['src/auth/session-service.ts'],
+          verification: { ok: false, stderr: 'verification failed in auth session' },
+          acceptanceCheckResults: [{ check: 'npm test passes', status: 'fail', note: 'verification failed in auth session' }]
+        }
+      }];
+      await fs.writeFile(statePath, JSON.stringify(state, null, 2), 'utf8');
+    };
+
+    await seedFailedRun('failed-run-one', '2026-04-05T08:00:00.000Z');
+    await seedFailedRun('failed-run-two', '2026-04-05T09:00:00.000Z');
+
+    await startProjectSupervisor(projectId);
+    await triggerProjectSupervisorPass(projectId);
+    const status = getProjectSupervisorStatus(projectId);
+    const overview = await getProjectOverview(projectId);
+
+    assert.equal(status.running, false);
+    assert.match(String(overview.project.supervisorStatus?.runtime?.pausedReason || ''), /auto-paused after 2 consecutive failed runs/i);
+    assert.equal(overview.project.healthDashboard.repeatedFailures.warning, true);
+    assert.equal(overview.project.healthDashboard.repeatedFailures.consecutiveFailedRuns, 2);
+    assert.match(String(overview.project.healthDashboard.repeatedFailures.summary || ''), /repeated|반복/);
+  } finally {
+    await stopProjectSupervisor(projectId).catch(() => {});
+    for (const runId of runIds) {
+      await deleteRun(runId).catch(() => {});
+    }
+    if (projectId) await deleteProject(projectId).catch(() => {});
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('getProjectOverview includes supervisorStatus field', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-supervisor-overview-'));
+  let projectId = '';
+  try {
+    const proj = await createProject({ title: 'supervisor-overview-test', rootPath: tempDir });
+    projectId = proj.id;
+    await updateProject(projectId, {
+      autoProgress: { enabled: true, scheduleEnabled: true, scheduleCron: '0 8 * * *' }
+    });
+    const overview = await getProjectOverview(projectId);
+    assert.ok(overview.project.supervisorStatus, 'supervisorStatus must be present in overview');
+    assert.equal(overview.project.supervisorStatus.enabled, true);
+    assert.equal(overview.project.supervisorStatus.scheduleCron, '0 8 * * *');
+    assert.equal(typeof overview.project.supervisorStatus.active, 'boolean');
+    assert.equal(overview.project.supervisorStatus.pauseOnRepeatedFailures, true);
+    assert.equal(overview.project.supervisorStatus.maxConsecutiveFailures, 3);
+    assert.equal(typeof overview.project.supervisorStatus.nextScheduledAt, 'string');
+  } finally {
+    await stopProjectSupervisor(projectId).catch(() => {});
+    if (projectId) await deleteProject(projectId).catch(() => {});
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('stopRunChain API endpoint marks chain as stopped', async () => {
+  const server = await startHarnessServerForTest();
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-chain-api-'));
+  let projectId = '';
+  let runId = '';
+  try {
+    const proj = await createProject({ title: 'chain-api-test', rootPath: tempDir });
+    projectId = proj.id;
+    const run = await createRun({
+      projectId, phaseId: proj.phases?.[0]?.id || '',
+      title: 'chain-api-run', objective: 'test chain stop api', specText: '', specFiles: ''
+    });
+    runId = run.id;
+    const res = await fetch(`${server.baseUrl}/api/runs/${runId}/chain-stop`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ reason: 'api stop test' })
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.chainMeta?.chainStopped, true);
+    assert.ok(String(body.chainMeta?.reason || '').includes('api stop test'));
+  } finally {
+    await server.stop();
+    if (runId) await deleteRun(runId).catch(() => {});
+    if (projectId) await deleteProject(projectId).catch(() => {});
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('supervisor API endpoint starts and stops supervisor via HTTP', async () => {
+  const server = await startHarnessServerForTest();
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-supervisor-api-'));
+  let projectId = '';
+  try {
+    const proj = await createProject({ title: 'supervisor-api-test', rootPath: tempDir });
+    projectId = proj.id;
+    await updateProject(projectId, {
+      autoProgress: { enabled: true, scheduleEnabled: false, scheduleCron: '' }
+    });
+
+    // Start supervisor
+    const startRes = await fetch(`${server.baseUrl}/api/projects/${projectId}/supervisor`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'start' })
+    });
+    assert.equal(startRes.status, 200);
+    const startBody = await startRes.json();
+    assert.equal(startBody.started, true);
+    assert.equal(startBody.projectId, projectId);
+
+    // Stop supervisor
+    const stopRes = await fetch(`${server.baseUrl}/api/projects/${projectId}/supervisor`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'stop', reason: 'api test teardown' })
+    });
+    assert.equal(stopRes.status, 200);
+    const stopBody = await stopRes.json();
+    assert.equal(stopBody.stopped, true);
+
+    // Invalid action returns 400
+    const badRes = await fetch(`${server.baseUrl}/api/projects/${projectId}/supervisor`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'invalid' })
+    });
+    assert.equal(badRes.status, 400);
+    const badBody = await badRes.json();
+    assert.match(String(badBody.error || ''), /action must be/);
+    assert.equal(badBody.status, 400);
+    assert.ok(String(badBody.requestId || '').startsWith('req-'));
+  } finally {
+    await server.stop();
+    if (projectId) await deleteProject(projectId).catch(() => {});
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
 });

@@ -1,4 +1,120 @@
 (function attachHarnessModalActions(global) {
+  function buildStructuredSpecText(form) {
+    const sections = [
+      ['성공 조건', form.get('successCriteria')],
+      ['제외 범위', form.get('excludedScope')],
+      ['대상 사용자', form.get('targetUsers')],
+      ['예시 입력 / 출력', form.get('exampleIO')],
+      ['변경 금지 영역', form.get('protectedAreas')]
+    ].filter(([, value]) => String(value || '').trim());
+    return sections.map(([title, value]) => `## ${title}\n\n${String(value || '').trim()}`).join('\n\n');
+  }
+
+  function buildStructuredSpecTextFromDraft(draft = {}) {
+    const sections = [
+      ['성공 조건', draft.successCriteria],
+      ['제외 범위', draft.excludedScope]
+    ].filter(([, value]) => String(value || '').trim());
+    return sections.map(([title, value]) => `## ${title}\n\n${String(value || '').trim()}`).join('\n\n');
+  }
+
+  function buildProjectPayloadFromForm(form, options = {}) {
+    const draft = options?.draft || {};
+    const title = String(form.get('title') || '').trim() || String(draft.title || '').trim();
+    const rootPath = String(form.get('rootPath') || '').trim() || String(draft.rootPath || '').trim();
+    const charterText = String(form.get('charterText') || '').trim() || String(draft.charterText || '').trim();
+    const defaultPresetId = String(form.get('defaultPresetId') || '').trim() || String(draft.defaultPresetId || '').trim() || 'auto';
+    const phaseTitle = String(form.get('phaseTitle') || '').trim() || String(options?.preferDraftPhase ? draft.phaseTitle || '' : '').trim();
+    const phaseGoal = String(form.get('phaseGoal') || '').trim() || String(options?.preferDraftPhase ? draft.phaseGoal || '' : '').trim();
+    return {
+      title,
+      rootPath,
+      charterText,
+      defaultPresetId,
+      bootstrapRepoDocs: Boolean(form.get('bootstrapRepoDocs')),
+      phases: phaseTitle || phaseGoal
+        ? [{ id: 'P001', title: phaseTitle || 'Foundation', goal: phaseGoal, status: 'active' }]
+        : []
+    };
+  }
+
+  function buildStarterRunPayload(project, intake, deps = {}) {
+    const getRunPresetFormDefaults = deps?.getRunPresetFormDefaults || (() => ({ maxParallel: 1, maxTaskAttempts: 2, maxGoalLoops: 3 }));
+    const draft = intake?.starterRunDraft || {};
+    const presetId = draft.presetId || project?.defaultPresetId || 'auto';
+    const defaults = getRunPresetFormDefaults(presetId);
+    return {
+      title: draft.title || `${project?.title || 'project'}-intake`,
+      projectId: project?.id || '',
+      projectPath: intake?.rootPath || project?.rootPath || '',
+      presetId,
+      objective: draft.objective || '',
+      specText: buildStructuredSpecTextFromDraft(draft),
+      specFiles: draft.specFilesText || '',
+      settings: {
+        maxParallel: defaults.maxParallel,
+        maxTaskAttempts: defaults.maxTaskAttempts,
+        maxGoalLoops: defaults.maxGoalLoops
+      }
+    };
+  }
+
+  function buildProjectSettingsPayload(doc, deps = {}) {
+    const normalizeMaxChainDepth = deps?.normalizeMaxChainDepth || ((value) => Number(value) || 0);
+    const toolActions = String(doc.getElementById('project-settings-tool-actions')?.value || '')
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean);
+    const payload = {
+      charterText: doc.getElementById('project-settings-charter')?.value || '',
+      defaultPresetId: doc.getElementById('project-settings-preset')?.value || 'auto',
+      providerProfile: {
+        coordinationProvider: doc.getElementById('project-settings-coordination-provider')?.value || 'codex',
+        workerProvider: doc.getElementById('project-settings-worker-provider')?.value || 'codex'
+      },
+      toolProfile: {
+        id: doc.getElementById('project-settings-tool-id')?.value || 'default',
+        label: doc.getElementById('project-settings-tool-label')?.value || 'Default',
+        allowedActionClasses: toolActions
+      },
+      browserVerification: {
+        url: doc.getElementById('project-settings-browser-url')?.value || ''
+      },
+      devServer: {
+        command: doc.getElementById('project-settings-dev-command')?.value || ''
+      },
+      continuationPolicy: {
+        mode: doc.getElementById('project-settings-continuation-mode')?.value || 'guided',
+        autoChainOnComplete: doc.getElementById('project-settings-auto-chain')?.checked === true,
+        autoQualitySweepOnPhaseComplete: doc.getElementById('project-settings-auto-sweep')?.checked === true,
+        keepDocsInSync: doc.getElementById('project-settings-doc-sync')?.checked !== false,
+        maxChainDepth: normalizeMaxChainDepth(doc.getElementById('project-settings-max-chain-depth')?.value || '')
+      },
+      autoProgress: {
+        enabled: doc.getElementById('project-settings-supervisor-enabled')?.checked === true,
+        scheduleEnabled: doc.getElementById('project-settings-schedule-enabled')?.checked === true,
+        scheduleCron: doc.getElementById('project-settings-schedule-cron')?.value?.trim() || '',
+        pollIntervalMs: Math.max(5000, Number(doc.getElementById('project-settings-poll-interval')?.value || 30000) || 30000)
+      }
+    };
+    const runLoopEnabled = doc.getElementById('project-settings-run-loop-enabled')?.checked === true;
+    if (runLoopEnabled) {
+      payload.continuationPolicy.runLoop = {
+        enabled: true,
+        mode: doc.getElementById('project-settings-run-loop-mode')?.value || 'repeat-count',
+        maxRuns: Math.max(1, Number(doc.getElementById('project-settings-run-loop-max-runs')?.value || 3) || 3),
+        maxConsecutiveFailures: Math.max(1, Number(doc.getElementById('project-settings-run-loop-max-failures')?.value || 3) || 3)
+      };
+    }
+    const pauseOnRepeatedFailures = doc.getElementById('project-settings-pause-on-failures')?.checked !== false;
+    const maxConsecutiveFailures = Math.max(1, Number(doc.getElementById('project-settings-max-failures')?.value || 3) || 3);
+    if (!pauseOnRepeatedFailures || maxConsecutiveFailures !== 3) {
+      payload.autoProgress.pauseOnRepeatedFailures = pauseOnRepeatedFailures;
+      payload.autoProgress.maxConsecutiveFailures = maxConsecutiveFailures;
+    }
+    return payload;
+  }
+
   function createModalActions(deps) {
     const pickText = global.HarnessUiHelpers?.pickText || ((ko, en = '') => String(ko || en || ''));
     const t = (ko, en = '') => pickText(ko, en);
@@ -40,9 +156,10 @@
       renderCreateRunContext,
       renderDraftDiagnostics,
       setDraftDiagnostics,
-      buildProjectPayloadFromForm,
-      buildStarterRunPayload,
+      getRunPresetFormDefaults,
+      normalizeMaxChainDepth,
       refreshProjects,
+      refreshProjectOverview,
       refreshRuns,
       selectRun,
       selectProject
@@ -110,6 +227,8 @@
       document.getElementById('coordination-provider').value = normalizeAgentModel(harnessSettings.coordinationProvider, 'codex');
       document.getElementById('worker-provider').value = normalizeAgentModel(harnessSettings.workerProvider, 'codex');
       document.getElementById('codex-runtime-profile').value = String(harnessSettings.codexRuntimeProfile || 'yolo').trim() || 'yolo';
+      document.getElementById('codex-model').value = String(harnessSettings.codexModel || 'gpt-5.4').trim() || 'gpt-5.4';
+      document.getElementById('codex-fast-mode').checked = harnessSettings.codexFastMode !== false;
       document.getElementById('ui-language').value = String(harnessSettings.uiLanguage || 'en').trim() || 'en';
       document.getElementById('agent-language').value = String(harnessSettings.agentLanguage || 'en').trim() || 'en';
       document.getElementById('codex-notes').value = harnessSettings.codexNotes || '';
@@ -319,7 +438,7 @@
         const project = await request('/api/projects', { method: 'POST', body: JSON.stringify(projectPayload) });
         const run = await request('/api/runs', {
           method: 'POST',
-          body: JSON.stringify(buildStarterRunPayload(project, projectIntake))
+          body: JSON.stringify(buildStarterRunPayload(project, projectIntake, { getRunPresetFormDefaults }))
         });
         closeCreateProjectModal();
         await refreshProjects();
@@ -388,6 +507,25 @@
       renderProjectIntake();
     }
 
+    async function saveProjectSettings() {
+      const selectedProjectId = typeof getSelectedProjectId === 'function' ? getSelectedProjectId() : '';
+      if (!selectedProjectId) return;
+      const payload = buildProjectSettingsPayload(document, { normalizeMaxChainDepth });
+      await runUiAction('save-project-settings', async () => {
+        await request(`/api/projects/${selectedProjectId}`, {
+          method: 'POST',
+          body: JSON.stringify(payload)
+        });
+        if (typeof refreshProjectOverview === 'function') {
+          await refreshProjectOverview(selectedProjectId, { render: false });
+        }
+        await refreshProjects();
+        if (typeof global.renderDetail === 'function') {
+          global.renderDetail();
+        }
+      }, t('프로젝트 기본 설정을 저장했습니다.', 'Saved the project defaults.'));
+    }
+
     function attachFormHandlers() {
       document.getElementById('apply-strategy-template-btn').addEventListener('click', () => {
         applyStrategyTemplatePreset();
@@ -405,6 +543,8 @@
             coordinationProvider: document.getElementById('coordination-provider').value,
             workerProvider: document.getElementById('worker-provider').value,
             codexRuntimeProfile: document.getElementById('codex-runtime-profile').value,
+            codexModel: document.getElementById('codex-model').value,
+            codexFastMode: document.getElementById('codex-fast-mode').checked,
             uiLanguage: document.getElementById('ui-language').value,
             agentLanguage: document.getElementById('agent-language').value,
             codexNotes: document.getElementById('codex-notes').value,
@@ -484,6 +624,12 @@
       openStarterRunFromIntake,
       createProjectAndStarterRunFromIntake,
       applyStrategyTemplatePreset,
+      buildStructuredSpecText,
+      buildStructuredSpecTextFromDraft,
+      buildProjectPayloadFromForm,
+      buildStarterRunPayload: (project, intake) => buildStarterRunPayload(project, intake, { getRunPresetFormDefaults }),
+      buildProjectSettingsPayload: () => buildProjectSettingsPayload(document, { normalizeMaxChainDepth }),
+      saveProjectSettings,
       openCreateModal,
       closeCreateModal,
       openCreateProjectModal,
@@ -492,6 +638,11 @@
   }
 
   global.HarnessUiModalActions = {
-    createModalActions
+    createModalActions,
+    buildStructuredSpecText,
+    buildStructuredSpecTextFromDraft,
+    buildProjectPayloadFromForm,
+    buildStarterRunPayload,
+    buildProjectSettingsPayload
   };
 })(window);

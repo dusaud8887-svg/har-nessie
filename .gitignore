@@ -5,8 +5,8 @@ node_modules/
 # claude code project settings (machine-local)
 .claude/
 
-# local harness machine settings
-.harness-web/settings.json
+# local harness machine state
+.harness-web/**
 
 # local run and project state
 runs/**

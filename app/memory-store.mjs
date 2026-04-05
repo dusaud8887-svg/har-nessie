@@ -1,5 +1,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { GRAPH_INTELLIGENCE_DEFAULTS } from './run-config.mjs';
+import { createRuntimeObservability } from './runtime-observability.mjs';
 
 let DatabaseSync = null;
 try {
@@ -7,9 +9,12 @@ try {
 } catch {}
 
 const indexStateCache = new Map();
+const rootObservabilityCache = new Map();
+const projectWriteLocks = new Map();
 const MEMORY_RECENCY_HALF_LIFE_DAYS = 21;
 const GRAPH_RECENCY_HALF_LIFE_DAYS = 14;
 const MEMORY_RECENCY_FLOOR = 0.18;
+const MEMORY_WRITE_LOCK_TIMEOUT_MS = 30_000;
 
 function now() {
   return new Date().toISOString();
@@ -129,6 +134,56 @@ function projectPaths(rootDir, projectKey) {
     indexFile: path.join(baseDir, 'memory.sqlite'),
     legacyFile: path.join(rootDir, 'memory', 'projects', `${projectKey}.md`)
   };
+}
+
+function rootObservability(rootDir) {
+  const normalizedRoot = path.resolve(String(rootDir || '.'));
+  const existing = rootObservabilityCache.get(normalizedRoot);
+  if (existing) return existing;
+  const observability = createRuntimeObservability({
+    metaDir: path.join(normalizedRoot, '.harness-web'),
+    now
+  });
+  rootObservabilityCache.set(normalizedRoot, observability);
+  return observability;
+}
+
+async function withProjectWriteLock(projectKey, action) {
+  const lockKey = String(projectKey || '').trim() || 'memory';
+  const previous = projectWriteLocks.get(lockKey) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => {
+    release = resolve;
+  });
+  const next = previous.then(() => current);
+  projectWriteLocks.set(lockKey, next);
+  let timeoutHandle = null;
+  try {
+    await Promise.race([
+      previous,
+      new Promise((_, reject) => {
+        timeoutHandle = setTimeout(() => reject(new Error(`Timed out waiting for memory write lock: ${lockKey}`)), MEMORY_WRITE_LOCK_TIMEOUT_MS);
+      })
+    ]);
+    return await action();
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+    release();
+    if (projectWriteLocks.get(lockKey) === next) {
+      projectWriteLocks.delete(lockKey);
+    }
+  }
+}
+
+async function writeProjectMemory(rootDir, projectKey, scope, action) {
+  return withProjectWriteLock(projectKey, async () => {
+    try {
+      return await action();
+    } catch (error) {
+      await rootObservability(rootDir).recordHarnessError(scope, error, { projectKey });
+      throw error;
+    }
+  });
 }
 
 async function migrateLegacyMemory(paths, meta) {
@@ -696,7 +751,7 @@ function fallbackSearch(docs, query, limit) {
   }));
 }
 
-function scoreArtifactRecord(record, searchContext, options = {}) {
+export function scoreArtifactRecord(record, searchContext, options = {}) {
   const queryTokens = Array.isArray(searchContext?.queryTokens) ? searchContext.queryTokens : [];
   const filesLikely = Array.isArray(searchContext?.filesLikely) ? searchContext.filesLikely : [];
   const relatedFiles = Array.isArray(searchContext?.relatedFiles) ? searchContext.relatedFiles : [];
@@ -704,6 +759,10 @@ function scoreArtifactRecord(record, searchContext, options = {}) {
   const keywords = uniqueStrings(record.keywords).map((token) => token.toLowerCase());
   const recordSymbols = uniqueStrings(record.symbolHints).map((token) => token.toLowerCase());
   const graphSymbols = uniqueStrings(record.graphSymbols).map((token) => token.toLowerCase());
+  const rootCauseVariants = variantEntriesFromRecord(record, 'rootCause', 'rootCauseVariants', 'rootCauseVariantCounts')
+    .map((entry) => ({ ...entry, valueLower: String(entry.value || '').toLowerCase() }));
+  const summaryVariants = variantEntriesFromRecord(record, 'summary', 'summaryVariants', 'summaryVariantCounts')
+    .map((entry) => ({ ...entry, valueLower: String(entry.value || '').toLowerCase() }));
   const recordFiles = uniqueStrings([
     ...(record.filesLikely || []),
     ...(record.changedFiles || []),
@@ -714,6 +773,8 @@ function scoreArtifactRecord(record, searchContext, options = {}) {
     record.summary,
     record.graphSummary,
     record.rootCause,
+    ...(record.summaryVariants || []),
+    ...(record.rootCauseVariants || []),
     ...(record.acceptanceFailures || []),
     ...keywords,
     ...recordSymbols,
@@ -727,6 +788,10 @@ function scoreArtifactRecord(record, searchContext, options = {}) {
     if (!token) continue;
     if (keywords.includes(token)) score += 18;
     if (haystack.includes(token)) score += 8;
+    const rootCauseMatch = rootCauseVariants.find((entry) => entry.valueLower.includes(token));
+    if (rootCauseMatch) score += Math.min(14, 6 + (rootCauseMatch.count * 2));
+    const summaryMatch = summaryVariants.find((entry) => entry.valueLower.includes(token));
+    if (summaryMatch) score += Math.min(10, 4 + (summaryMatch.count * 2));
   }
   if (options.taskId && String(record.taskId || '') === String(options.taskId || '')) score += 18;
   if (options.stage && String(record.stage || '') === String(options.stage || '')) score += 10;
@@ -738,6 +803,7 @@ function scoreArtifactRecord(record, searchContext, options = {}) {
   if ((record.outOfScopeFiles || []).length) score += 10;
   if (String(record.decision || '') === 'retry') score += 8;
   if (String(record.decision || '') === 'failed') score += 10;
+  score += Math.min(12, (recordOccurrenceCount(record) - 1) * 3);
   score += Math.round(recencyWeightForRecord(record, {
     halfLifeDays: MEMORY_RECENCY_HALF_LIFE_DAYS,
     floor: MEMORY_RECENCY_FLOOR
@@ -794,8 +860,86 @@ function artifactSemanticKey(record) {
     rootCause || summary,
     normalizedFiles,
     acceptance,
-    uniqueStrings(record.graphEdges).slice(0, 3).join('|')
+    uniqueStrings(record.graphEdges).slice(0, 3).join('|'),
+    uniqueStrings(record.graphSymbols).slice(0, 4).join('|')
   ].join('::');
+}
+
+function recordOccurrenceCount(record) {
+  return Math.max(1, Number(record?.occurrenceCount || 1));
+}
+
+function normalizeVariantText(value) {
+  return cleanup(value || '');
+}
+
+function variantCountMapFromRecord(record, singleKey, listKey, countKey) {
+  const counts = new Map();
+  const rawCounts = record?.[countKey];
+  const hasExplicitCounts = rawCounts && typeof rawCounts === 'object' && !Array.isArray(rawCounts);
+  if (hasExplicitCounts) {
+    for (const [key, value] of Object.entries(rawCounts)) {
+      const normalizedKey = normalizeVariantText(key);
+      const numericValue = Math.max(0, Number(value || 0));
+      if (normalizedKey && numericValue > 0) counts.set(normalizedKey, numericValue);
+    }
+  }
+  const primary = normalizeVariantText(record?.[singleKey] || '');
+  if (primary) {
+    counts.set(primary, Math.max(counts.get(primary) || 0, hasExplicitCounts ? 1 : recordOccurrenceCount(record)));
+  }
+  for (const value of Array.isArray(record?.[listKey]) ? record[listKey] : []) {
+    const normalized = normalizeVariantText(value);
+    if (!normalized) continue;
+    counts.set(normalized, Math.max(counts.get(normalized) || 0, 1));
+  }
+  return counts;
+}
+
+function serializeVariantCountMap(countMap) {
+  return Object.fromEntries(
+    [...countMap.entries()]
+      .filter(([key, value]) => key && Number(value || 0) > 0)
+      .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+  );
+}
+
+function mergeVariantCounts(base, incoming, singleKey, listKey, countKey) {
+  const merged = variantCountMapFromRecord(base, singleKey, listKey, countKey);
+  for (const [key, value] of variantCountMapFromRecord(incoming, singleKey, listKey, countKey).entries()) {
+    merged.set(key, (merged.get(key) || 0) + Number(value || 0));
+  }
+  return serializeVariantCountMap(merged);
+}
+
+function variantEntriesFromRecord(record, singleKey, listKey, countKey) {
+  return Object.entries(serializeVariantCountMap(variantCountMapFromRecord(record, singleKey, listKey, countKey)))
+    .map(([value, count]) => ({
+      value,
+      count: Math.max(1, Number(count || 0))
+    }));
+}
+
+function mergeCompactedArtifactRecord(base, incoming) {
+  const rootCauseVariantCounts = mergeVariantCounts(base, incoming, 'rootCause', 'rootCauseVariants', 'rootCauseVariantCounts');
+  const summaryVariantCounts = mergeVariantCounts(base, incoming, 'summary', 'summaryVariants', 'summaryVariantCounts');
+  return {
+    ...base,
+    filesLikely: uniqueStrings([...(base.filesLikely || []), ...(incoming.filesLikely || [])]),
+    changedFiles: uniqueStrings([...(base.changedFiles || []), ...(incoming.changedFiles || [])]),
+    outOfScopeFiles: uniqueStrings([...(base.outOfScopeFiles || []), ...(incoming.outOfScopeFiles || [])]),
+    acceptanceFailures: uniqueStrings([...(base.acceptanceFailures || []), ...(incoming.acceptanceFailures || [])]),
+    symbolHints: uniqueStrings([...(base.symbolHints || []), ...(incoming.symbolHints || [])]),
+    graphEdges: uniqueStrings([...(base.graphEdges || []), ...(incoming.graphEdges || [])]),
+    graphSymbols: uniqueStrings([...(base.graphSymbols || []), ...(incoming.graphSymbols || [])]),
+    keywords: uniqueStrings([...(base.keywords || []), ...(incoming.keywords || [])]),
+    occurrenceCount: recordOccurrenceCount(base) + recordOccurrenceCount(incoming),
+    rootCauseVariants: Object.keys(rootCauseVariantCounts),
+    rootCauseVariantCounts,
+    summaryVariants: Object.keys(summaryVariantCounts),
+    summaryVariantCounts,
+    createdAtHistory: uniqueStrings([...(base.createdAtHistory || []), base.createdAt || '', ...(incoming.createdAtHistory || []), incoming.createdAt || '']).sort()
+  };
 }
 
 function buildGraphMemory(taskCodeContext = null) {
@@ -823,6 +967,90 @@ function buildGraphMemory(taskCodeContext = null) {
   };
 }
 
+function parseGraphEdgeToken(edge = '') {
+  const raw = String(edge || '').trim();
+  if (!raw.includes('->')) return null;
+  const [sourcePart, restPart] = raw.split('->');
+  const [targetPart, symbolPart = ''] = String(restPart || '').split('#');
+  const source = String(sourcePart || '').trim();
+  const target = String(targetPart || '').trim();
+  if (!source || !target) return null;
+  const importedSymbols = String(symbolPart || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return {
+    source,
+    target,
+    importedSymbols
+  };
+}
+
+export function buildPropagatedGraphInsights(edgeCounts = new Map()) {
+  const adjacency = new Map();
+  const nodeWeights = new Map();
+  for (const [edge, stats] of edgeCounts.entries()) {
+    const parsed = parseGraphEdgeToken(edge);
+    if (!parsed) continue;
+    const edgeWeight = Number(stats?.weight || 0);
+    if (!adjacency.has(parsed.source)) adjacency.set(parsed.source, []);
+    adjacency.get(parsed.source).push({
+      ...parsed,
+      weight: edgeWeight
+    });
+    addWeightedCount(nodeWeights, parsed.source, edgeWeight);
+    addWeightedCount(nodeWeights, parsed.target, edgeWeight);
+  }
+  const propagatedPathCounts = new Map();
+  const propagatedSymbolCounts = new Map();
+  const propagatedNodeCounts = new Map();
+  const damping = Number(GRAPH_INTELLIGENCE_DEFAULTS?.propagation?.damping || 0.62);
+  const maxDepth = Math.max(1, Number(GRAPH_INTELLIGENCE_DEFAULTS?.propagation?.maxDepth || 3) || 3);
+
+  for (const [startNode, edges] of adjacency.entries()) {
+    for (const edge of edges) {
+      const stack = [{
+        current: edge.target,
+        score: Number(edge.weight || 0),
+        path: [startNode, edge.target],
+        importedSymbols: edge.importedSymbols || [],
+        depth: 1
+      }];
+      while (stack.length) {
+        const current = stack.pop();
+        if (!current || current.score <= 0) continue;
+        const pathKey = current.path.join(' -> ');
+        addWeightedCount(propagatedPathCounts, pathKey, current.score);
+        addWeightedCount(propagatedNodeCounts, current.current, current.score);
+        for (const symbol of current.importedSymbols || []) {
+          addWeightedCount(propagatedSymbolCounts, symbol, current.score);
+        }
+        if (current.depth >= maxDepth) continue;
+        const nextEdges = adjacency.get(current.current) || [];
+        for (const nextEdge of nextEdges) {
+          if (current.path.includes(nextEdge.target)) continue;
+          stack.push({
+            current: nextEdge.target,
+            score: current.score * Number(nextEdge.weight || 0) * damping,
+            path: [...current.path, nextEdge.target],
+            importedSymbols: nextEdge.importedSymbols || [],
+            depth: current.depth + 1
+          });
+        }
+      }
+    }
+  }
+
+  return {
+    nodeCount: nodeWeights.size,
+    edgeCount: edgeCounts.size,
+    propagation: { damping, maxDepth },
+    topPaths: topWeightedEntries(propagatedPathCounts, 'path', 4),
+    propagatedFiles: topWeightedEntries(propagatedNodeCounts, 'filePath', 4),
+    propagatedSymbols: topWeightedEntries(propagatedSymbolCounts, 'symbol', 6)
+  };
+}
+
 function buildGraphInsights(records = []) {
   const recent = [...(Array.isArray(records) ? records : [])]
     .sort((left, right) => timestampMs(right.createdAt || right.updatedAt || '') - timestampMs(left.createdAt || left.updatedAt || ''))
@@ -834,18 +1062,37 @@ function buildGraphInsights(records = []) {
       halfLifeDays: GRAPH_RECENCY_HALF_LIFE_DAYS,
       floor: 0.12
     });
+    const weightedOccurrence = weight * recordOccurrenceCount(record);
     for (const edge of record.graphEdges || []) {
-      addWeightedCount(edgeCounts, edge, weight);
+      addWeightedCount(edgeCounts, edge, weightedOccurrence);
     }
     for (const symbol of record.graphSymbols || []) {
-      addWeightedCount(symbolCounts, symbol, weight);
+      addWeightedCount(symbolCounts, symbol, weightedOccurrence);
     }
   }
+  const propagated = buildPropagatedGraphInsights(edgeCounts);
   return {
     decayHalfLifeDays: GRAPH_RECENCY_HALF_LIFE_DAYS,
+    propagation: propagated.propagation,
     topEdges: topWeightedEntries(edgeCounts, 'edge', 6),
-    topSymbols: topWeightedEntries(symbolCounts, 'symbol', 8)
+    topSymbols: topWeightedEntries(symbolCounts, 'symbol', 8),
+    nodeCount: propagated.nodeCount,
+    edgeCount: propagated.edgeCount,
+    topPaths: propagated.topPaths,
+    propagatedFiles: propagated.propagatedFiles,
+    propagatedSymbols: propagated.propagatedSymbols
   };
+}
+
+function rootCauseAnalyticsEntries(record) {
+  const entries = variantEntriesFromRecord(record, 'rootCause', 'rootCauseVariants', 'rootCauseVariantCounts');
+  const hasExplicitRootCauseCounts = record?.rootCauseVariantCounts && typeof record.rootCauseVariantCounts === 'object' && !Array.isArray(record.rootCauseVariantCounts);
+  return entries.map((entry) => ({
+    ...entry,
+    boostedCount: !hasExplicitRootCauseCounts && entries.length > 1
+      ? Math.max(entry.count, recordOccurrenceCount(record))
+      : entry.count
+  }));
 }
 
 function buildTemporalInsights(records = []) {
@@ -865,16 +1112,19 @@ function buildTemporalInsights(records = []) {
       halfLifeDays: MEMORY_RECENCY_HALF_LIFE_DAYS,
       floor: MEMORY_RECENCY_FLOOR
     });
-    totalWeight += weight;
-    if (createdAtMs >= recentCutoff) recentWeight += weight;
+    const weightedOccurrence = weight * recordOccurrenceCount(record);
+    totalWeight += weightedOccurrence;
+    if (createdAtMs >= recentCutoff) recentWeight += weightedOccurrence;
     if (!newestArtifactAt || createdAtMs > timestampMs(newestArtifactAt)) {
       newestArtifactAt = record.createdAt || record.updatedAt || newestArtifactAt;
     }
-    addWeightedCount(decisionCounts, record.decision || 'unknown', weight);
+    addWeightedCount(decisionCounts, record.decision || 'unknown', weightedOccurrence);
     for (const filePath of [...(record.changedFiles || []), ...(record.outOfScopeFiles || []), ...(record.filesLikely || [])]) {
-      addWeightedCount(fileCounts, filePath, weight);
+      addWeightedCount(fileCounts, filePath, weightedOccurrence);
     }
-    addWeightedCount(rootCauseCounts, record.rootCause || '', weight);
+    for (const entry of rootCauseAnalyticsEntries(record)) {
+      addWeightedCount(rootCauseCounts, entry.value, weightedOccurrence * entry.boostedCount);
+    }
   }
 
   return {
@@ -891,16 +1141,31 @@ function buildTemporalInsights(records = []) {
 function compactArtifactRecords(records) {
   const sorted = [...records].sort((left, right) => (Date.parse(right.createdAt || right.updatedAt || '') || 0) - (Date.parse(left.createdAt || left.updatedAt || '') || 0));
   const deduped = [];
-  const seen = new Set();
+  const seen = new Map();
   for (const record of sorted) {
     const semanticKey = artifactSemanticKey(record);
-    if (!semanticKey || seen.has(semanticKey)) continue;
-    seen.add(semanticKey);
-    deduped.push({
+    if (!semanticKey) continue;
+    const existingIndex = seen.get(semanticKey);
+    if (existingIndex != null) {
+      deduped[existingIndex] = mergeCompactedArtifactRecord(deduped[existingIndex], record);
+      continue;
+    }
+    const compacted = {
       ...record,
       schemaVersion: String(record.schemaVersion || '2'),
-      compactionKey: semanticKey
-    });
+      compactionKey: semanticKey,
+      occurrenceCount: recordOccurrenceCount(record),
+      rootCauseVariants: uniqueStrings([
+        record.rootCause || '',
+        ...variantEntriesFromRecord(record, 'rootCause', 'rootCauseVariants', 'rootCauseVariantCounts').map((entry) => entry.value)
+      ]),
+      rootCauseVariantCounts: serializeVariantCountMap(variantCountMapFromRecord(record, 'rootCause', 'rootCauseVariants', 'rootCauseVariantCounts')),
+      summaryVariants: uniqueStrings([record.summary || '']),
+      summaryVariantCounts: serializeVariantCountMap(variantCountMapFromRecord(record, 'summary', 'summaryVariants', 'summaryVariantCounts')),
+      createdAtHistory: uniqueStrings([record.createdAt || '']).sort()
+    };
+    seen.set(semanticKey, deduped.length);
+    deduped.push(compacted);
   }
   deduped.sort((left, right) => (Date.parse(left.createdAt || left.updatedAt || '') || 0) - (Date.parse(right.createdAt || right.updatedAt || '') || 0));
   return {
@@ -928,6 +1193,8 @@ async function searchArtifactRecords(paths, query, limit, options = {}, records 
         record.summary,
         record.graphSummary,
         record.rootCause,
+        ...(record.rootCauseVariants || []),
+        ...(record.summaryVariants || []),
         ...(record.acceptanceFailures || []),
         ...(record.symbolHints || []),
         ...(record.graphSymbols || []),
@@ -952,6 +1219,8 @@ async function searchArtifactRecords(paths, query, limit, options = {}, records 
       record.summary,
       record.graphSummary,
       record.rootCause,
+      ...(record.rootCauseVariants || []).slice(1, 3),
+      ...(record.summaryVariants || []).slice(1, 2),
       ...(record.acceptanceFailures || []),
       ...(record.outOfScopeFiles || []),
       ...(record.graphEdges || []).slice(0, 2)
@@ -964,6 +1233,7 @@ async function searchArtifactRecords(paths, query, limit, options = {}, records 
       source: 'artifact-record',
       score,
       recencyWeight: recencyWeightForRecord(record),
+      occurrenceCount: recordOccurrenceCount(record),
       verificationOk: record.verificationOk !== false,
       matchedFiles: uniqueStrings(record.filesLikely).slice(0, 4),
       matchedSymbols: uniqueStrings([...(record.symbolHints || []), ...(record.graphSymbols || [])]).slice(0, 4),
@@ -988,41 +1258,50 @@ function buildFailureAnalytics(records) {
       halfLifeDays: MEMORY_RECENCY_HALF_LIFE_DAYS,
       floor: MEMORY_RECENCY_FLOOR
     });
+    const weightedOccurrence = weight * recordOccurrenceCount(record);
     for (const check of record.acceptanceFailures || []) {
-      addWeightedCount(acceptanceCounts, check, weight);
+      addWeightedCount(acceptanceCounts, check, weightedOccurrence);
     }
     for (const filePath of [...(record.outOfScopeFiles || []), ...(record.changedFiles || [])]) {
-      addWeightedCount(fileCounts, filePath, weight);
+      addWeightedCount(fileCounts, filePath, weightedOccurrence);
     }
-    addWeightedCount(rootCauseCounts, record.rootCause || '', weight);
-    addWeightedCount(stageCounts, record.stage || 'unknown', weight);
+    for (const entry of rootCauseAnalyticsEntries(record)) {
+      addWeightedCount(rootCauseCounts, entry.value, weightedOccurrence * entry.boostedCount);
+    }
+    addWeightedCount(stageCounts, record.stage || 'unknown', weightedOccurrence);
   }
 
   const recentFailure = [...records]
     .filter((record) => String(record.decision || '') === 'retry' || record.verificationOk === false || (record.outOfScopeFiles || []).length)
     .sort((left, right) => (Date.parse(right.createdAt || '') || 0) - (Date.parse(left.createdAt || '') || 0))[0] || null;
+  const totalArtifacts = records.reduce((sum, record) => sum + recordOccurrenceCount(record), 0);
+  const retryCount = retryRecords.reduce((sum, record) => sum + recordOccurrenceCount(record), 0);
+  const verificationFailures = failedVerification.reduce((sum, record) => sum + recordOccurrenceCount(record), 0);
+  const scopeDriftCount = scopeDrift.reduce((sum, record) => sum + recordOccurrenceCount(record), 0);
 
   return {
-    totalArtifacts: records.length,
-    retryCount: retryRecords.length,
-    verificationFailures: failedVerification.length,
-    scopeDriftCount: scopeDrift.length,
+    totalArtifacts,
+    retryCount,
+    verificationFailures,
+    scopeDriftCount,
     decayHalfLifeDays: MEMORY_RECENCY_HALF_LIFE_DAYS,
-    retryPressure: Number(retryRecords.reduce((sum, record) => sum + recencyWeightForRecord(record), 0).toFixed(3)),
-    verificationPressure: Number(failedVerification.reduce((sum, record) => sum + recencyWeightForRecord(record), 0).toFixed(3)),
-    scopeDriftPressure: Number(scopeDrift.reduce((sum, record) => sum + recencyWeightForRecord(record), 0).toFixed(3)),
+    retryPressure: Number(retryRecords.reduce((sum, record) => sum + (recencyWeightForRecord(record) * recordOccurrenceCount(record)), 0).toFixed(3)),
+    verificationPressure: Number(failedVerification.reduce((sum, record) => sum + (recencyWeightForRecord(record) * recordOccurrenceCount(record)), 0).toFixed(3)),
+    scopeDriftPressure: Number(scopeDrift.reduce((sum, record) => sum + (recencyWeightForRecord(record) * recordOccurrenceCount(record)), 0).toFixed(3)),
     topAcceptanceFailures: topWeightedEntries(acceptanceCounts, 'check', 4),
     topFailureFiles: topWeightedEntries(fileCounts, 'filePath', 4),
     topRootCauses: topWeightedEntries(rootCauseCounts, 'reason', 4),
     stageFailures: topWeightedEntries(stageCounts, 'stage', 4),
     longHorizon: {
       windowDays: 14,
-      totalFailures: retryRecords.length + failedVerification.length + scopeDrift.length,
-      retryRate: records.length ? Number((retryRecords.length / records.length).toFixed(3)) : 0,
-      recentFailures: recentRecords.filter((record) => String(record.decision || '') === 'retry' || record.verificationOk === false || (record.outOfScopeFiles || []).length).length,
+      totalFailures: retryCount + verificationFailures + scopeDriftCount,
+      retryRate: totalArtifacts ? Number((retryCount / totalArtifacts).toFixed(3)) : 0,
+      recentFailures: recentRecords
+        .filter((record) => String(record.decision || '') === 'retry' || record.verificationOk === false || (record.outOfScopeFiles || []).length)
+        .reduce((sum, record) => sum + recordOccurrenceCount(record), 0),
       recentFailurePressure: Number(recentRecords
         .filter((record) => String(record.decision || '') === 'retry' || record.verificationOk === false || (record.outOfScopeFiles || []).length)
-        .reduce((sum, record) => sum + recencyWeightForRecord(record), 0)
+        .reduce((sum, record) => sum + (recencyWeightForRecord(record) * recordOccurrenceCount(record)), 0)
         .toFixed(3))
     },
     recentFailure: recentFailure
@@ -1041,13 +1320,14 @@ function buildTraceSummary(records) {
   const stageCounts = new Map();
   const decisionCounts = new Map();
   for (const record of records) {
-    stageCounts.set(record.stage || 'unknown', (stageCounts.get(record.stage || 'unknown') || 0) + 1);
-    decisionCounts.set(record.decision || 'unknown', (decisionCounts.get(record.decision || 'unknown') || 0) + 1);
+    const occurrenceCount = recordOccurrenceCount(record);
+    stageCounts.set(record.stage || 'unknown', (stageCounts.get(record.stage || 'unknown') || 0) + occurrenceCount);
+    decisionCounts.set(record.decision || 'unknown', (decisionCounts.get(record.decision || 'unknown') || 0) + occurrenceCount);
   }
   const latest = [...records]
     .sort((left, right) => (Date.parse(right.createdAt || '') || 0) - (Date.parse(left.createdAt || '') || 0))[0] || null;
   return {
-    artifactCount: records.length,
+    artifactCount: records.reduce((sum, record) => sum + recordOccurrenceCount(record), 0),
     taskCount: taskIds.size,
     stageCounts: [...stageCounts.entries()].map(([stage, count]) => ({ stage, count })),
     decisionCounts: [...decisionCounts.entries()].map(([decision, count]) => ({ decision, count })),
@@ -1185,371 +1465,385 @@ export async function searchProjectMemory(rootDir, projectKey, query, limit = 5,
 }
 
 export async function appendClarifyMemory(rootDir, run) {
-  const paths = await prepareProjectMemory(rootDir, run.memory.projectKey, {
-    projectPath: run.projectPath
-  }, {
-    reindex: false
-  });
-  const lines = [
-    `## ${run.updatedAt} | Clarify | ${run.id}`,
-    '',
-    `- Title: ${run.title}`,
-    `- Preset: ${run.preset?.name || 'Auto'}`,
-    `- Objective: ${run.input.objective || '-'}`,
-    `- Clarified objective: ${run.clarify?.clarifiedObjective || '-'}`,
-    `- Scope: ${run.clarify?.scopeSummary || '-'}`,
-    `- Pattern: ${run.clarify?.architecturePattern || '-'}`,
-    ''
-  ];
+  return writeProjectMemory(rootDir, run.memory.projectKey, 'memory.append-clarify', async () => {
+    const paths = await prepareProjectMemory(rootDir, run.memory.projectKey, {
+      projectPath: run.projectPath
+    }, {
+      reindex: false
+    });
+    const lines = [
+      `## ${run.updatedAt} | Clarify | ${run.id}`,
+      '',
+      `- Title: ${run.title}`,
+      `- Preset: ${run.preset?.name || 'Auto'}`,
+      `- Objective: ${run.input.objective || '-'}`,
+      `- Clarified objective: ${run.clarify?.clarifiedObjective || '-'}`,
+      `- Scope: ${run.clarify?.scopeSummary || '-'}`,
+      `- Pattern: ${run.clarify?.architecturePattern || '-'}`,
+      ''
+    ];
 
-  if (Array.isArray(run.clarify?.assumptions) && run.clarify.assumptions.length) {
-    lines.push('### Assumptions', '');
-    for (const item of run.clarify.assumptions) lines.push(`- ${item}`);
-    lines.push('');
-  }
-  const openQuestions = openQuestionText(run.clarify?.openQuestions);
-  if (openQuestions.length) {
-    lines.push('### Open Questions', '');
-    for (const item of openQuestions) lines.push(`- ${item}`);
-    lines.push('');
-  }
+    if (Array.isArray(run.clarify?.assumptions) && run.clarify.assumptions.length) {
+      lines.push('### Assumptions', '');
+      for (const item of run.clarify.assumptions) lines.push(`- ${item}`);
+      lines.push('');
+    }
+    const openQuestions = openQuestionText(run.clarify?.openQuestions);
+    if (openQuestions.length) {
+      lines.push('### Open Questions', '');
+      for (const item of openQuestions) lines.push(`- ${item}`);
+      lines.push('');
+    }
 
-  await appendSection(paths.dailyFile, lines);
-  await reindexMemory(paths);
-  return searchProjectMemory(rootDir, run.memory.projectKey, run.clarify?.clarifiedObjective || run.input.objective || '', 5, {
-    projectPath: run.projectPath
-  }, {
-    reindex: false
+    await appendSection(paths.dailyFile, lines);
+    await reindexMemory(paths);
+    return searchProjectMemory(rootDir, run.memory.projectKey, run.clarify?.clarifiedObjective || run.input.objective || '', 5, {
+      projectPath: run.projectPath
+    }, {
+      reindex: false
+    });
   });
 }
 
 export async function appendGoalJudgeMemory(rootDir, run) {
-  const paths = await prepareProjectMemory(rootDir, run.memory.projectKey, {
-    projectPath: run.projectPath
-  }, {
-    reindex: false
-  });
-  const lines = [
-    `## ${run.updatedAt} | Goal Judge | ${run.id}`,
-    '',
-    `- Goal achieved: ${run.result?.goalAchieved ? 'yes' : 'no'}`,
-    `- Summary: ${run.result?.summary || '-'}`,
-    `- Goal loops: ${run.goalLoops || 0}`,
-    ''
-  ];
-  if (Array.isArray(run.result?.findings) && run.result.findings.length) {
-    lines.push('### Findings', '');
-    for (const item of run.result.findings) lines.push(`- ${item}`);
-    lines.push('');
-  }
-  const pending = (run.tasks || []).filter((task) => task.status !== 'done');
-  if (pending.length) {
-    lines.push('### Pending Tasks', '');
-    for (const task of pending) {
-      lines.push(`- ${task.id} [${task.status}] ${task.title}: ${task.goal}`);
+  return writeProjectMemory(rootDir, run.memory.projectKey, 'memory.append-goal-judge', async () => {
+    const paths = await prepareProjectMemory(rootDir, run.memory.projectKey, {
+      projectPath: run.projectPath
+    }, {
+      reindex: false
+    });
+    const lines = [
+      `## ${run.updatedAt} | Goal Judge | ${run.id}`,
+      '',
+      `- Goal achieved: ${run.result?.goalAchieved ? 'yes' : 'no'}`,
+      `- Summary: ${run.result?.summary || '-'}`,
+      `- Goal loops: ${run.goalLoops || 0}`,
+      ''
+    ];
+    if (Array.isArray(run.result?.findings) && run.result.findings.length) {
+      lines.push('### Findings', '');
+      for (const item of run.result.findings) lines.push(`- ${item}`);
+      lines.push('');
     }
-    lines.push('');
-  }
+    const pending = (run.tasks || []).filter((task) => task.status !== 'done');
+    if (pending.length) {
+      lines.push('### Pending Tasks', '');
+      for (const task of pending) {
+        lines.push(`- ${task.id} [${task.status}] ${task.title}: ${task.goal}`);
+      }
+      lines.push('');
+    }
 
-  await appendSection(paths.dailyFile, lines);
-  await reindexMemory(paths);
-  return searchProjectMemory(rootDir, run.memory.projectKey, run.result?.summary || run.clarify?.clarifiedObjective || '', 5, {
-    projectPath: run.projectPath
-  }, {
-    reindex: false
+    await appendSection(paths.dailyFile, lines);
+    await reindexMemory(paths);
+    return searchProjectMemory(rootDir, run.memory.projectKey, run.result?.summary || run.clarify?.clarifiedObjective || '', 5, {
+      projectPath: run.projectPath
+    }, {
+      reindex: false
+    });
   });
 }
 
 export async function appendCheckpointMemory(rootDir, run, checkpoint) {
-  const paths = await prepareProjectMemory(rootDir, run.memory.projectKey, {
-    projectPath: run.projectPath
-  }, {
-    reindex: false
-  });
-  const lines = [
-    `## ${run.updatedAt} | Run Checkpoint | ${run.id}`,
-    '',
-    `- Trigger: ${checkpoint.trigger || '-'}`,
-    `- Status: ${checkpoint.status || '-'}`,
-    `- Objective: ${checkpoint.objective || '-'}`,
-    `- Next action: ${checkpoint.nextAction || '-'}`,
-    `- Result summary: ${checkpoint.resultSummary || checkpoint.planSummary || '-'}`,
-    ''
-  ];
-  if (Array.isArray(checkpoint.pendingTasks) && checkpoint.pendingTasks.length) {
-    lines.push('### Pending Tasks', '');
-    for (const task of checkpoint.pendingTasks) {
-      lines.push(`- ${task.id} [${task.status}] ${task.title}: ${task.reviewSummary || task.goal || '-'}`);
+  return writeProjectMemory(rootDir, run.memory.projectKey, 'memory.append-checkpoint', async () => {
+    const paths = await prepareProjectMemory(rootDir, run.memory.projectKey, {
+      projectPath: run.projectPath
+    }, {
+      reindex: false
+    });
+    const lines = [
+      `## ${run.updatedAt} | Run Checkpoint | ${run.id}`,
+      '',
+      `- Trigger: ${checkpoint.trigger || '-'}`,
+      `- Status: ${checkpoint.status || '-'}`,
+      `- Objective: ${checkpoint.objective || '-'}`,
+      `- Next action: ${checkpoint.nextAction || '-'}`,
+      `- Result summary: ${checkpoint.resultSummary || checkpoint.planSummary || '-'}`,
+      ''
+    ];
+    if (Array.isArray(checkpoint.pendingTasks) && checkpoint.pendingTasks.length) {
+      lines.push('### Pending Tasks', '');
+      for (const task of checkpoint.pendingTasks) {
+        lines.push(`- ${task.id} [${task.status}] ${task.title}: ${task.reviewSummary || task.goal || '-'}`);
+      }
+      lines.push('');
     }
-    lines.push('');
-  }
-  if (Array.isArray(checkpoint.suggestedBacklogChanges) && checkpoint.suggestedBacklogChanges.length) {
-    lines.push('### Suggested Backlog Changes', '');
-    for (const item of checkpoint.suggestedBacklogChanges) {
-      lines.push(`- ${item.kind}: ${item.summary}`);
+    if (Array.isArray(checkpoint.suggestedBacklogChanges) && checkpoint.suggestedBacklogChanges.length) {
+      lines.push('### Suggested Backlog Changes', '');
+      for (const item of checkpoint.suggestedBacklogChanges) {
+        lines.push(`- ${item.kind}: ${item.summary}`);
+      }
+      lines.push('');
     }
-    lines.push('');
-  }
-  if (Array.isArray(checkpoint.openQuestions) && checkpoint.openQuestions.length) {
-    lines.push('### Open Questions', '');
-    for (const item of checkpoint.openQuestions) lines.push(`- ${item}`);
-    lines.push('');
-  }
-  await appendSection(paths.dailyFile, lines);
-  await reindexMemory(paths);
-  return searchProjectMemory(rootDir, run.memory.projectKey, checkpoint.nextAction || checkpoint.objective || run.title || '', 5, {
-    projectPath: run.projectPath
-  }, {
-    reindex: false
+    if (Array.isArray(checkpoint.openQuestions) && checkpoint.openQuestions.length) {
+      lines.push('### Open Questions', '');
+      for (const item of checkpoint.openQuestions) lines.push(`- ${item}`);
+      lines.push('');
+    }
+    await appendSection(paths.dailyFile, lines);
+    await reindexMemory(paths);
+    return searchProjectMemory(rootDir, run.memory.projectKey, checkpoint.nextAction || checkpoint.objective || run.title || '', 5, {
+      projectPath: run.projectPath
+    }, {
+      reindex: false
+    });
   });
 }
 
 export async function appendCompletionMemory(rootDir, run) {
-  const paths = await prepareProjectMemory(rootDir, run.memory.projectKey, {
-    projectPath: run.projectPath
-  }, {
-    reindex: false
-  });
+  return writeProjectMemory(rootDir, run.memory.projectKey, 'memory.append-completion', async () => {
+    const paths = await prepareProjectMemory(rootDir, run.memory.projectKey, {
+      projectPath: run.projectPath
+    }, {
+      reindex: false
+    });
 
-  const dailyLines = [
-    `## ${run.updatedAt} | Run Complete | ${run.id}`,
-    '',
-    `- Title: ${run.title}`,
-    `- Status: ${run.status}`,
-    `- Pattern: ${run.clarify?.architecturePattern || '-'}`,
-    `- Summary: ${run.result?.summary || run.planSummary || '-'}`,
-    ''
-  ];
-  if (Array.isArray(run.tasks) && run.tasks.length) {
-    dailyLines.push('### Task Ledger', '');
-    for (const task of run.tasks) {
-      dailyLines.push(`- ${task.id} [${task.status}] ${task.title}: ${task.reviewSummary || task.goal}`);
+    const dailyLines = [
+      `## ${run.updatedAt} | Run Complete | ${run.id}`,
+      '',
+      `- Title: ${run.title}`,
+      `- Status: ${run.status}`,
+      `- Pattern: ${run.clarify?.architecturePattern || '-'}`,
+      `- Summary: ${run.result?.summary || run.planSummary || '-'}`,
+      ''
+    ];
+    if (Array.isArray(run.tasks) && run.tasks.length) {
+      dailyLines.push('### Task Ledger', '');
+      for (const task of run.tasks) {
+        dailyLines.push(`- ${task.id} [${task.status}] ${task.title}: ${task.reviewSummary || task.goal}`);
+      }
+      dailyLines.push('');
     }
-    dailyLines.push('');
-  }
-  await appendSection(paths.dailyFile, dailyLines);
+    await appendSection(paths.dailyFile, dailyLines);
 
-  const memoryLines = [
-    `## ${run.updatedAt} | ${run.title}`,
-    '',
-    `- Status: ${run.status}`,
-    `- Objective: ${run.clarify?.clarifiedObjective || run.input.objective || '-'}`,
-    `- Pattern: ${run.clarify?.architecturePattern || '-'}`,
-    `- Goal summary: ${run.result?.summary || run.planSummary || '-'}`,
-    ''
-  ];
-  if (Array.isArray(run.result?.findings) && run.result.findings.length) {
-    memoryLines.push('### Durable Findings', '');
-    for (const item of run.result.findings) memoryLines.push(`- ${item}`);
-    memoryLines.push('');
-  }
-  if (Array.isArray(run.clarify?.assumptions) && run.clarify.assumptions.length) {
-    memoryLines.push('### Stable Assumptions', '');
-    for (const item of run.clarify.assumptions) memoryLines.push(`- ${item}`);
-    memoryLines.push('');
-  }
+    const memoryLines = [
+      `## ${run.updatedAt} | ${run.title}`,
+      '',
+      `- Status: ${run.status}`,
+      `- Objective: ${run.clarify?.clarifiedObjective || run.input.objective || '-'}`,
+      `- Pattern: ${run.clarify?.architecturePattern || '-'}`,
+      `- Goal summary: ${run.result?.summary || run.planSummary || '-'}`,
+      ''
+    ];
+    if (Array.isArray(run.result?.findings) && run.result.findings.length) {
+      memoryLines.push('### Durable Findings', '');
+      for (const item of run.result.findings) memoryLines.push(`- ${item}`);
+      memoryLines.push('');
+    }
+    if (Array.isArray(run.clarify?.assumptions) && run.clarify.assumptions.length) {
+      memoryLines.push('### Stable Assumptions', '');
+      for (const item of run.clarify.assumptions) memoryLines.push(`- ${item}`);
+      memoryLines.push('');
+    }
 
-  await appendSection(paths.memoryFile, memoryLines);
-  await reindexMemory(paths);
-  return searchProjectMemory(rootDir, run.memory.projectKey, run.result?.summary || run.clarify?.clarifiedObjective || '', 5, {
-    projectPath: run.projectPath
-  }, {
-    reindex: false
+    await appendSection(paths.memoryFile, memoryLines);
+    await reindexMemory(paths);
+    return searchProjectMemory(rootDir, run.memory.projectKey, run.result?.summary || run.clarify?.clarifiedObjective || '', 5, {
+      projectPath: run.projectPath
+    }, {
+      reindex: false
+    });
   });
 }
 
 export async function appendTaskReviewMemory(rootDir, run, task) {
-  const paths = await prepareProjectMemory(rootDir, run.memory.projectKey, {
-    projectPath: run.projectPath
-  }, {
-    reindex: false
-  });
-  const lines = [
-    `## ${run.updatedAt} | Task Review | ${run.id} | ${task.id}`,
-    '',
-    `- Task: ${task.title}`,
-    `- Status: ${task.status}`,
-    `- Review: ${task.reviewSummary || '-'}`,
-    `- Workspace: ${task.lastExecution?.workspaceMode || '-'}`,
-    `- Changed files: ${(task.lastExecution?.changedFiles || []).join(', ') || '-'}`,
-    `- Repo changed files: ${(task.lastExecution?.repoChangedFiles || []).join(', ') || '-'}`,
-    `- Out-of-scope files: ${(task.lastExecution?.outOfScopeFiles || []).join(', ') || '-'}`,
-    ''
-  ];
-  if (Array.isArray(task.findings) && task.findings.length) {
-    lines.push('### Findings', '');
-    for (const item of task.findings) lines.push(`- ${item}`);
-    lines.push('');
-  }
-  await appendSection(paths.dailyFile, lines);
-
-  if (task.status === 'failed' || (task.lastExecution?.outOfScopeFiles || []).length) {
-    const durable = [
-      `## ${run.updatedAt} | Task Risk | ${task.id}`,
+  return writeProjectMemory(rootDir, run.memory.projectKey, 'memory.append-task-review', async () => {
+    const paths = await prepareProjectMemory(rootDir, run.memory.projectKey, {
+      projectPath: run.projectPath
+    }, {
+      reindex: false
+    });
+    const lines = [
+      `## ${run.updatedAt} | Task Review | ${run.id} | ${task.id}`,
       '',
-      `- Title: ${task.title}`,
+      `- Task: ${task.title}`,
+      `- Status: ${task.status}`,
       `- Review: ${task.reviewSummary || '-'}`,
+      `- Workspace: ${task.lastExecution?.workspaceMode || '-'}`,
+      `- Changed files: ${(task.lastExecution?.changedFiles || []).join(', ') || '-'}`,
+      `- Repo changed files: ${(task.lastExecution?.repoChangedFiles || []).join(', ') || '-'}`,
       `- Out-of-scope files: ${(task.lastExecution?.outOfScopeFiles || []).join(', ') || '-'}`,
       ''
     ];
     if (Array.isArray(task.findings) && task.findings.length) {
-      durable.push('### Findings', '');
-      for (const item of task.findings) durable.push(`- ${item}`);
-      durable.push('');
+      lines.push('### Findings', '');
+      for (const item of task.findings) lines.push(`- ${item}`);
+      lines.push('');
     }
-    await appendSection(paths.memoryFile, durable);
-  }
+    await appendSection(paths.dailyFile, lines);
 
-  await reindexMemory(paths);
-  return searchProjectMemory(rootDir, run.memory.projectKey, task.reviewSummary || task.goal || '', 5, {
-    projectPath: run.projectPath
-  }, {
-    reindex: false
+    if (task.status === 'failed' || (task.lastExecution?.outOfScopeFiles || []).length) {
+      const durable = [
+        `## ${run.updatedAt} | Task Risk | ${task.id}`,
+        '',
+        `- Title: ${task.title}`,
+        `- Review: ${task.reviewSummary || '-'}`,
+        `- Out-of-scope files: ${(task.lastExecution?.outOfScopeFiles || []).join(', ') || '-'}`,
+        ''
+      ];
+      if (Array.isArray(task.findings) && task.findings.length) {
+        durable.push('### Findings', '');
+        for (const item of task.findings) durable.push(`- ${item}`);
+        durable.push('');
+      }
+      await appendSection(paths.memoryFile, durable);
+    }
+
+    await reindexMemory(paths);
+    return searchProjectMemory(rootDir, run.memory.projectKey, task.reviewSummary || task.goal || '', 5, {
+      projectPath: run.projectPath
+    }, {
+      reindex: false
+    });
   });
 }
 
 export async function appendArtifactMemory(rootDir, run, task) {
-  const paths = await prepareProjectMemory(rootDir, run.memory.projectKey, {
-    projectPath: run.projectPath
-  }, {
-    reindex: false
-  });
-
-  const artifactEntries = await buildArtifactEntries(rootDir, run, task);
-  const taskCodeContext = await readOptionalJson(taskCodeContextArtifactPath(rootDir, run.id, task.id)) || null;
-  const graphMemory = buildGraphMemory(taskCodeContext);
-  const symbolHints = uniqueStrings([
-    ...(Array.isArray(taskCodeContext?.symbolHints) ? taskCodeContext.symbolHints : []),
-    ...((Array.isArray(taskCodeContext?.relatedFiles) ? taskCodeContext.relatedFiles : []).flatMap((entry) => Array.isArray(entry?.symbols) ? entry.symbols : []))
-  ]).slice(0, 12);
-  const manifestFile = artifactManifestPath(rootDir, run.id);
-  const existingManifest = await readOptionalJson(manifestFile) || {
-    schemaVersion: '1',
-    runId: run.id,
-    projectKey: run.memory.projectKey,
-    generatedAt: now(),
-    entries: []
-  };
-  const manifestMap = new Map(
-    (Array.isArray(existingManifest.entries) ? existingManifest.entries : [])
-      .map((entry) => [String(entry.artifactId || ''), entry])
-      .filter(([key]) => key)
-  );
-  for (const entry of artifactEntries) {
-    manifestMap.set(entry.artifactId, {
-      artifactId: entry.artifactId,
-      kind: entry.kind,
-      scope: entry.scope,
-      taskId: entry.taskId,
-      stage: entry.stage,
-      filePath: entry.filePath,
-      filesLikely: entry.filesLikely,
-      status: entry.status,
-      note: entry.note
+  return writeProjectMemory(rootDir, run.memory.projectKey, 'memory.append-artifact', async () => {
+    const paths = await prepareProjectMemory(rootDir, run.memory.projectKey, {
+      projectPath: run.projectPath
+    }, {
+      reindex: false
     });
-  }
-  await fs.writeFile(manifestFile, JSON.stringify({
-    schemaVersion: '1',
-    runId: run.id,
-    projectKey: run.memory.projectKey,
-    generatedAt: now(),
-    entries: [...manifestMap.values()]
-  }, null, 2), 'utf8');
 
-  const existingRecords = await readJsonLines(paths.artifactIndexFile);
-  const recordMap = new Map(existingRecords.map((record) => [String(record.artifactId || ''), record]));
-  for (const entry of artifactEntries) {
-    recordMap.set(entry.artifactId, {
-      schemaVersion: '2',
-      artifactId: entry.artifactId,
-      projectKey: entry.projectKey,
-      runId: entry.runId,
-      taskId: entry.taskId,
-      kind: entry.kind,
-      stage: entry.stage,
-      title: entry.title,
-      summary: entry.summary,
-      keywords: entry.keywords,
-      filesLikely: entry.filesLikely,
-      decision: entry.decision,
-      verificationOk: entry.verificationOk,
-      rootCause: entry.rootCause,
-      taskTitle: entry.taskTitle,
-      taskStatus: entry.taskStatus,
-      changedFiles: entry.changedFiles,
-      outOfScopeFiles: entry.outOfScopeFiles,
-      acceptanceFailures: entry.acceptanceFailures,
-      sourcePath: entry.sourcePath,
-      createdAt: entry.createdAt,
-      symbolHints,
-      graphSummary: graphMemory.graphSummary,
-      graphEdges: graphMemory.graphEdges,
-      graphSymbols: graphMemory.graphSymbols
+    const artifactEntries = await buildArtifactEntries(rootDir, run, task);
+    const taskCodeContext = await readOptionalJson(taskCodeContextArtifactPath(rootDir, run.id, task.id)) || null;
+    const graphMemory = buildGraphMemory(taskCodeContext);
+    const symbolHints = uniqueStrings([
+      ...(Array.isArray(taskCodeContext?.symbolHints) ? taskCodeContext.symbolHints : []),
+      ...((Array.isArray(taskCodeContext?.relatedFiles) ? taskCodeContext.relatedFiles : []).flatMap((entry) => Array.isArray(entry?.symbols) ? entry.symbols : []))
+    ]).slice(0, 12);
+    const manifestFile = artifactManifestPath(rootDir, run.id);
+    const existingManifest = await readOptionalJson(manifestFile) || {
+      schemaVersion: '1',
+      runId: run.id,
+      projectKey: run.memory.projectKey,
+      generatedAt: now(),
+      entries: []
+    };
+    const manifestMap = new Map(
+      (Array.isArray(existingManifest.entries) ? existingManifest.entries : [])
+        .map((entry) => [String(entry.artifactId || ''), entry])
+        .filter(([key]) => key)
+    );
+    for (const entry of artifactEntries) {
+      manifestMap.set(entry.artifactId, {
+        artifactId: entry.artifactId,
+        kind: entry.kind,
+        scope: entry.scope,
+        taskId: entry.taskId,
+        stage: entry.stage,
+        filePath: entry.filePath,
+        filesLikely: entry.filesLikely,
+        status: entry.status,
+        note: entry.note
+      });
+    }
+    await fs.writeFile(manifestFile, JSON.stringify({
+      schemaVersion: '1',
+      runId: run.id,
+      projectKey: run.memory.projectKey,
+      generatedAt: now(),
+      entries: [...manifestMap.values()]
+    }, null, 2), 'utf8');
+
+    const existingRecords = await readJsonLines(paths.artifactIndexFile);
+    const recordMap = new Map(existingRecords.map((record) => [String(record.artifactId || ''), record]));
+    for (const entry of artifactEntries) {
+      recordMap.set(entry.artifactId, {
+        schemaVersion: '2',
+        artifactId: entry.artifactId,
+        projectKey: entry.projectKey,
+        runId: entry.runId,
+        taskId: entry.taskId,
+        kind: entry.kind,
+        stage: entry.stage,
+        title: entry.title,
+        summary: entry.summary,
+        keywords: entry.keywords,
+        filesLikely: entry.filesLikely,
+        decision: entry.decision,
+        verificationOk: entry.verificationOk,
+        rootCause: entry.rootCause,
+        taskTitle: entry.taskTitle,
+        taskStatus: entry.taskStatus,
+        changedFiles: entry.changedFiles,
+        outOfScopeFiles: entry.outOfScopeFiles,
+        acceptanceFailures: entry.acceptanceFailures,
+        sourcePath: entry.sourcePath,
+        createdAt: entry.createdAt,
+        symbolHints,
+        graphSummary: graphMemory.graphSummary,
+        graphEdges: graphMemory.graphEdges,
+        graphSymbols: graphMemory.graphSymbols
+      });
+    }
+    const compaction = compactArtifactRecords([...recordMap.values()]);
+    await writeJsonLines(paths.artifactIndexFile, compaction.records);
+    await writeRunMemoryDoc(paths, run);
+    await writeTaskMemoryDoc(paths, run, task, artifactEntries);
+    await reindexMemory(paths);
+    return searchProjectMemory(rootDir, run.memory.projectKey, task.reviewSummary || task.goal || task.title || '', 6, {
+      projectPath: run.projectPath
+    }, {
+      reindex: false
     });
-  }
-  const compaction = compactArtifactRecords([...recordMap.values()]);
-  await writeJsonLines(paths.artifactIndexFile, compaction.records);
-  await writeRunMemoryDoc(paths, run);
-  await writeTaskMemoryDoc(paths, run, task, artifactEntries);
-  await reindexMemory(paths);
-  return searchProjectMemory(rootDir, run.memory.projectKey, task.reviewSummary || task.goal || task.title || '', 6, {
-    projectPath: run.projectPath
-  }, {
-    reindex: false
   });
 }
 
 export async function appendProjectQualitySweepMemory(rootDir, project, sweep) {
-  const paths = await prepareProjectMemory(rootDir, project.sharedMemoryKey, {
-    projectPath: project.rootPath
-  }, {
-    reindex: false
-  });
+  return writeProjectMemory(rootDir, project.sharedMemoryKey, 'memory.append-project-quality-sweep', async () => {
+    const paths = await prepareProjectMemory(rootDir, project.sharedMemoryKey, {
+      projectPath: project.rootPath
+    }, {
+      reindex: false
+    });
 
-  const dailyLines = [
-    `## ${sweep.createdAt} | Quality Sweep | ${project.id}`,
-    '',
-    `- Phase: ${sweep.phaseTitle || sweep.phaseId || '-'}`,
-    `- Grade: ${sweep.grade || '-'}`,
-    `- Summary: ${sweep.summary || '-'}`,
-    `- Artifact: ${sweep.artifactPath || '-'}`,
-    ''
-  ];
-  if (Array.isArray(sweep.findings) && sweep.findings.length) {
-    dailyLines.push('### Findings', '');
-    for (const finding of sweep.findings) {
-      dailyLines.push(`- ${finding.category} [${finding.severity}]: ${finding.summary}`);
+    const dailyLines = [
+      `## ${sweep.createdAt} | Quality Sweep | ${project.id}`,
+      '',
+      `- Phase: ${sweep.phaseTitle || sweep.phaseId || '-'}`,
+      `- Grade: ${sweep.grade || '-'}`,
+      `- Summary: ${sweep.summary || '-'}`,
+      `- Artifact: ${sweep.artifactPath || '-'}`,
+      ''
+    ];
+    if (Array.isArray(sweep.findings) && sweep.findings.length) {
+      dailyLines.push('### Findings', '');
+      for (const finding of sweep.findings) {
+        dailyLines.push(`- ${finding.category} [${finding.severity}]: ${finding.summary}`);
+      }
+      dailyLines.push('');
     }
-    dailyLines.push('');
-  }
-  await appendSection(paths.dailyFile, dailyLines);
+    await appendSection(paths.dailyFile, dailyLines);
 
-  const durableLines = [
-    `## ${sweep.createdAt} | Quality Sweep`,
-    '',
-    `- Project: ${project.title || project.id}`,
-    `- Phase: ${sweep.phaseTitle || sweep.phaseId || '-'}`,
-    `- Grade: ${sweep.grade || '-'}`,
-    `- Summary: ${sweep.summary || '-'}`,
-    ''
-  ];
-  if (Array.isArray(sweep.recommendedActions) && sweep.recommendedActions.length) {
-    durableLines.push('### Recommended Actions', '');
-    for (const item of sweep.recommendedActions) durableLines.push(`- ${item}`);
-    durableLines.push('');
-  }
-  if (Array.isArray(sweep.findings) && sweep.findings.length) {
-    durableLines.push('### Finding Classes', '');
-    for (const finding of sweep.findings) {
-      durableLines.push(`- ${finding.category} [${finding.severity}]`);
+    const durableLines = [
+      `## ${sweep.createdAt} | Quality Sweep`,
+      '',
+      `- Project: ${project.title || project.id}`,
+      `- Phase: ${sweep.phaseTitle || sweep.phaseId || '-'}`,
+      `- Grade: ${sweep.grade || '-'}`,
+      `- Summary: ${sweep.summary || '-'}`,
+      ''
+    ];
+    if (Array.isArray(sweep.recommendedActions) && sweep.recommendedActions.length) {
+      durableLines.push('### Recommended Actions', '');
+      for (const item of sweep.recommendedActions) durableLines.push(`- ${item}`);
+      durableLines.push('');
     }
-    durableLines.push('');
-  }
-  await appendSection(paths.memoryFile, durableLines);
-  await reindexMemory(paths);
-  return searchProjectMemory(rootDir, project.sharedMemoryKey, sweep.summary || 'quality sweep', 5, {
-    projectPath: project.rootPath
-  }, {
-    reindex: false
+    if (Array.isArray(sweep.findings) && sweep.findings.length) {
+      durableLines.push('### Finding Classes', '');
+      for (const finding of sweep.findings) {
+        durableLines.push(`- ${finding.category} [${finding.severity}]`);
+      }
+      durableLines.push('');
+    }
+    await appendSection(paths.memoryFile, durableLines);
+    await reindexMemory(paths);
+    return searchProjectMemory(rootDir, project.sharedMemoryKey, sweep.summary || 'quality sweep', 5, {
+      projectPath: project.rootPath
+    }, {
+      reindex: false
+    });
   });
 }

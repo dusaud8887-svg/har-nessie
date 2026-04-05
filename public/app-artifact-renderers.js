@@ -20,6 +20,11 @@
       return `<div class="stack-list" style="margin-top: 14px;"><div class="stack-item"><strong>${escapeHtml(title)}</strong></div>${items.map((item) => `<div class="stack-item warning-item">${escapeHtml(item)}</div>`).join('')}</div>`;
     }
 
+    function verificationLabel(summary) {
+      if (!summary || typeof summary.verificationOk !== 'boolean') return '';
+      return summary.verificationOk === false ? t('실패', 'Failed') : t('통과', 'Passed');
+    }
+
     function renderArtifactSummary(artifacts) {
       const summary = artifacts?.executionSummary || null;
       const verdict = artifacts?.reviewVerdict || null;
@@ -38,7 +43,7 @@
           <div class="detail-list">
             ${renderDetailItem(t('검토 결정', 'Review decision'), verdict?.decision || summary?.reviewDecision, t('없음', 'None'))}
             ${renderDetailItem(t('검토 경로', 'Review route'), verdict?.route || summary?.reviewRoute, t('없음', 'None'))}
-            ${renderDetailItem(t('검증 결과', 'Verification'), summary ? (summary.verificationOk === false ? t('실패', 'Failed') : t('통과', 'Passed')) : '', t('없음', 'None'))}
+            ${renderDetailItem(t('검증 결과', 'Verification'), verificationLabel(summary), t('없음', 'None'))}
             ${renderDetailItem(t('적용 결과', 'Apply result'), summary?.applyResult, t('없음', 'None'))}
             ${renderDetailItem(t('범위 이탈 파일', 'Out-of-scope files'), (summary?.outOfScopeFiles || []).join(', '), t('없음', 'None'))}
           </div>
@@ -169,19 +174,33 @@
       if (!artifacts?.codeContext) {
         return `<div class="stack-item">${escapeHtml(t('code context 산출물이 아직 없습니다.', 'No code context artifact yet.'))}</div>`;
       }
+      const criticalSymbols = Array.isArray(artifacts.codeContext?.projectGraph?.criticalSymbols)
+        ? artifacts.codeContext.projectGraph.criticalSymbols.slice(0, 4)
+        : [];
+      const criticalRiskThreshold = Number(artifacts.codeContext?.projectGraph?.thresholds?.criticalRisk || 15);
       return `
         <div class="card" style="margin-bottom: 16px;">
           <h3>${escapeHtml(t('코드 문맥', 'Code context'))}</h3>
           <div class="detail-list">
             ${renderDetailItem(t('요약', 'Summary'), artifacts.codeContext.summary, t('없음', 'None'))}
             ${renderDetailItem(t('토큰', 'Tokens'), (artifacts.codeContext.queryTokens || []).join(', '), t('없음', 'None'))}
+            ${renderDetailItem(t('전역 인덱싱 파일 수', 'Indexed files'), artifacts.codeContext?.projectGraph?.indexedFileCount, '0')}
           </div>
         </div>
+        ${criticalSymbols.length ? `
+          <div class="card" style="margin-bottom: 16px;">
+            <h3>${escapeHtml(`CRITICAL-RISK >= ${criticalRiskThreshold.toFixed(1)}`)}</h3>
+            <div class="stack-list">
+              ${criticalSymbols.map((item) => `<div class="stack-item"><strong>${escapeHtml(item.symbol || '')}</strong><div>${escapeHtml(`risk ${Number(item.riskScore || 0).toFixed(1)} | importers ${Number(item.importerCount || 0)} | callers ${Number(item.callerCount || 0)}${Array.isArray(item.definedIn) && item.definedIn.length ? ` | defined in ${item.definedIn[0]}` : ''}`)}</div></div>`).join('')}
+            </div>
+          </div>
+        ` : ''}
         <div class="stack-list">
           ${(artifacts.codeContext.relatedFiles || []).map((item) => `
             <div class="stack-item">
               <strong>${escapeHtml(item.path || '')}</strong>
-              <div style="margin-top: 6px; color: var(--muted);">score ${escapeHtml(item.score || 0)}</div>
+              <div style="margin-top: 6px; color: var(--muted);">score ${escapeHtml(item.score || 0)} | importedBy ${escapeHtml(item?.impact?.importedByCount || 0)} | calledBy ${escapeHtml(item?.impact?.calledByCount || 0)}</div>
+              ${(item?.impact?.exportedSymbolImpact || [])[0] ? `<div style="margin-top: 6px; color: var(--muted);">${escapeHtml(`${(item.impact.exportedSymbolImpact[0].symbol || '')}: importers ${Number(item.impact.exportedSymbolImpact[0].importerCount || 0)}, callers ${Number(item.impact.exportedSymbolImpact[0].callerCount || 0)}, calls ${Number(item.impact.exportedSymbolImpact[0].callCount || 0)}`)}</div>` : ''}
               <div style="margin-top: 6px;">${renderListChips(item.symbols || [], t('심볼 없음', 'No symbols'))}</div>
             </div>
           `).join('') || `<div class="stack-item">${escapeHtml(t('관련 파일 없음', 'No related files'))}</div>`}

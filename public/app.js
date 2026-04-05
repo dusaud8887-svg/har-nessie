@@ -1,35 +1,64 @@
-let runs = [];
-    let projects = [];
-    let selectedRunId = '';
-    let selectedProjectId = '';
-    let selectedTab = 'dashboard';
-    let selectedTaskId = '';
-    const artifactState = new Map();
-    const projectOverviewState = new Map();
-    const clarifyDraftAnswers = new Map();
-    let harnessSettings = null;
-    let systemInfo = null;
-    let draftDiagnostics = null;
-    let refreshTimer = null;
-    let projectOverviewRefreshTimer = null;
-    const busyActions = new Set();
-    let planEditAgents = [];
-    let planEditTasks = [];
-    let skipTaskTargetId = '';
-    let artifactLoadingKey = '';
-    const detailUiStateByView = new Map();
-    let currentDetailViewKey = '';
-    let runSelectionSeq = 0;
-    let projectSearchQuery = '';
-    let runSearchQuery = '';
-    let projectFilterMode = 'all';
-    let projectIntake = null;
-    let projectIntakeSelectedRoots = [];
-    let createRunDraftContext = null;
+    if (!window.HarnessUiState?.createUiState || !window.HarnessUiState?.bindGlobalState) {
+      throw new Error('Harness UI state module failed to load.');
+    }
+    const uiState = window.HarnessUiState.createUiState();
+    window.HarnessUiState.bindGlobalState(uiState, [
+      'runs',
+      'projects',
+      'selectedRunId',
+      'selectedProjectId',
+      'selectedTab',
+      'selectedTaskId',
+      'artifactState',
+      'projectOverviewState',
+      'clarifyDraftAnswers',
+      'harnessSettings',
+      'systemInfo',
+      'draftDiagnostics',
+      'refreshTimer',
+      'projectOverviewRefreshTimer',
+      'busyActions',
+      'planEditAgents',
+      'planEditTasks',
+      'skipTaskTargetId',
+      'artifactLoadingKey',
+      'detailUiStateByView',
+      'currentDetailViewKey',
+      'runSelectionSeq',
+      'projectSearchQuery',
+      'runSearchQuery',
+      'projectFilterMode',
+      'projectIntake',
+      'projectIntakeSelectedRoots',
+      'createRunDraftContext',
+      'recentPhaseTransitionsByProjectId',
+      'bannerState',
+      'toastState',
+      'bannerTimer',
+      'toastTimer'
+    ]);
 
     function currentUiText(ko, en = '') {
       const picker = window.HarnessUiHelpers?.pickText;
       return picker ? picker(ko, en) : String(ko || en || '');
+    }
+
+    function safeParseJson(text) {
+      try {
+        return JSON.parse(text);
+      } catch {
+        return null;
+      }
+    }
+
+    function buildResponseError(response, text) {
+      const parsed = safeParseJson(text);
+      if (parsed) {
+        const message = parsed?.error?.message || parsed?.error || parsed?.message || response.statusText;
+        const requestId = parsed?.requestId ? ` [${parsed.requestId}]` : '';
+        return new Error(`${message}${requestId}`);
+      }
+      return new Error(text || response.statusText);
     }
 
     async function request(url, options = {}) {
@@ -40,7 +69,7 @@ let runs = [];
         const response = await fetch(url, { headers, signal: controller.signal, ...options });
         if (!response.ok) {
           const text = await response.text();
-          throw new Error(text || response.statusText);
+          throw buildResponseError(response, text);
         }
         return response.json();
       } catch (err) {
@@ -51,20 +80,74 @@ let runs = [];
       }
     }
 
-    function setBanner(message = '', tone = 'error') {
+    function noticePalette(tone = 'error') {
+      return tone === 'success'
+        ? { bg: '#dcfce7', fg: '#166534', edge: 'rgba(22,101,52,0.16)' }
+        : (tone === 'info'
+          ? { bg: '#e0e7ff', fg: '#3730a3', edge: 'rgba(55,48,163,0.16)' }
+          : { bg: '#fee2e2', fg: '#991b1b', edge: 'rgba(153,27,27,0.16)' });
+    }
+
+    function renderGlobalNotices() {
       const root = document.getElementById('global-banner');
       if (!root) return;
-      if (!message) {
+      const bannerMarkup = bannerState?.message
+        ? (() => {
+            const palette = noticePalette(bannerState.tone);
+            return `<div style="padding:12px 14px; border-radius:12px; background:${palette.bg}; color:${palette.fg}; box-shadow: var(--shadow); border:1px solid ${palette.edge};">${escapeHtml(bannerState.message)}</div>`;
+          })()
+        : '';
+      const toastMarkup = toastState?.message
+        ? (() => {
+            const palette = noticePalette(toastState.tone);
+            return `
+              <div data-toast="true" style="display:flex; justify-content:flex-end; margin-top:${bannerMarkup ? '10px' : '0'};">
+                <div style="max-width:420px; padding:10px 12px; border-radius:14px; background:${palette.bg}; color:${palette.fg}; box-shadow:0 18px 38px rgba(15,23,42,0.14); border:1px solid ${palette.edge};">
+                  <div style="font-size:11px; letter-spacing:0.08em; text-transform:uppercase; opacity:0.72;">${escapeHtml(t('자동화 알림', 'Automation notice'))}</div>
+                  <div style="margin-top:4px;">${escapeHtml(toastState.message)}</div>
+                </div>
+              </div>
+            `;
+          })()
+        : '';
+      if (!bannerMarkup && !toastMarkup) {
         root.style.display = 'none';
         root.innerHTML = '';
         return;
       }
-      const bg = tone === 'success' ? '#dcfce7' : (tone === 'info' ? '#e0e7ff' : '#fee2e2');
-      const fg = tone === 'success' ? '#166534' : (tone === 'info' ? '#3730a3' : '#991b1b');
       root.style.display = 'block';
-      root.innerHTML = '<div style="padding:12px 14px; border-radius:12px; background:' + bg + '; color:' + fg + '; box-shadow: var(--shadow); border:1px solid rgba(15,23,42,0.08);">' + escapeHtml(message) + '</div>';
+      root.innerHTML = `${bannerMarkup}${toastMarkup}`;
+    }
+
+    function setBanner(message = '', tone = 'error') {
+      bannerState = { message: String(message || '').trim(), tone };
+      if (bannerTimer) {
+        clearTimeout(bannerTimer);
+        bannerTimer = null;
+      }
+      renderGlobalNotices();
       if (tone !== 'error') {
-        setTimeout(() => setBanner(''), 2800);
+        bannerTimer = setTimeout(() => {
+          bannerState = { message: '', tone: 'info' };
+          renderGlobalNotices();
+          bannerTimer = null;
+        }, 2800);
+      }
+    }
+
+    function setToast(message = '', tone = 'info') {
+      toastState = { message: String(message || '').trim(), tone };
+      if (toastTimer) {
+        clearTimeout(toastTimer);
+        toastTimer = null;
+      }
+      renderGlobalNotices();
+      if (toastState.message) {
+        toastTimer = setTimeout(() => {
+          toastState = { message: '', tone: 'info' };
+          renderGlobalNotices();
+          toastTimer = null;
+        }, 2400);
       }
     }
 
@@ -170,6 +253,15 @@ let runs = [];
       return enabled ? t('자동', 'Automatic') : t('수동', 'Manual');
     }
 
+    function autoChainChoiceLabel(enabled) {
+      return enabled ? t('활성', 'Enabled') : t('비활성', 'Disabled');
+    }
+
+    function normalizeMaxChainDepth(value) {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? Math.max(0, Math.floor(parsed)) : 0;
+    }
+
     function browserPolicyLabelText(value, configured = false) {
       const normalized = String(value || '').trim().toLowerCase();
       if (normalized.includes('baseline') || value === '이 프로젝트 baseline' || configured) return t('이 프로젝트 baseline', 'Project baseline');
@@ -239,6 +331,18 @@ let runs = [];
           <div style="white-space: pre-wrap;">${escapeHtml(text || empty || t('없음', 'None'))}</div>
         </div>
       `;
+    }
+
+    function normalizeExecutionPolicyRules(executionPolicy) {
+      return window.HarnessRunRenderers?.normalizeExecutionPolicyRules
+        ? window.HarnessRunRenderers.normalizeExecutionPolicyRules(executionPolicy)
+        : [];
+    }
+
+    function renderExecutionPolicyRuleList(executionPolicy) {
+      return window.HarnessRunRenderers?.renderExecutionPolicyRuleList
+        ? window.HarnessRunRenderers.renderExecutionPolicyRuleList(executionPolicy, { escapeHtml, t })
+        : '';
     }
 
     function renderListStack(title, items, empty = '') {
@@ -371,49 +475,15 @@ let runs = [];
     }
 
     function deriveRunRuntimeSignals(run) {
-      const tasks = Array.isArray(run?.tasks) ? run.tasks : [];
-      const logs = Array.isArray(run?.logs) ? run.logs : [];
-      const highlights = [];
-      for (const task of tasks) {
-        const verification = task?.lastExecution?.verification || {};
-        if (verification?.ok === false) {
-          const note = (Array.isArray(verification?.failingChecks) && verification.failingChecks.length
-            ? verification.failingChecks[0]
-            : (verification?.stderr || verification?.stdout || t('검증 실패', 'Verification failed')));
-          highlights.push(`${task.id}: ${note}`);
-        }
-        if (verification?.browser && verification.browser.ok === false) {
-          highlights.push(`${task.id}: ${verification.browser.note || t('브라우저 자동 확인 실패', 'Browser automation failed')}`);
-        }
-      }
-      for (const log of logs.slice(-10)) {
-        const level = String(log?.level || '').toLowerCase();
-        const message = String(log?.message || '').trim();
-        if (!message) continue;
-        if (level === 'error' || level === 'warning' || /(fail|error|timeout|browser|verification|healthy)/i.test(message)) {
-          highlights.push(message);
-        }
-      }
-      return {
-        warning: highlights.length > 0,
-        headline: highlights.length
-          ? t('최근 런타임 경고를 먼저 확인하는 편이 좋습니다.', 'Check the recent runtime warnings first.')
-          : t('최근 런타임 경고는 크지 않습니다.', 'Recent runtime warnings are minor.'),
-        highlights: highlights.slice(0, 5)
-      };
+      return window.HarnessRunRenderers?.deriveRunRuntimeSignals
+        ? window.HarnessRunRenderers.deriveRunRuntimeSignals(run, { t })
+        : { warning: false, headline: t('최근 런타임 경고는 크지 않습니다.', 'Recent runtime warnings are minor.'), highlights: [] };
     }
 
     function renderRuntimeSignals(run) {
-      const runtime = deriveRunRuntimeSignals(run);
-      return `
-        <div class="card" style="margin-top: 16px;">
-          <h3>${escapeHtml(t('런타임 관측', 'Runtime observability'))}</h3>
-          <div class="detail-list">
-            ${renderDetailItem(t('요약', 'Summary'), runtime.headline, t('최근 런타임 경고 없음', 'No recent runtime warnings'))}
-            ${renderDetailItem(t('최근 신호', 'Recent signals'), runtime.highlights.join(' | '), t('최근 경고 없음', 'No recent warnings'))}
-          </div>
-        </div>
-      `;
+      return window.HarnessRunRenderers?.renderRuntimeSignals
+        ? window.HarnessRunRenderers.renderRuntimeSignals(run, { escapeHtml, t })
+        : '';
     }
 
     function runtimeProfileLabel(profileId) {
@@ -625,6 +695,13 @@ let runs = [];
       setFieldLabel('run-max-parallel-input', '동시에 진행할 작업 수', 'Parallel task count');
       setFieldLabel('run-max-task-attempts-input', '태스크 최대 재시도', 'Max task retries');
       setFieldLabel('run-max-goal-loops-input', '최대 목표 재판정', 'Max goal loops');
+      setFieldLabel('run-loop-enabled-input', '런-레벨 자동 루프', 'Run-level automation loop');
+      setFieldHelper('run-loop-enabled-input', '이 런을 짧은 체인으로 이어서 반복 실행합니다.', 'Repeat this run as a short continuation chain.');
+      setFieldLabel('run-loop-mode-input', '루프 방식', 'Loop mode');
+      setSelectOptionText('run-loop-mode-input', 'repeat-count', '정해진 횟수만 반복', 'Repeat N runs');
+      setSelectOptionText('run-loop-mode-input', 'until-goal', '목표 달성까지 반복', 'Repeat until goal achieved');
+      setFieldLabel('run-loop-max-runs-input', '최대 루프 횟수', 'Max loop runs');
+      setFieldLabel('run-loop-max-failures-input', '연속 실패 자동 중단', 'Auto-stop after consecutive failed runs');
       setButtonText('#run-form .modal-footer button:nth-of-type(1)', '취소', 'Cancel');
       setButtonText('#run-form .modal-footer button:nth-of-type(2)', '입력 진단', 'Check input');
       setButtonText('#run-form .modal-footer button:nth-of-type(3)', '작업 만들기', 'Create run');
@@ -674,6 +751,14 @@ let runs = [];
       setSelectOptionText('codex-runtime-profile', 'yolo', '즉시 진행 · 승인 없이 전체 접근', 'Go now · full access without approval');
       setSelectOptionText('codex-runtime-profile', 'full-auto', '승인 요청 · 작업 폴더 쓰기', 'Approval requested · workspace write');
       setSelectOptionText('codex-runtime-profile', 'safe', '읽기 전용 · 안전 모드', 'Read-only · safe mode');
+      setFieldLabel('codex-model', 'Codex 모델', 'Codex model');
+      setSelectOptionText('codex-model', 'gpt-5.4', 'GPT-5.4', 'GPT-5.4');
+      setSelectOptionText('codex-model', 'gpt-5.3-codex-spark', 'GPT-5.3-Codex-Spark', 'GPT-5.3-Codex-Spark');
+      const codexFastModeLabel = document.querySelector('#codex-fast-mode')?.closest('.form-group')?.querySelector('label');
+      if (codexFastModeLabel) {
+        codexFastModeLabel.childNodes[codexFastModeLabel.childNodes.length - 1].textContent = ` ${t('Codex 빠른 모드', 'Codex fast mode')}`;
+      }
+      setFieldHelper('codex-fast-mode', '켜면 fast service tier를 유지하고, 끄면 default service tier로 내립니다.', 'On keeps the fast service tier. Off falls back to the default service tier.');
       setFieldLabel('ui-language', '화면 언어', 'UI language');
       setFieldLabel('agent-language', 'AI 응답 언어', 'Agent response language');
       setSelectOptionText('ui-language', 'ko', '한국어', 'Korean');
@@ -1132,23 +1217,9 @@ let runs = [];
     }
 
     function renderProgressSummary(run) {
-      const progress = deriveProgressSummary(run);
-      return `
-        <div class="card">
-          <h3>운영 진행 요약</h3>
-          <div class="metric-row">
-            <div class="mini-card"><span class="k">현재 단계</span><div class="v">${escapeHtml(progress.phase)}</div></div>
-            <div class="mini-card"><span class="k">현재 작업</span><div class="v">${escapeHtml(progress.step)}</div></div>
-            <div class="mini-card"><span class="k">경과</span><div class="v">${escapeHtml(formatElapsedSeconds(progress.elapsed || 0))}</div></div>
-            <div class="mini-card"><span class="k">마지막 행동</span><div class="v">${escapeHtml(progress.lastAction || '-')}</div></div>
-          </div>
-          <div class="detail-list">
-            ${renderDetailItem('상세', progress.detail, '상세 없음')}
-            ${renderDetailItem('최근 이벤트', progress.lastEvent, '최근 이벤트 없음')}
-            ${renderDetailItem('원본 기록', progress.rawPreserved, '전체 로그와 원본 실행 기록은 아래 화면에서 다시 볼 수 있습니다.')}
-          </div>
-        </div>
-      `;
+      return window.HarnessRunRenderers?.renderProgressSummary
+        ? window.HarnessRunRenderers.renderProgressSummary(run, { deriveProgressSummary, escapeHtml, formatElapsedSeconds, renderDetailItem })
+        : '';
     }
 
     function renderDecisionPanel(run) {
@@ -1179,104 +1250,47 @@ let runs = [];
       `;
     }
 
+    function deriveAutoReplanStatus(run) {
+      return window.HarnessRunRenderers?.deriveAutoReplanStatus
+        ? window.HarnessRunRenderers.deriveAutoReplanStatus(run, { t })
+        : null;
+    }
+
+    function renderAutoReplanStatus(run) {
+      return window.HarnessRunRenderers?.renderAutoReplanStatus
+        ? window.HarnessRunRenderers.renderAutoReplanStatus(run, { deriveAutoReplanStatus, escapeHtml, renderDetailItem, t })
+        : '';
+    }
+
     function normalizeChangedFiles(changedFiles) {
-      if (Array.isArray(changedFiles)) {
-        return changedFiles
-          .map((item) => {
-            if (typeof item === 'string') return item.trim();
-            return String(item?.path || '').trim();
-          })
-          .filter(Boolean);
-      }
-      if (typeof changedFiles === 'string') {
-        const text = changedFiles.trim();
-        if (!text) return [];
-        try {
-          return normalizeChangedFiles(JSON.parse(text));
-        } catch {
-          return [text];
-        }
-      }
-      return [];
+      return window.HarnessRunRenderers?.normalizeChangedFiles
+        ? window.HarnessRunRenderers.normalizeChangedFiles(changedFiles)
+        : [];
+    }
+
+    function resolveChangedFiles(task, artifacts) {
+      return window.HarnessRunRenderers?.resolveChangedFiles
+        ? window.HarnessRunRenderers.resolveChangedFiles(task, artifacts)
+        : [];
     }
 
     function renderTaskInsights(task, artifacts) {
-      if (!task) {
-        return `<div class="stack-item">${escapeHtml(t('태스크를 선택하면 현재 판단과 위험 요소를 먼저 볼 수 있습니다.', 'Select a task to see the current judgment and risks first.'))}</div>`;
-      }
-      const findings = (task.findings || []).filter(Boolean);
-      const changedFiles = normalizeChangedFiles(artifacts?.changedFiles);
-      const evidence = deriveTaskEvidence(task, artifacts);
-      const evidenceSummary = summarizeTaskEvidence(evidence);
-      return `
-        <div class="grid-2 task-insight-grid">
-          <div class="card">
-            <h3>${escapeHtml(t('현재 판단', 'Current judgment'))}</h3>
-            <div class="detail-list">
-              ${renderDetailItem(t('요약', 'Summary'), task.reviewSummary || (task.status === 'done' ? t('검토 완료', 'Review complete') : t('아직 검토 요약 없음', 'No review summary yet')), t('요약 없음', 'No summary'))}
-              ${renderDetailItem(t('다음 액션', 'Next action'), task.status === 'failed'
-                ? t('실패 원인을 보고 다시 시도할지, 이번 작업은 건너뛸지 결정하세요.', 'Review the failure and decide whether to retry or skip this task.')
-                : (task.status === 'done'
-                  ? t('산출물과 검토 결과를 확인하면 됩니다.', 'Review the artifacts and review result.')
-                  : t('태스크 정의와 완료 조건을 먼저 확인하세요.', 'Check the task definition and acceptance criteria first.')))}
-            </div>
-          </div>
-          <div class="card">
-            <h3>${escapeHtml(t('핵심 체크', 'Key checks'))}</h3>
-            ${renderListChips((task.acceptanceChecks || []).slice(0, 6), t('정의된 완료 조건 없음', 'No acceptance criteria defined'))}
-            <div style="margin-top: 14px;">
-              ${renderDetailItem(t('변경 파일', 'Changed files'), changedFiles.join(', '), t('아직 변경 파일 없음', 'No changed files yet'))}
-            </div>
-          </div>
-        </div>
-        <div class="card">
-          <h3>${escapeHtml(t('검증 증거', 'Verification evidence'))}</h3>
-          <div class="metric-row" style="margin-bottom: 14px;">
-            <div class="mini-card"><span class="k">${escapeHtml(t('기계 검증', 'Automated checks'))}</span><div class="v">${escapeHtml(`${evidenceSummary.autoPassed}/${evidenceSummary.autoExpected || 0}`)}</div></div>
-            <div class="mini-card"><span class="k">${escapeHtml(t('실패', 'Failed'))}</span><div class="v">${escapeHtml(evidenceSummary.autoFailed || 0)}</div></div>
-            <div class="mini-card"><span class="k">${escapeHtml(t('추가 확인', 'Pending'))}</span><div class="v">${escapeHtml(evidenceSummary.autoPending || 0)}</div></div>
-            <div class="mini-card"><span class="k">${escapeHtml(t('사람 확인', 'Manual review'))}</span><div class="v">${escapeHtml(evidenceSummary.manualPending || 0)}</div></div>
-          </div>
-          <div class="stack-list">
-            ${evidence.map((item) => `
-              <div class="stack-item ${item.status === 'fail' ? 'warning-item' : ''}">
-                <strong>${escapeHtml(item.type)}</strong>
-                <div>${escapeHtml(
-                  item.status === 'pass' ? t('통과', 'Passed')
-                    : item.status === 'fail' ? t('실패', 'Failed')
-                    : item.status === 'pending' ? t('사람 확인 또는 추가 검증 필요', 'Needs review or more verification')
-                    : t('필요 없음', 'Not needed')
-                )}</div>
-                <div style="margin-top: 6px; color: var(--muted);">${escapeHtml(item.note || '')}</div>
-              </div>
-            `).join('')}
-          </div>
-        </div>
-        ${findings.length ? `
-          <div class="card">
-            <h3>${escapeHtml(t('문제와 힌트', 'Issues and hints'))}</h3>
-            <div class="stack-list">
-              ${findings.map((finding) => `<div class="stack-item warning-item">${escapeHtml(finding)}</div>`).join('')}
-            </div>
-          </div>
-        ` : ''}
-      `;
+      return window.HarnessRunRenderers?.renderTaskInsights
+        ? window.HarnessRunRenderers.renderTaskInsights(task, artifacts, {
+          deriveTaskEvidence,
+          escapeHtml,
+          renderDetailItem,
+          renderListChips,
+          summarizeTaskEvidence,
+          t
+        })
+        : '';
     }
 
     function renderTaskActions(task) {
-      if (!task) return '';
-      const canRetry = task.status === 'failed';
-      const canSkip = task.status === 'failed' || task.status === 'ready';
-      if (!canRetry && !canSkip) return '';
-      return `
-        <div class="card" style="margin-bottom: 16px;">
-          <h3>${escapeHtml(t('복구 작업', 'Recovery actions'))}</h3>
-          <div style="display:flex; gap:12px; flex-wrap:wrap;">
-            ${canRetry ? `<button class="primary" onclick="retrySelectedTask()" ${isBusy('retry-task') ? 'disabled' : ''}>${escapeHtml(isBusy('retry-task') ? t('재시도 중...', 'Retrying...') : t('이 태스크 다시 시도', 'Retry this task'))}</button>` : ''}
-            ${canSkip ? `<button class="secondary-btn" onclick="skipSelectedTask()" ${isBusy('skip-task') ? 'disabled' : ''}>${escapeHtml(isBusy('skip-task') ? t('건너뛰는 중...', 'Skipping...') : t('이 태스크 건너뛰기', 'Skip this task'))}</button>` : ''}
-          </div>
-        </div>
-      `;
+      return window.HarnessRunRenderers?.renderTaskActions
+        ? window.HarnessRunRenderers.renderTaskActions(task, { escapeHtml, isBusy, t })
+        : '';
     }
 
     function statusLabel(status) {
@@ -1338,11 +1352,155 @@ let runs = [];
       setFieldValue('run-max-goal-loops-input', defaults.maxGoalLoops);
     }
 
+    function applyProjectRunLoopDefaults(project) {
+      const loop = project?.defaultSettings?.continuationPolicy?.runLoop || {};
+      const enabledField = document.getElementById('run-loop-enabled-input');
+      const modeField = document.getElementById('run-loop-mode-input');
+      const maxRunsField = document.getElementById('run-loop-max-runs-input');
+      const maxFailuresField = document.getElementById('run-loop-max-failures-input');
+      if (enabledField) enabledField.checked = loop.enabled === true;
+      if (modeField) modeField.value = loop.mode === 'until-goal' ? 'until-goal' : 'repeat-count';
+      if (maxRunsField) maxRunsField.value = String(Math.max(1, Number(loop.maxRuns || 3) || 3));
+      if (maxFailuresField) maxFailuresField.value = String(Math.max(1, Number(loop.maxConsecutiveFailures || 3) || 3));
+    }
+
+    function applyProjectSchedulePreset(value) {
+      const cronField = document.getElementById('project-settings-schedule-cron');
+      if (!cronField || !value) return;
+      cronField.value = value;
+      syncProjectScheduleBuilder();
+    }
+
+    function updateProjectScheduleBuilderModeButtons(selectedMode) {
+      ['weekdays', 'daily', 'hourly', 'every-30-min', 'custom'].forEach((mode) => {
+        const button = document.getElementById(`project-settings-schedule-builder-mode-${mode}`);
+        if (!button) return;
+        const active = selectedMode === mode;
+        button.style.background = active ? 'rgba(15,23,42,0.95)' : 'rgba(255,255,255,0.92)';
+        button.style.color = active ? '#fff' : 'var(--text)';
+        button.style.borderColor = active ? 'rgba(15,23,42,0.95)' : 'rgba(15,23,42,0.12)';
+        button.style.boxShadow = active ? '0 14px 30px rgba(15,23,42,0.16)' : 'none';
+      });
+    }
+
+    function applyProjectScheduleBuilderMode(mode) {
+      const modeField = document.getElementById('project-settings-schedule-builder-mode');
+      if (!modeField) return;
+      modeField.value = String(mode || 'custom').trim() || 'custom';
+      updateProjectScheduleBuilderModeButtons(modeField.value);
+      updateProjectScheduleBuilderPreview();
+    }
+
+    function parseProjectScheduleBuilderCron(value) {
+      const cron = String(value || '').trim();
+      if (!cron) return { mode: 'custom', hour: '9', minute: '0' };
+      if (cron === '*/30 * * * *') return { mode: 'every-30-min', hour: '9', minute: '0' };
+      const hourlyMatch = cron.match(/^(\d{1,2})\s+\*\s+\*\s+\*\s+\*$/);
+      if (hourlyMatch) return { mode: 'hourly', hour: '9', minute: hourlyMatch[1] };
+      const weekdaysMatch = cron.match(/^(\d{1,2})\s+(\d{1,2})\s+\*\s+\*\s+1-5$/);
+      if (weekdaysMatch) {
+        return { mode: 'weekdays', minute: weekdaysMatch[1], hour: weekdaysMatch[2] };
+      }
+      const dailyMatch = cron.match(/^(\d{1,2})\s+(\d{1,2})\s+\*\s+\*\s+\*$/);
+      if (dailyMatch) {
+        return { mode: 'daily', minute: dailyMatch[1], hour: dailyMatch[2] };
+      }
+      return { mode: 'custom', hour: '9', minute: '0' };
+    }
+
+    function buildProjectScheduleBuilderCron() {
+      const mode = document.getElementById('project-settings-schedule-builder-mode')?.value || 'custom';
+      const hour = Math.min(23, Math.max(0, Number(document.getElementById('project-settings-schedule-builder-hour')?.value || 9)));
+      const minute = Math.min(59, Math.max(0, Number(document.getElementById('project-settings-schedule-builder-minute')?.value || 0)));
+      if (mode === 'every-30-min') return '*/30 * * * *';
+      if (mode === 'hourly') return `${minute} * * * *`;
+      if (mode === 'daily') return `${minute} ${hour} * * *`;
+      if (mode === 'weekdays') return `${minute} ${hour} * * 1-5`;
+      return '';
+    }
+
+    function projectScheduleBuilderPreview(cron) {
+      const value = String(cron || '').trim();
+      if (!value) return t('직접 cron을 입력하거나 아래 빌더를 적용하세요.', 'Enter a cron expression or apply the builder below.');
+      if (value === '*/30 * * * *') return t('30분마다 실행합니다.', 'Runs every 30 minutes.');
+      const hourlyMatch = value.match(/^(\d{1,2})\s+\*\s+\*\s+\*\s+\*$/);
+      if (hourlyMatch) return t(`매시간 ${String(hourlyMatch[1]).padStart(2, '0')}분에 실행합니다.`, `Runs every hour at minute ${String(hourlyMatch[1]).padStart(2, '0')}.`);
+      const weekdaysMatch = value.match(/^(\d{1,2})\s+(\d{1,2})\s+\*\s+\*\s+1-5$/);
+      if (weekdaysMatch) return t(`평일 ${String(weekdaysMatch[2]).padStart(2, '0')}:${String(weekdaysMatch[1]).padStart(2, '0')}에 실행합니다.`, `Runs on weekdays at ${String(weekdaysMatch[2]).padStart(2, '0')}:${String(weekdaysMatch[1]).padStart(2, '0')}.`);
+      const dailyMatch = value.match(/^(\d{1,2})\s+(\d{1,2})\s+\*\s+\*\s+\*$/);
+      if (dailyMatch) return t(`매일 ${String(dailyMatch[2]).padStart(2, '0')}:${String(dailyMatch[1]).padStart(2, '0')}에 실행합니다.`, `Runs daily at ${String(dailyMatch[2]).padStart(2, '0')}:${String(dailyMatch[1]).padStart(2, '0')}.`);
+      return t(`사용자 정의 cron: ${value}`, `Custom cron: ${value}`);
+    }
+
+    function updateProjectScheduleBuilderPreview() {
+      const previewNode = document.getElementById('project-settings-schedule-preview');
+      const cronField = document.getElementById('project-settings-schedule-cron');
+      if (!previewNode || !cronField) return;
+      const mode = document.getElementById('project-settings-schedule-builder-mode')?.value || 'custom';
+      const built = buildProjectScheduleBuilderCron();
+      const previewValue = mode !== 'custom' && built ? built : cronField.value;
+      const suffix = mode !== 'custom' && built && String(built).trim() !== String(cronField.value || '').trim()
+        ? t(' · 아직 위 cron 입력란에는 적용되지 않았습니다.', ' · not yet applied to the cron field above.')
+        : '';
+      previewNode.textContent = `${projectScheduleBuilderPreview(previewValue)}${suffix}`;
+    }
+
+    function syncProjectScheduleBuilder(projectOverview = null) {
+      const cronField = document.getElementById('project-settings-schedule-cron');
+      const modeField = document.getElementById('project-settings-schedule-builder-mode');
+      const hourField = document.getElementById('project-settings-schedule-builder-hour');
+      const minuteField = document.getElementById('project-settings-schedule-builder-minute');
+      if (!cronField || !modeField || !hourField || !minuteField) {
+        updateProjectScheduleBuilderPreview();
+        return;
+      }
+      const sourceCron = cronField.value || projectOverview?.project?.defaultSettings?.autoProgress?.scheduleCron || '';
+      const parsed = parseProjectScheduleBuilderCron(sourceCron);
+      modeField.value = parsed.mode;
+      hourField.value = String(parsed.hour);
+      minuteField.value = String(parsed.minute);
+      updateProjectScheduleBuilderModeButtons(parsed.mode);
+      updateProjectScheduleBuilderPreview();
+    }
+
+    function applyProjectScheduleBuilder() {
+      const cronField = document.getElementById('project-settings-schedule-cron');
+      if (!cronField) return;
+      const built = buildProjectScheduleBuilderCron();
+      if (built) cronField.value = built;
+      updateProjectScheduleBuilderModeButtons(document.getElementById('project-settings-schedule-builder-mode')?.value || 'custom');
+      updateProjectScheduleBuilderPreview();
+    }
+
+    function onProjectScheduleCronInput() {
+      syncProjectScheduleBuilder();
+    }
+
+    function syncProjectSettingsFormControls(projectOverview) {
+      const continuationPolicy = projectOverview?.project?.defaultSettings?.continuationPolicy || {};
+      const autoProgress = projectOverview?.project?.defaultSettings?.autoProgress || {};
+      const setChecked = (id, checked) => {
+        const node = document.getElementById(id);
+        if (node) node.checked = checked === true;
+      };
+      const setValue = (id, value) => {
+        const node = document.getElementById(id);
+        if (node) node.value = String(value ?? '');
+      };
+      setChecked('project-settings-run-loop-enabled', continuationPolicy.runLoop?.enabled === true);
+      setValue('project-settings-run-loop-mode', continuationPolicy.runLoop?.mode === 'until-goal' ? 'until-goal' : 'repeat-count');
+      setValue('project-settings-run-loop-max-runs', Math.max(1, Number(continuationPolicy.runLoop?.maxRuns || 3) || 3));
+      setValue('project-settings-run-loop-max-failures', Math.max(1, Number(continuationPolicy.runLoop?.maxConsecutiveFailures || 3) || 3));
+      setChecked('project-settings-pause-on-failures', autoProgress.pauseOnRepeatedFailures !== false);
+      setValue('project-settings-max-failures', Math.max(1, Number(autoProgress.maxConsecutiveFailures || 3) || 3));
+      syncProjectScheduleBuilder(projectOverview);
+    }
+
     function renderTaskMeta(task, artifacts) {
       if (!task) {
         return '<div class="mini-card"><span class="k">선택 상태</span><div class="v">태스크를 선택하세요</div></div>';
       }
-      const changedCount = normalizeChangedFiles(artifacts?.changedFiles).length;
+      const changedCount = resolveChangedFiles(task, artifacts).length;
       const reviewRoute = task.lastExecution?.reviewRoute || 'pending';
       const actionCount = Object.values(task.lastExecution?.actionCounts || {}).reduce((sum, value) => sum + Number(value || 0), 0);
       const verification = artifacts?.verificationJson || task.lastExecution?.verification || {};
@@ -1403,7 +1561,8 @@ let runs = [];
       browserReadinessLabel,
       browserReadinessDetail,
       getSelectedProjectId: () => selectedProjectId,
-      getProjectOverview: (projectId) => projectOverviewState.get(projectId)
+      getProjectOverview: (projectId) => projectOverviewState.get(projectId),
+      getRecentPhaseTransition: (projectId) => recentPhaseTransitionsByProjectId.get(projectId) || null
     });
 
     if (!window.HarnessUiModalActions?.createModalActions) {
@@ -1472,9 +1631,10 @@ let runs = [];
       setDraftDiagnostics: (next) => {
         draftDiagnostics = next;
       },
-      buildProjectPayloadFromForm,
-      buildStarterRunPayload,
+      getRunPresetFormDefaults,
+      normalizeMaxChainDepth,
       refreshProjects,
+      refreshProjectOverview,
       refreshRuns,
       selectRun,
       selectProject
@@ -1484,41 +1644,9 @@ let runs = [];
     applyStaticTranslations();
 
     function renderTaskDefinition(task, options = {}) {
-      if (!task) {
-        return '<div class="stack-item">태스크를 선택하면 목표와 완료 조건을 볼 수 있습니다.</div>';
-      }
-      const compact = options.compact === true;
-      return `
-        <div class="task-definition ${compact ? 'compact' : ''}">
-          <div class="task-definition-head">
-            <div>
-              <strong>${escapeHtml(task.id)}</strong>
-              <div style="margin-top: 4px; font-size: 15px;">${escapeHtml(task.title)}</div>
-            </div>
-            <span class="status-badge ${escapeHtml(task.status)}">${escapeHtml(statusLabel(task.status))}</span>
-          </div>
-          <div class="detail-list">
-            ${renderDetailItem('목표', task.goal, '목표 미정')}
-            ${renderDetailItem('선행 태스크', (task.dependsOn || []).join(', '), '없음')}
-          </div>
-          <div class="definition-grid">
-            <div>
-              <h4>예상 변경 파일</h4>
-              ${renderListChips(task.filesLikely, '지정되지 않음')}
-            </div>
-            <div>
-              <h4>완료 조건</h4>
-              ${renderListChips(task.acceptanceChecks, '정의되지 않음')}
-            </div>
-          </div>
-          ${compact ? '' : `
-            <div>
-              <h4 style="margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted);">제약사항</h4>
-              ${renderListChips(task.constraints, '추가 제약 없음')}
-            </div>
-          `}
-        </div>
-      `;
+      return window.HarnessRunRenderers?.renderTaskDefinition
+        ? window.HarnessRunRenderers.renderTaskDefinition(task, options, { escapeHtml, renderDetailItem, renderListChips, statusLabel })
+        : '';
     }
 
     function renderAgentBlueprint(run) {
@@ -1725,55 +1853,19 @@ let runs = [];
     }
 
     function renderPlanPreview(run, limit = 4) {
-      const tasks = Array.isArray(run.tasks) ? run.tasks : [];
-      const visibleTasks = tasks.slice(0, limit);
-      const executionPolicy = run.executionPolicy || {};
-      return `
-        <div class="stack" style="margin-bottom: 24px;">
-          <div class="card">
-            <h3>승인할 계획</h3>
-            <div class="stack-item warning-item" style="margin-bottom: 14px;">
-              <strong>대부분은 아래 3가지만 보면 됩니다</strong>
-              <div style="margin-top: 6px;">1. 목표가 맞는지 2. 제외 범위를 넘지 않는지 3. 첫 작업이 이상하지 않은지</div>
-              <div style="margin-top: 6px; color: var(--muted);">문제가 없으면 바로 시작해도 됩니다. 목표 자체가 다르거나, 손대면 안 되는 영역을 건드리면 그때만 계획을 다시 조정하면 됩니다.</div>
-            </div>
-            <div class="metric-row">
-              <div class="mini-card"><span class="k">태스크</span><div class="v">${escapeHtml(tasks.length)}</div></div>
-              <div class="mini-card"><span class="k">에이전트</span><div class="v">${escapeHtml((run.agents || []).length)}</div></div>
-              <div class="mini-card"><span class="k">진행 패턴</span><div class="v">${escapeHtml(describePattern(run.clarify?.architecturePattern || 'auto'))}</div></div>
-              <div class="mini-card"><span class="k">작업 방식</span><div class="v">${escapeHtml(describePreset(run.preset))}</div></div>
-            </div>
-            <div class="detail-list">
-              ${renderDetailItem(t('한 줄 요약', 'Summary'), run.planSummary, t('계획 요약이 아직 없습니다.', 'No plan summary yet.'))}
-              ${renderDetailItem(t('역할 분담', 'Execution model'), run.executionModel || run.clarify?.executionModel, t('역할 분담 정보 없음', 'No execution model'))}
-              ${renderDetailItem(t('자동 진행 규칙', 'Automation policy'), (executionPolicy.policyNotes || []).join(' | '), t('추가 규칙 없음', 'No extra policy notes'))}
-            </div>
-          </div>
-          <div class="card">
-            <h3>${escapeHtml(t('생성된 에이전트', 'Generated agents'))}</h3>
-            ${renderAgentBlueprint(run)}
-          </div>
-          <div class="card">
-            <div style="display:flex; align-items:center; justify-content:space-between; gap:12px;">
-              <h3 style="margin:0;">${escapeHtml(t('생성된 태스크', 'Generated tasks'))}</h3>
-              <div style="display:flex; gap:8px; flex-wrap:wrap;">
-                ${canEditPlan(run) ? '<button class="secondary-btn" onclick="openPlanEditModal()">계획 내용 수정</button>' : ''}
-                ${tasks.length > limit ? `<button class="secondary-btn" onclick="switchTab('planning')">전체 보기</button>` : ''}
-              </div>
-            </div>
-            <div class="stack-list" style="margin-top: 12px;">
-              ${visibleTasks.map((task) => `
-                <div class="stack-item interactive" onclick="openTaskDetails('${task.id}')">
-                  <strong>${escapeHtml(task.id)} · ${escapeHtml(task.title)}</strong>
-                  <div style="margin-top: 6px;">${escapeHtml(clip(task.goal, 220) || t('목표 없음', 'No goal'))}</div>
-                  <div style="margin-top: 8px; font-size: 12px; color: var(--muted);">${escapeHtml(t('예상 파일', 'Likely files'))}: ${escapeHtml((task.filesLikely || []).join(', ') || t('미정', 'Not decided'))}</div>
-                  <div style="margin-top: 8px;">${renderListChips((task.acceptanceChecks || []).slice(0, 3), t('완료 조건 없음', 'No acceptance criteria'))}</div>
-                </div>
-              `).join('') || `<div class="stack-item">${escapeHtml(t('생성된 태스크가 없습니다.', 'No tasks were generated.'))}</div>`}
-            </div>
-          </div>
-        </div>
-      `;
+      return window.HarnessRunRenderers?.renderPlanPreview
+        ? window.HarnessRunRenderers.renderPlanPreview(run, limit, {
+            canEditPlan,
+            clip,
+            describePattern,
+            describePreset,
+            escapeHtml,
+            renderAgentBlueprint,
+            renderDetailItem,
+            renderListChips,
+            t
+          })
+        : '';
     }
 
     function getRecoveryFocusTask(run) {
@@ -1818,63 +1910,32 @@ let runs = [];
       `;
     }
 
+    function deriveRestartRecovery(run) {
+      return window.HarnessRunRenderers?.deriveRestartRecovery
+        ? window.HarnessRunRenderers.deriveRestartRecovery(run, { t })
+        : null;
+    }
+
+    function renderRestartRecoveryNotice(run) {
+      return window.HarnessRunRenderers?.renderRestartRecoveryNotice
+        ? window.HarnessRunRenderers.renderRestartRecoveryNotice(run, { deriveRestartRecovery, escapeHtml, renderDetailItem, t })
+        : '';
+    }
+
     function buildStructuredSpecText(form) {
-      const sections = [
-        ['성공 조건', form.get('successCriteria')],
-        ['제외 범위', form.get('excludedScope')],
-        ['대상 사용자', form.get('targetUsers')],
-        ['예시 입력 / 출력', form.get('exampleIO')],
-        ['변경 금지 영역', form.get('protectedAreas')]
-      ].filter(([, value]) => String(value || '').trim());
-      return sections.map(([title, value]) => `## ${title}\\n\\n${String(value || '').trim()}`).join('\\n\\n');
+      return modalActions.buildStructuredSpecText(form);
     }
 
     function buildStructuredSpecTextFromDraft(draft = {}) {
-      const sections = [
-        ['성공 조건', draft.successCriteria],
-        ['제외 범위', draft.excludedScope]
-      ].filter(([, value]) => String(value || '').trim());
-      return sections.map(([title, value]) => `## ${title}\\n\\n${String(value || '').trim()}`).join('\\n\\n');
+      return modalActions.buildStructuredSpecTextFromDraft(draft);
     }
 
     function buildProjectPayloadFromForm(form, options = {}) {
-      const draft = options?.draft || {};
-      const title = String(form.get('title') || '').trim() || String(draft.title || '').trim();
-      const rootPath = String(form.get('rootPath') || '').trim() || String(draft.rootPath || '').trim();
-      const charterText = String(form.get('charterText') || '').trim() || String(draft.charterText || '').trim();
-      const defaultPresetId = String(form.get('defaultPresetId') || '').trim() || String(draft.defaultPresetId || '').trim() || 'auto';
-      const phaseTitle = String(form.get('phaseTitle') || '').trim() || String(options?.preferDraftPhase ? draft.phaseTitle || '' : '').trim();
-      const phaseGoal = String(form.get('phaseGoal') || '').trim() || String(options?.preferDraftPhase ? draft.phaseGoal || '' : '').trim();
-      return {
-        title,
-        rootPath,
-        charterText,
-        defaultPresetId,
-        bootstrapRepoDocs: Boolean(form.get('bootstrapRepoDocs')),
-        phases: phaseTitle || phaseGoal
-          ? [{ id: 'P001', title: phaseTitle || 'Foundation', goal: phaseGoal, status: 'active' }]
-          : []
-      };
+      return modalActions.buildProjectPayloadFromForm(form, options);
     }
 
     function buildStarterRunPayload(project, intake) {
-      const draft = intake?.starterRunDraft || {};
-      const presetId = draft.presetId || project?.defaultPresetId || 'auto';
-      const defaults = getRunPresetFormDefaults(presetId);
-      return {
-        title: draft.title || `${project?.title || 'project'}-intake`,
-        projectId: project?.id || '',
-        projectPath: intake?.rootPath || project?.rootPath || '',
-        presetId,
-        objective: draft.objective || '',
-        specText: buildStructuredSpecTextFromDraft(draft),
-        specFiles: draft.specFilesText || '',
-        settings: {
-          maxParallel: defaults.maxParallel,
-          maxTaskAttempts: defaults.maxTaskAttempts,
-          maxGoalLoops: defaults.maxGoalLoops
-        }
-      };
+      return modalActions.buildStarterRunPayload(project, intake);
     }
 
     function setFieldValue(id, value) {
@@ -2215,10 +2276,13 @@ let runs = [];
     function normalizeProjectContinuationPolicy(policy = {}) {
       const source = policy && typeof policy === 'object' ? policy : {};
       const mode = ['manual', 'guided'].includes(String(source.mode || '').trim()) ? String(source.mode || '').trim() : 'guided';
+      const maxChainDepth = normalizeMaxChainDepth(source.maxChainDepth);
       return {
         mode,
+        autoChainOnComplete: source.autoChainOnComplete === true,
         autoQualitySweepOnPhaseComplete: source.autoQualitySweepOnPhaseComplete === true,
-        keepDocsInSync: source.keepDocsInSync !== false
+        keepDocsInSync: source.keepDocsInSync !== false,
+        maxChainDepth
       };
     }
 
@@ -2409,7 +2473,8 @@ let runs = [];
         <div style="margin-top:8px; color: var(--muted);">${escapeHtml(t('기본 작업 방식', 'Default work style'))}: ${escapeHtml(describePreset(project.defaultPresetId || 'auto'))}</div>
         <div style="margin-top:4px; color: var(--muted);">${escapeHtml(t('기본 담당 AI', 'Default agents'))}: ${escapeHtml(providerSummary)}</div>
         <div style="margin-top:4px; color: var(--muted);">${escapeHtml(t('기본 도구 프로필', 'Default tool profile'))}: ${escapeHtml(toolProfile?.label || toolProfile?.id || 'default')} · ${escapeHtml(t('브라우저 확인 기본 정책', 'Browser policy'))}: ${escapeHtml(browserPolicyLabel)} · ${escapeHtml(t('브라우저 검증', 'Browser verification'))}: ${escapeHtml(browserReadinessLabel(browserVerification, runtimeBrowser))} · ${escapeHtml(t('개발 서버', 'Dev server'))}: ${escapeHtml(devServer?.command || t('미설정', 'Not set'))}</div>
-        <div style="margin-top:4px; color: var(--muted);">${escapeHtml(t('연속 작업 운영', 'Continuation mode'))}: ${escapeHtml(continuationModeLabel(continuationPolicy.mode))} · ${escapeHtml(t('문서 동기화', 'Docs sync'))} ${escapeHtml(docsSyncChoiceLabel(continuationPolicy.keepDocsInSync))} · ${escapeHtml(t('단계 완료 시 정리 점검', 'Phase-close quality sweep'))} ${escapeHtml(autoSweepChoiceLabel(continuationPolicy.autoQualitySweepOnPhaseComplete))}</div>
+        <div style="margin-top:4px; color: var(--muted);">${escapeHtml(t('연속 작업 운영', 'Continuation mode'))}: ${escapeHtml(continuationModeLabel(continuationPolicy.mode))} · ${escapeHtml(t('문서 동기화', 'Docs sync'))} ${escapeHtml(docsSyncChoiceLabel(continuationPolicy.keepDocsInSync))} · ${escapeHtml(t('단계 완료 시 정리 점검', 'Phase-close quality sweep'))} ${escapeHtml(autoSweepChoiceLabel(continuationPolicy.autoQualitySweepOnPhaseComplete))} · ${escapeHtml(t('자동 체이닝', 'Auto-chain after run'))} ${escapeHtml(autoChainChoiceLabel(continuationPolicy.autoChainOnComplete))} · ${escapeHtml(t('최대 연쇄 수', 'Max chain depth'))}: ${Math.max(continuationPolicy.maxChainDepth, 0)}</div>
+        ${(continuationPolicy.runLoop?.enabled) ? `<div style="margin-top:4px; color: var(--muted);">${escapeHtml(t('기본 런 루프', 'Default run loop'))}: ${escapeHtml(continuationPolicy.runLoop.mode === 'until-goal' ? t('목표 달성까지 반복', 'Repeat until goal achieved') : t('정해진 횟수 반복', 'Repeat N runs'))} · ${escapeHtml(t('최대 반복', 'Max runs'))} ${escapeHtml(String(continuationPolicy.runLoop.maxRuns || 3))} · ${escapeHtml(t('실패 중단', 'Failure stop'))} ${escapeHtml(String(continuationPolicy.runLoop.maxConsecutiveFailures || 3))}</div>` : ''}
         <div style="margin-top:4px; color: var(--muted);">${escapeHtml(t('짧게 적어도 됩니다. Codex가 현재 단계, 이전 run, 문서 문맥을 보고 목표와 성공 조건 초안을 함께 다듬습니다.', 'A short prompt is enough. Codex will use the current phase, previous runs, and docs context to refine the goal and success criteria draft.'))}</div>
         `;
       }
@@ -2446,6 +2511,7 @@ let runs = [];
         <div class="run-item ${run.id === selectedRunId ? 'active' : ''}" data-status="${escapeHtml(run.status)}" onclick="selectRun('${run.id}')">
           <strong>${escapeHtml(run.title)}</strong>
           <small>${statusLabel(run.status)} · ${escapeHtml(formatTimestamp(run.updatedAt))}</small>
+          ${describeRunChainStatus(run) ? `<small>${escapeHtml(describeRunChainStatus(run))}</small>` : ''}
           <small>태스크 ${escapeHtml(run.taskCounts?.total ?? run.tasks?.length ?? 0)} · 완료 ${escapeHtml((run.taskCounts?.done ?? 0) + (run.taskCounts?.skipped ?? 0))} · 실패 ${escapeHtml(run.taskCounts?.failed ?? 0)}</small>
         </div>
       `).join('');
@@ -2501,6 +2567,7 @@ let runs = [];
       const result = modalActions.openCreateModal();
       if (selectedProjectId && !createRunDraftContext) {
         const project = selectedProjectSummary();
+        applyProjectRunLoopDefaults(project);
         const continuationPolicy = normalizeProjectContinuationPolicy(project?.defaultSettings?.continuationPolicy);
         if (continuationPolicy.mode === 'guided') {
           applySuggestedProjectRunDraft({ silent: true });
@@ -2561,8 +2628,44 @@ let runs = [];
 
     async function refreshProjectOverview(projectId, options = {}) {
       if (!projectId) return null;
+      const previousOverview = projectOverviewState.get(projectId);
       const overview = await request('/api/projects/' + projectId);
       projectOverviewState.set(projectId, overview);
+      const previousHealth = String(previousOverview?.project?.healthDashboard?.status || '').trim();
+      const nextHealth = String(overview?.project?.healthDashboard?.status || '').trim();
+      const previousPhaseId = String(previousOverview?.project?.currentPhaseId || '').trim();
+      const nextPhaseId = String(overview?.project?.currentPhaseId || '').trim();
+      const previousPauseReason = String(previousOverview?.project?.supervisorStatus?.runtime?.pausedReason || '').trim();
+      const nextPauseReason = String(overview?.project?.supervisorStatus?.runtime?.pausedReason || '').trim();
+      const severityRank = (value) => ({ healthy: 0, watch: 1, attention: 2 }[String(value || '').trim()] ?? -1);
+      if (selectedProjectId === projectId && previousHealth && severityRank(nextHealth) > severityRank(previousHealth)) {
+        const statusLabel = nextHealth === 'attention'
+          ? t('운영 주의', 'Attention needed')
+          : t('관찰 필요', 'Watch closely');
+        const detail = overview?.project?.healthDashboard?.reminder?.detail
+          || overview?.project?.healthDashboard?.repeatedFailures?.summary
+          || overview?.project?.healthDashboard?.docsDrift?.summary
+          || '';
+        setBanner(`${statusLabel}: ${detail || t('프로젝트 자동화 상태를 다시 확인하세요.', 'Review the project automation state again.')}`, 'info');
+        setToast(`${statusLabel}: ${detail || t('자동화 경로를 다시 확인하세요.', 'Review the automation path again.')}`, 'info');
+      } else if (selectedProjectId === projectId && nextPauseReason && nextPauseReason !== previousPauseReason) {
+        setBanner(t(`Supervisor 자동 일시중지: ${nextPauseReason}`, `Supervisor auto-paused: ${nextPauseReason}`), 'info');
+        setToast(t(`Supervisor 정지 사유: ${nextPauseReason}`, `Supervisor stop reason: ${nextPauseReason}`), 'info');
+      }
+      if (selectedProjectId === projectId && previousPhaseId && nextPhaseId && previousPhaseId !== nextPhaseId) {
+        recentPhaseTransitionsByProjectId.set(projectId, {
+          phaseId: nextPhaseId,
+          fromPhaseId: previousPhaseId,
+          at: Date.now()
+        });
+        const nextPhase = (Array.isArray(overview?.phases) ? overview.phases : []).find((phase) => String(phase?.id || '').trim() === nextPhaseId);
+        setToast(
+          nextPhase?.title
+            ? t(`자동으로 ${nextPhase.title} 단계로 전환했습니다.`, `Auto-advanced into phase ${nextPhase.title}.`)
+            : t('프로젝트 단계가 자동 전환되었습니다.', 'The project phase advanced automatically.'),
+          'success'
+        );
+      }
       if (options.render !== false && selectedProjectId === projectId && !selectedRunId) {
         renderDetail();
       }
@@ -2700,44 +2803,7 @@ let runs = [];
     }
 
     async function saveProjectSettings() {
-      if (!selectedProjectId) return;
-      const toolActions = String(document.getElementById('project-settings-tool-actions')?.value || '')
-        .split(',')
-        .map((item) => item.trim())
-        .filter(Boolean);
-      const payload = {
-        charterText: document.getElementById('project-settings-charter')?.value || '',
-        defaultPresetId: document.getElementById('project-settings-preset')?.value || 'auto',
-        providerProfile: {
-          coordinationProvider: document.getElementById('project-settings-coordination-provider')?.value || 'codex',
-          workerProvider: document.getElementById('project-settings-worker-provider')?.value || 'codex'
-        },
-        toolProfile: {
-          id: document.getElementById('project-settings-tool-id')?.value || 'default',
-          label: document.getElementById('project-settings-tool-label')?.value || 'Default',
-          allowedActionClasses: toolActions
-        },
-        browserVerification: {
-          url: document.getElementById('project-settings-browser-url')?.value || ''
-        },
-        devServer: {
-          command: document.getElementById('project-settings-dev-command')?.value || ''
-        },
-        continuationPolicy: {
-          mode: document.getElementById('project-settings-continuation-mode')?.value || 'guided',
-          autoQualitySweepOnPhaseComplete: document.getElementById('project-settings-auto-sweep')?.checked === true,
-          keepDocsInSync: document.getElementById('project-settings-doc-sync')?.checked !== false
-        }
-      };
-      await runUiAction('save-project-settings', async () => {
-        await request(`/api/projects/${selectedProjectId}`, {
-          method: 'POST',
-          body: JSON.stringify(payload)
-        });
-        await refreshProjectOverview(selectedProjectId, { render: false });
-        await refreshProjects();
-        renderDetail();
-      }, '프로젝트 기본 설정을 저장했습니다.');
+      return modalActions.saveProjectSettings();
     }
 
     async function saveProjectPhaseContract(phaseId) {
@@ -2995,6 +3061,132 @@ let runs = [];
       };
     }
 
+    function deriveRunQueueInsights(run, stats) {
+      const tasks = Array.isArray(run?.tasks) ? run.tasks : [];
+      const activeTasks = tasks.filter((task) => task.status === 'in_progress').slice(0, 2);
+      const queuedTasks = tasks.filter((task) => task.status === 'ready').slice(0, 3);
+      const done = Math.min(stats.done, stats.total);
+      const remaining = Math.max(0, stats.total - done);
+      const parallelism = Math.max(1, Number(run?.settings?.maxParallel || 1) || 1);
+      const batchCount = remaining > 0 ? Math.max(1, Math.ceil(remaining / parallelism)) : 0;
+      const completion = stats.total > 0 ? Math.round((done / stats.total) * 100) : 0;
+      let eta = '';
+      if (remaining > 0) {
+        eta = activeTasks.length > 0
+          ? t(`약 ${batchCount}개 배치 남음`, `About ${batchCount} batch(es) remaining`)
+          : t(`대기 ${remaining}개`, `${remaining} queued`);
+      }
+      return {
+        completion,
+        remaining,
+        activeTasks,
+        queuedTasks,
+        eta,
+        batchCount
+      };
+    }
+
+    function renderRunQueueProgress(run, stats) {
+      const queue = deriveRunQueueInsights(run, stats);
+      if (!stats.total) return '';
+      const nextItems = queue.queuedTasks.length
+        ? queue.queuedTasks.map((task) => `${task.id} ${clip(task.title || '', 40)}`.trim()).join(' | ')
+        : t('추가 대기 태스크 없음', 'No queued follow-up tasks');
+      const activeItems = queue.activeTasks.length
+        ? queue.activeTasks.map((task) => `${task.id} ${clip(task.title || '', 40)}`.trim()).join(' | ')
+        : t('현재 실행 중인 태스크 없음', 'No task is actively running');
+      return `
+        <div class="card" style="margin-bottom: 18px; border: 1px solid rgba(15,23,42,0.08); background: linear-gradient(180deg, rgba(248,250,252,0.96), rgba(255,255,255,1));">
+          <div class="section-head" style="margin-bottom: 12px;">
+            <div>
+              <span class="eyebrow">${escapeHtml(t('런 큐 진행', 'Run queue progress'))}</span>
+              <h3>${escapeHtml(t(`완료 ${queue.completion}% · 남은 배치 ${queue.batchCount || 0}`, `${queue.completion}% complete · ${queue.batchCount || 0} batch(es) left`))}</h3>
+            </div>
+            <p>${escapeHtml(t('실시간 태스크 큐와 남은 흐름을 한 장에서 읽습니다.', 'Read the live task queue and remaining flow in one place.'))}</p>
+          </div>
+          <div style="height:10px; border-radius:999px; background:rgba(15,23,42,0.08); overflow:hidden;">
+            <div style="height:100%; width:${escapeHtml(String(queue.completion))}%; background:linear-gradient(90deg, rgba(15,23,42,0.92), rgba(59,130,246,0.82));"></div>
+          </div>
+          <div class="stats-grid" style="margin-top: 12px;">
+            <div class="stat-card"><span class="label">${escapeHtml(t('실행 중', 'Active now'))}</span><div class="value">${escapeHtml(String(stats.progress || 0))}</div></div>
+            <div class="stat-card"><span class="label">${escapeHtml(t('대기 큐', 'Queued'))}</span><div class="value">${escapeHtml(String(stats.ready || 0))}</div></div>
+            <div class="stat-card"><span class="label">${escapeHtml(t('실패/검토', 'Failed / review'))}</span><div class="value">${escapeHtml(String(stats.failed || 0))}</div></div>
+            <div class="stat-card"><span class="label">${escapeHtml(t('예상 남은 흐름', 'ETA'))}</span><div class="value">${escapeHtml(queue.eta || t('거의 마무리', 'Nearly done'))}</div></div>
+          </div>
+          <div class="stack-list" style="margin-top: 12px;">
+            <div class="stack-item"><strong>${escapeHtml(t('현재 실행', 'Running now'))}</strong><div>${escapeHtml(activeItems)}</div></div>
+            <div class="stack-item"><strong>${escapeHtml(t('다음 큐', 'Next up'))}</strong><div>${escapeHtml(nextItems)}</div></div>
+          </div>
+        </div>
+      `;
+    }
+
+    function describeRunChainStatus(run) {
+      const chainDepth = normalizeMaxChainDepth(run?.chainDepth);
+      const chainedFromRunId = String(run?.chainedFromRunId || '').trim();
+      const loop = run?.chainMeta?.loop || null;
+      if (loop?.enabled) {
+        const loopLabel = loop.mode === 'until-goal'
+          ? t(`자동 루프 ${loop.currentRunIndex}/${loop.maxRuns} · 목표까지 반복`, `Auto loop ${loop.currentRunIndex}/${loop.maxRuns} · until goal`)
+          : t(`자동 루프 ${loop.currentRunIndex}/${loop.maxRuns}`, `Auto loop ${loop.currentRunIndex}/${loop.maxRuns}`);
+        if (run?.chainMeta?.chainStopped === true) {
+          return `${loopLabel} · ${t('중단됨', 'Stopped')}`;
+        }
+        if (Number(loop.consecutiveFailures || 0) > 0) {
+          return `${loopLabel} · ${t(`연속 실패 ${loop.consecutiveFailures}`, `${loop.consecutiveFailures} failed in a row`)}`;
+        }
+        return loopLabel;
+      }
+      if (run?.chainMeta?.chainStopped === true) {
+        return t('자동 체인 중단됨', 'Auto-chain stopped');
+      }
+      if (chainedFromRunId || chainDepth > 0) {
+        return t(`자동 체인 ${chainDepth}단계`, `Auto-chain depth ${chainDepth}`);
+      }
+      if (run?.chainMeta?.trigger) {
+        return t('자동 체인 후보 있음', 'Auto-chain candidate');
+      }
+      return '';
+    }
+
+    function renderRunAutomationStatus(run) {
+      const loop = run?.chainMeta?.loop || null;
+      const chainSummary = describeRunChainStatus(run);
+      if (!chainSummary && !loop) return '';
+      const loopModeLabel = loop?.mode === 'until-goal'
+        ? t('목표 달성까지 반복', 'Repeat until goal')
+        : t('정해진 횟수 반복', 'Repeat fixed count');
+      const chainDepth = normalizeMaxChainDepth(run?.chainDepth);
+      const nextLoop = loop?.enabled && Number(loop.currentRunIndex || 1) < Number(loop.maxRuns || 1)
+        ? `${Number(loop.currentRunIndex || 1) + 1}/${Number(loop.maxRuns || 1)}`
+        : t('없음', 'None');
+      return `
+        <div class="card" style="margin-bottom: 18px;">
+          <div class="section-head" style="margin-bottom: 12px;">
+            <div>
+              <span class="eyebrow">${escapeHtml(t('자동 진행', 'Automation'))}</span>
+              <h3>${escapeHtml(chainSummary || t('수동 실행', 'Manual run'))}</h3>
+              ${loop?.enabled ? `<div style="margin-top:6px; color:var(--muted); font-size:12px;">${escapeHtml(t(`전용 루프 진행 패널 · ${Number(loop.currentRunIndex || 1)} / ${Number(loop.maxRuns || 1)}회 | 체인 depth ${chainDepth} | 모드: ${loop.mode === 'until-goal' ? 'until-goal' : 'repeat-count'}`, `Loop progress panel · ${Number(loop.currentRunIndex || 1)} / ${Number(loop.maxRuns || 1)} | chain depth ${chainDepth} | mode: ${loop.mode === 'until-goal' ? 'until-goal' : 'repeat-count'}`))}</div>` : ''}
+            </div>
+            <p>${escapeHtml(loop?.enabled
+              ? t('런 사이 자동 반복, 실패 중단 임계값, 계보를 함께 봅니다.', 'See run-to-run repetition, failure stop threshold, and lineage together.')
+              : t('이 run은 자동 루프 없이 동작합니다.', 'This run is operating without a run-level loop.'))}</p>
+          </div>
+          <div class="stats-grid">
+            <div class="stat-card"><span class="label">${escapeHtml(t('현재 반복', 'Current loop'))}</span><div class="value">${escapeHtml(loop?.enabled ? `${Number(loop.currentRunIndex || 1)}/${Number(loop.maxRuns || 1)}` : '-')}</div></div>
+            <div class="stat-card"><span class="label">${escapeHtml(t('루프 방식', 'Loop mode'))}</span><div class="value">${escapeHtml(loop?.enabled ? loopModeLabel : t('꺼짐', 'Off'))}</div></div>
+            <div class="stat-card"><span class="label">${escapeHtml(t('다음 반복', 'Next loop'))}</span><div class="value">${escapeHtml(nextLoop)}</div></div>
+            <div class="stat-card"><span class="label">${escapeHtml(t('실패 중단 임계값', 'Failure stop'))}</span><div class="value">${escapeHtml(loop?.enabled ? `${Number(loop.consecutiveFailures || 0)}/${Number(loop.maxConsecutiveFailures || 0)}` : '-')}</div></div>
+          </div>
+          <div class="stack-list" style="margin-top: 12px;">
+            ${run.chainedFromRunId ? `<div class="stack-item"><strong>${escapeHtml(t('이전 run', 'Previous run'))}</strong><div>${escapeHtml(run.chainedFromRunId)}</div></div>` : ''}
+            ${run.chainMeta?.originRunId ? `<div class="stack-item"><strong>${escapeHtml(t('루프 시작 run', 'Loop origin run'))}</strong><div>${escapeHtml(run.chainMeta.originRunId)}</div></div>` : ''}
+            ${run.chainMeta?.reason ? `<div class="stack-item"><strong>${escapeHtml(t('자동 진행 이유', 'Automation reason'))}</strong><div>${escapeHtml(run.chainMeta.reason)}</div></div>` : ''}
+          </div>
+        </div>
+      `;
+    }
+
     function latestLog(run) {
       const logs = run.logs || [];
       return logs.length ? logs[logs.length - 1] : null;
@@ -3182,6 +3374,9 @@ let runs = [];
               </div>
             </div>
           `;
+        if (projectOverview) {
+          syncProjectSettingsFormControls(projectOverview);
+        }
         restoreCurrentDetailUiState();
         return;
       }
@@ -3214,11 +3409,13 @@ let runs = [];
           <div style="display: flex; align-items: center; gap: 16px;">
             <h2>${escapeHtml(run.title)}</h2>
             ${renderStatusBadge(run.status)}
+            ${run.chainMeta?.chainStopped ? `<span class="status-badge warning">${escapeHtml(t('체인 중단', 'Chain stopped'))}</span>` : ''}
           </div>
         </div>
         <div class="header-actions">
           <button class="primary" onclick="startRun()" ${isBusy('start-run') ? 'disabled' : ''}>${escapeHtml(isBusy('start-run') ? t('처리 중...', 'Working...') : t('시작/재개', 'Start / resume'))}</button>
           <button class="danger" onclick="stopRun()" ${isBusy('stop-run') ? 'disabled' : ''}>${escapeHtml(isBusy('stop-run') ? t('처리 중...', 'Working...') : t('정지', 'Stop'))}</button>
+          <button class="secondary-btn" onclick="stopAutoChainRun()" ${isBusy('stop-auto-chain') ? 'disabled' : ''}>${escapeHtml(t('자동 체인 중단', 'Stop auto-chain'))}</button>
           <button onclick="deleteRunUi()" ${isBusy('delete-run') ? 'disabled' : ''}>${escapeHtml(isBusy('delete-run') ? t('삭제 중...', 'Deleting...') : t('삭제', 'Delete'))}</button>
         </div>
       `;
@@ -3248,6 +3445,7 @@ let runs = [];
             ${renderHumanGate(run)}
           </div>
           ${deriveRunSignalRail(run, stats)}
+          ${renderRunQueueProgress(run, stats)}
           <div class="board-section">
             <div class="section-head">
               <div>
@@ -3264,8 +3462,11 @@ let runs = [];
             </div>
           </div>
           ${renderOverviewHighlights(run, stats)}
+          ${renderRunAutomationStatus(run)}
           ${renderProgressSummary(run)}
+          ${renderRestartRecoveryNotice(run)}
           ${renderDecisionPanel(run)}
+          ${renderAutoReplanStatus(run)}
           ${renderRecoveryGuide(run)}
           ${runtimeSignals ? `
             <details class="advanced-settings" style="margin-bottom: 18px;">
@@ -3318,6 +3519,12 @@ let runs = [];
                   ${renderDetailItem(t('자동 진행 규칙', 'Automation policy'), (run.executionPolicy?.policyNotes || []).join(' | '), t('추가 규칙 없음', 'No extra policy notes'))}
                   ${renderDetailItem(t('동시 진행 여부', 'Parallelism'), deriveParallelReason(run), t('설명 없음', 'No explanation'))}
                 </div>
+                ${normalizeExecutionPolicyRules(run.executionPolicy).length ? `
+                  <div style="margin-top: 14px;">
+                    <strong>${escapeHtml(t('왜 이런 태스크가 추가됐는지', 'Why the harness changed this plan'))}</strong>
+                    ${renderExecutionPolicyRuleList(run.executionPolicy)}
+                  </div>
+                ` : ''}
               </div>
               <div class="card">
                 <h3>${escapeHtml(t('계획된 태스크', 'Planned tasks'))}</h3>
@@ -3347,6 +3554,7 @@ let runs = [];
                   ${renderDetailItem(t('가정', 'Assumptions'), (run.clarify?.assumptions || []).join(' | '), t('가정 없음', 'No assumptions'))}
                 </div>
               </div>
+              ${renderAutoReplanStatus(run)}
             </div>
           </div>
         `;
@@ -3602,6 +3810,44 @@ let runs = [];
         await refreshRuns();
       });
     }
+    async function stopAutoChainRun() {
+      if (!selectedRunId) return;
+      const run = runs.find((item) => item.id === selectedRunId);
+      if (!run) return;
+      await runUiAction('stop-auto-chain', async () => {
+        await request(`/api/runs/${selectedRunId}/chain-stop`, {
+          method: 'POST',
+          body: JSON.stringify({ reason: t('사용자 요청으로 자동 체인 중단') })
+        });
+        await refreshRuns();
+      }, run.chainMeta?.chainStopped === true ? t('체인 중단이 이미 적용되었습니다.', 'Auto-chain is already stopped.') : t('자동 체인을 중단했습니다.', 'Auto-chain stopped.'));
+    }
+    async function toggleProjectSupervisor() {
+      if (!selectedProjectId) return;
+      const overview = projectOverviewState.get(selectedProjectId);
+      const supervisorStatus = overview?.project?.supervisorStatus || null;
+      const isActive = supervisorStatus?.active === true;
+      await runUiAction('supervisor-toggle', async () => {
+        await request(`/api/projects/${selectedProjectId}/supervisor`, {
+          method: 'POST',
+          body: JSON.stringify({ action: isActive ? 'stop' : 'start' })
+        });
+        await refreshProjectOverview(selectedProjectId, { render: false });
+        renderDetail();
+      }, isActive ? t('Supervisor를 중지했습니다.', 'Supervisor stopped.') : t('Supervisor를 시작했습니다.', 'Supervisor started.'));
+    }
+    async function runSupervisorNow() {
+      if (!selectedProjectId) return;
+      await runUiAction('supervisor-run-now', async () => {
+        await request(`/api/projects/${selectedProjectId}/supervisor`, {
+          method: 'POST',
+          body: JSON.stringify({ action: 'run-now' })
+        });
+        await refreshProjectOverview(selectedProjectId, { render: false });
+        await refreshRuns();
+        renderDetail();
+      }, t('Supervisor 즉시 실행을 요청했습니다.', 'Supervisor run triggered.'));
+    }
     async function retrySelectedTask() {
       if (!selectedRunId || !selectedTaskId) return;
       await runUiAction('retry-task', async () => {
@@ -3676,14 +3922,19 @@ let runs = [];
       const res = await request(`/api/runs/${selectedRunId}/memory?q=${encodeURIComponent(q)}`);
       const graphEdges = Array.isArray(res.graphInsights?.topEdges) ? res.graphInsights.topEdges.slice(0, 3) : [];
       const graphSymbols = Array.isArray(res.graphInsights?.topSymbols) ? res.graphInsights.topSymbols.slice(0, 5) : [];
+      const criticalRiskThreshold = Number(res.projectCodeIntelligence?.thresholds?.criticalRisk || 15);
+      const criticalSymbols = graphSymbols.filter((item) => Number(item?.riskScore || 0) > criticalRiskThreshold).slice(0, 3);
+      const highImpactFiles = Array.isArray(res.projectCodeIntelligence?.topFiles) ? res.projectCodeIntelligence.topFiles.slice(0, 3) : [];
       const temporalFiles = Array.isArray(res.temporalInsights?.activeFiles) ? res.temporalInsights.activeFiles.slice(0, 3) : [];
       const temporalRootCauses = Array.isArray(res.temporalInsights?.activeRootCauses) ? res.temporalInsights.activeRootCauses.slice(0, 2) : [];
       const graphMarkup = graphEdges.length || graphSymbols.length
         ? `
         <div style="margin-bottom: 12px; padding: 10px; background: #eef6ff; border-radius: 6px; font-size: 13px;">
           <strong>${t('그래프 메모리 힌트', 'Graph memory hints')}</strong>
-          ${graphEdges.length ? `<div style="color: var(--muted); margin-top: 4px;">${escapeHtml(graphEdges.map((item) => item.edge).join(' | '))}</div>` : ''}
-          ${graphSymbols.length ? `<div style="color: var(--muted); margin-top: 4px;">${escapeHtml(graphSymbols.map((item) => item.symbol).join(', '))}</div>` : ''}
+          ${criticalSymbols.length ? `<div style="margin-top: 6px; color: #991b1b;"><strong>${escapeHtml(`CRITICAL-RISK >= ${criticalRiskThreshold.toFixed(1)}`)}</strong> ${escapeHtml(criticalSymbols.map((item) => `${item.symbol} (${Number(item.riskScore || 0).toFixed(1)})`).join(' | '))}</div>` : ''}
+          ${graphEdges.length ? `<div style="color: var(--muted); margin-top: 4px;">${escapeHtml(graphEdges.map((item) => `${item.edge} [risk ${Number(item.riskScore || 0).toFixed(1)}]`).join(' | '))}</div>` : ''}
+          ${graphSymbols.length ? `<div style="color: var(--muted); margin-top: 4px;">${escapeHtml(graphSymbols.map((item) => `${item.symbol} (risk ${Number(item.riskScore || 0).toFixed(1)}, importers ${Number(item.importerCount || 0)}, callers ${Number(item.callerCount || 0)}${Array.isArray(item.definedIn) && item.definedIn.length ? `, defined in ${item.definedIn[0]}` : ''})`).join(' | '))}</div>` : ''}
+          ${highImpactFiles.length ? `<div style="color: var(--muted); margin-top: 4px;">${escapeHtml(`${t('고영향 파일', 'High-impact files')}: ${highImpactFiles.map((item) => `${item.path} (importedBy ${Number(item.importedByCount || 0)}, calledBy ${Number(item.calledByCount || 0)})`).join(' | ')}`)}</div>` : ''}
         </div>
       `
         : '';
@@ -3700,6 +3951,7 @@ let runs = [];
       const resultMarkup = (res.searchResults || []).map(h => `
         <div style="margin-bottom: 12px; padding: 10px; background: #f8fafc; border-radius: 6px; font-size: 13px;">
           <strong>${escapeHtml(h.title)}</strong>
+          ${Number(h?.rankingMeta?.occurrenceCount || 0) > 1 ? `<div style="color: var(--muted); margin-top: 4px;">${escapeHtml(`${t('반복도', 'Occurrence')}: ${Number(h.rankingMeta.occurrenceCount)}`)}</div>` : ''}
           <div style="color: var(--muted); margin-top: 4px;">${escapeHtml(h.snippet)}</div>
         </div>
       `).join('') || t('결과 없음', 'No results');
@@ -3767,6 +4019,12 @@ let runs = [];
             maxParallel: Number(form.get('maxParallel')),
             maxTaskAttempts: Number(form.get('maxTaskAttempts') || 2),
             maxGoalLoops: Number(form.get('maxGoalLoops') || 3)
+          },
+          runLoop: {
+            enabled: form.get('runLoopEnabled') === 'on',
+            mode: String(form.get('runLoopMode') || 'repeat-count'),
+            maxRuns: Math.max(1, Number(form.get('runLoopMaxRuns') || 3) || 3),
+            maxConsecutiveFailures: Math.max(1, Number(form.get('runLoopMaxFailures') || 3) || 3)
           }
         };
         const run = await request('/api/runs', { method: 'POST', body: JSON.stringify(data) });
@@ -3956,19 +4214,30 @@ let runs = [];
       closeAddReqModal();
     });
 
-    Promise.all([refreshRuns(true), refreshProjects(), request('/api/settings').catch(() => null)])
-      .then(([, , settings]) => {
-        if (settings) {
-          harnessSettings = settings;
-          if (setUiLanguage) {
-            setUiLanguage(settings.uiLanguage || 'en');
-          }
-          applyStaticTranslations();
-          renderSidebarLiveSnapshot();
-          renderRunList();
-          renderProjectList();
-          renderDetail();
+    Promise.allSettled([refreshRuns(true), refreshProjects(), request('/api/settings')])
+      .then((results) => {
+        const [runsResult, projectsResult, settingsResult] = results;
+        const bootFailure = [runsResult, projectsResult]
+          .find((result) => result.status === 'rejected');
+        if (bootFailure?.status === 'rejected') {
+          throw bootFailure.reason;
         }
+        if (settingsResult?.status === 'fulfilled' && settingsResult.value) {
+          harnessSettings = settingsResult.value;
+          if (setUiLanguage) {
+            setUiLanguage(settingsResult.value.uiLanguage || 'en');
+          }
+        } else if (settingsResult?.status === 'rejected') {
+          setBanner(t(
+            '설정 로드에 실패해 기본값으로 시작했습니다. 필요하면 Settings에서 다시 저장해 주세요.',
+            'Settings failed to load, so the UI started with defaults. Re-save them in Settings if needed.'
+          ));
+        }
+        applyStaticTranslations();
+        renderSidebarLiveSnapshot();
+        renderRunList();
+        renderProjectList();
+        renderDetail();
       })
       .catch((error) => {
         setBanner(error.message || t('초기 데이터를 불러오지 못했습니다. 서버 상태를 확인해 주세요.', 'Failed to load initial data. Check whether the server is healthy.'));

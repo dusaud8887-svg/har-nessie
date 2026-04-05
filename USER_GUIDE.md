@@ -100,6 +100,8 @@ For a normal local setup, defaults are usually enough:
 - planning provider: whichever CLI you have installed
 - implementation provider: same, or a different one if you want to mix
 - runtime profile: `Go now`
+- Codex model: keep `GPT-5.4` unless you explicitly want `GPT-5.3-Codex-Spark`
+- Codex fast mode: leave it on for speed, turn it off when you want the default service tier
 - UI language: `English`
 - agent response language: `English`
 

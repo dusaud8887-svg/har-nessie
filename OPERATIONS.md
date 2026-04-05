@@ -145,6 +145,17 @@ Use:
 - task artifacts: `runs/<run-id>/tasks/<task-id>/`
 - project memory: `memory/projects/<project-key>/`
 - machine-local settings: `.harness-web/settings.json`
+- runtime observability: `.harness-web/runtime-events.ndjson`
+- persisted supervisor runtime: `.harness-web/supervisors.json`
+
+Runtime event and run log correlation fields:
+
+- `projectId`
+- `runId`
+- `taskId`
+- `correlationId`
+
+Use `correlationId` first when you need to follow one run or one task across `logs.ndjson`, `trace.ndjson`, and `.harness-web/runtime-events.ndjson`.
 
 ## Runtime profiles
 
@@ -155,7 +166,13 @@ Use:
 - `Read-only`
   - best when you want inspection before edits
 
+Codex-specific settings:
+
+- model selector: `GPT-5.4` by default, optional `GPT-5.3-Codex-Spark`
+- fast mode toggle: on maps to the fast service tier, off maps to the default service tier
+
 Additional notes:
 
 - The `Docs and Spec First` preset can use limited parallelism (`2` tasks at a time) when the git repo is clean.
 - If the repo is dirty and falls back to the shared workspace, the same preset automatically downgrades to sequential execution.
+- Supervisor runtime is now restored from `.harness-web/supervisors.json`, so a paused or running project automation state survives a harness restart.

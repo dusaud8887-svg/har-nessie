@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { existsSync, readFileSync, promises as fs } from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -27,17 +28,27 @@ import {
   TASK_CAPABILITY_REGISTRY,
   buildAcceptanceMetadata,
   buildTaskActionPolicy,
+  buildProjectCodeIntelligence,
   buildTaskCodeContext,
+  calculateExecutionEdgeRiskScore,
+  calculateExecutionSymbolRiskScore,
   extractStaticCodeGraphFacts,
+  graphCriticalRiskThreshold,
   inferTaskVerificationTypes,
+  isCriticalGraphRisk,
+  isTemporalMemoryConcentrated,
   normalizeToolProfile,
+  temporalConcentrationThreshold,
   summarizeActionOutput
 } from './task-action-runtime.mjs';
 import {
   CODEX_RUNTIME_PROFILES,
   DEFAULT_HARNESS_SETTINGS,
   DEFAULT_SETTINGS,
+  GRAPH_INTELLIGENCE_DEFAULTS,
   HARNESS_PATTERNS,
+  normalizeCodexFastMode,
+  normalizeCodexModel,
   normalizeCodexRuntimeProfile,
   RUN_OPERATION_DEFAULTS,
   RUN_PRESETS,
@@ -50,11 +61,28 @@ import {
 } from './project-intel.mjs';
 import { createProjectWorkflow } from './project-workflow.mjs';
 import { createProjectHealth } from './project-health.mjs';
+import { applyPlanPolicy, defaultExecutionPolicy } from './plan-policy.mjs';
+import { createBrowserVerificationRunner } from './browser-verification.mjs';
+import { minuteKeyFromDate, cronMatchesNow, findNextCronOccurrence } from './cron-utils.mjs';
+import { createMemoryResolver } from './memory-resolver.mjs';
+import { createPromptBuilders } from './prompt-builders.mjs';
+import { decideReviewRoute, isReadOnlyVerificationTask } from './review-routing.mjs';
+import { recoverPersistedRunsAfterRestart } from './run-recovery.mjs';
+import { buildContinuationPromptLines } from './run-continuation.mjs';
+import { createRuntimeObservability } from './runtime-observability.mjs';
+import { createSupervisorLoop } from './supervisor-loop.mjs';
+import { createSupervisorRuntimeStore } from './supervisor-runtime-store.mjs';
 
 const bus = new EventEmitter();
 const activeRuns = new Map();
+const runningProjectSupervisors = new Map();
+const harnessSettingsContext = new AsyncLocalStorage();
 const writeLocks = new Map();
 const appendLocks = new Map();
+const PROJECT_AUTOMATION_TICK_MS = 30_000;
+const PROJECT_AUTOMATION_MAX_DEPTH = 120;
+const RUN_LOCK_TIMEOUT_MS = 60_000;
+const APPEND_LOCK_TIMEOUT_MS = 20_000;
 
 const TEXT_EXTENSIONS = new Set([
   '.md', '.mdx', '.txt', '.json', '.yaml', '.yml', '.toml', '.ini', '.env',
@@ -106,6 +134,28 @@ const TASK_ARTIFACT_FILES = {
   review: { primary: 'agent-review.json', legacy: 'codex-review.json' }
 };
 let playwrightAvailabilityPromise = null;
+
+const runtimeObservability = createRuntimeObservability({ metaDir: HARNESS_META_DIR, now });
+const supervisorRuntimeStore = createSupervisorRuntimeStore({
+  filePath: path.join(HARNESS_META_DIR, 'supervisors.json'),
+  now,
+  recordHarnessError: runtimeObservability.recordHarnessError
+});
+
+const memoryResolver = createMemoryResolver({
+  ROOT_DIR,
+  loadState,
+  saveState,
+  searchProjectMemory,
+  withLock
+});
+const {
+  resolvePromptMemory,
+  applyMemorySnapshot,
+  refreshRunMemory
+} = memoryResolver;
+
+export { applyPlanPolicy, defaultExecutionPolicy, buildContinuationPromptLines, decideReviewRoute, isReadOnlyVerificationTask };
 
 /**
  * @typedef {Object} RunSummary
@@ -291,17 +341,353 @@ function normalizeProviderProfile(value, fallback = DEFAULT_HARNESS_SETTINGS) {
   };
 }
 
+function normalizeRunLoopSettings(value, fallback = null) {
+  const source = value && typeof value === 'object' ? value : {};
+  const fallbackValue = fallback && typeof fallback === 'object' ? fallback : {};
+  const enabled = source.enabled === true || (source.enabled == null && fallbackValue.enabled === true);
+  const modeCandidate = String(source.mode || fallbackValue.mode || 'repeat-count').trim().toLowerCase();
+  const maxRunsRaw = Number(source.maxRuns != null ? source.maxRuns : (fallbackValue.maxRuns != null ? fallbackValue.maxRuns : 1));
+  const maxRuns = Number.isFinite(maxRunsRaw) ? Math.max(1, Math.trunc(maxRunsRaw)) : 1;
+  const currentRunIndexRaw = Number(source.currentRunIndex != null ? source.currentRunIndex : (fallbackValue.currentRunIndex != null ? fallbackValue.currentRunIndex : 1));
+  const currentRunIndex = Number.isFinite(currentRunIndexRaw) ? Math.max(1, Math.trunc(currentRunIndexRaw)) : 1;
+  const maxConsecutiveFailuresRaw = Number(
+    source.maxConsecutiveFailures != null
+      ? source.maxConsecutiveFailures
+      : (fallbackValue.maxConsecutiveFailures != null ? fallbackValue.maxConsecutiveFailures : 3)
+  );
+  const maxConsecutiveFailures = Number.isFinite(maxConsecutiveFailuresRaw)
+    ? Math.max(1, Math.trunc(maxConsecutiveFailuresRaw))
+    : 3;
+  const consecutiveFailuresRaw = Number(source.consecutiveFailures != null ? source.consecutiveFailures : (fallbackValue.consecutiveFailures != null ? fallbackValue.consecutiveFailures : 0));
+  const consecutiveFailures = Number.isFinite(consecutiveFailuresRaw) ? Math.max(0, Math.trunc(consecutiveFailuresRaw)) : 0;
+  const normalizedMode = modeCandidate === 'until-goal' ? 'until-goal' : 'repeat-count';
+  return {
+    enabled,
+    mode: normalizedMode,
+    maxRuns,
+    currentRunIndex,
+    maxConsecutiveFailures,
+    consecutiveFailures,
+    originRunId: String(source.originRunId || fallbackValue.originRunId || '').trim(),
+    lastRunStatus: String(source.lastRunStatus || fallbackValue.lastRunStatus || '').trim()
+  };
+}
+
 function normalizeContinuationPolicy(value, fallback = null) {
   const source = value && typeof value === 'object' ? value : {};
   const fallbackValue = fallback && typeof fallback === 'object' ? fallback : {};
   const modeCandidate = String(source.mode || fallbackValue.mode || 'guided').trim().toLowerCase();
+  const maxChainDepth = Number(
+    source.maxChainDepth != null ? source.maxChainDepth : (fallbackValue.maxChainDepth != null ? fallbackValue.maxChainDepth : 3)
+  );
+  const maxChainDepthValue = Number.isFinite(maxChainDepth) ? Math.max(0, Math.trunc(maxChainDepth)) : 3;
   return {
     mode: ['manual', 'guided'].includes(modeCandidate) ? modeCandidate : 'guided',
+    autoChainOnComplete: source.autoChainOnComplete === true
+      || (source.autoChainOnComplete == null && fallbackValue.autoChainOnComplete === true),
+    maxChainDepth: maxChainDepthValue,
     autoQualitySweepOnPhaseComplete: source.autoQualitySweepOnPhaseComplete === true
       || (source.autoQualitySweepOnPhaseComplete == null && fallbackValue.autoQualitySweepOnPhaseComplete === true),
     keepDocsInSync: source.keepDocsInSync !== false
-      && (source.keepDocsInSync != null || fallbackValue.keepDocsInSync !== false)
+      && (source.keepDocsInSync != null || fallbackValue.keepDocsInSync !== false),
+    runLoop: normalizeRunLoopSettings(source.runLoop, fallbackValue.runLoop)
   };
+}
+
+function normalizeChainMeta(value) {
+  const source = value && typeof value === 'object' ? value : {};
+  return {
+    trigger: String(source.trigger || 'manual').trim() || 'manual',
+    chainStopped: source.chainStopped === true,
+    reason: String(source.reason || '').trim() || String(source.stopReason || '').trim() || '',
+    stoppedAt: source.stoppedAt || '',
+    lineageId: String(source.lineageId || '').trim(),
+    originRunId: String(source.originRunId || '').trim(),
+    loop: normalizeRunLoopSettings(source.loop)
+  };
+}
+
+function normalizeChainDepth(value = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.max(0, Math.trunc(parsed)) : 0;
+}
+
+function normalizeAutoProgressSettings(value, fallback = null) {
+  const source = value && typeof value === 'object' ? value : {};
+  const fallbackValue = fallback && typeof fallback === 'object' ? fallback : {};
+  const enabled = source.enabled === true || (source.enabled == null && fallbackValue.enabled === true);
+  const pollIntervalMs = Math.max(
+    5000,
+    Number(source.pollIntervalMs != null ? source.pollIntervalMs : fallbackValue.pollIntervalMs || 30000)
+  );
+  const scheduleEnabled = source.scheduleEnabled === true || (source.scheduleEnabled == null && fallbackValue.scheduleEnabled === true);
+  const scheduleCron = String(source.scheduleCron || fallbackValue.scheduleCron || '').trim();
+  const lastScheduledAt = String(source.lastScheduledAt || fallbackValue.lastScheduledAt || '').trim();
+  const pauseOnRepeatedFailures = source.pauseOnRepeatedFailures !== false
+    && (source.pauseOnRepeatedFailures != null || fallbackValue.pauseOnRepeatedFailures !== false);
+  const maxConsecutiveFailuresRaw = Number(
+    source.maxConsecutiveFailures != null
+      ? source.maxConsecutiveFailures
+      : (fallbackValue.maxConsecutiveFailures != null ? fallbackValue.maxConsecutiveFailures : 3)
+  );
+  const maxConsecutiveFailures = Number.isFinite(maxConsecutiveFailuresRaw)
+    ? Math.max(1, Math.trunc(maxConsecutiveFailuresRaw))
+    : 3;
+  return {
+    enabled,
+    pollIntervalMs: Number.isFinite(pollIntervalMs) ? Math.max(5000, Math.floor(pollIntervalMs)) : 30000,
+    scheduleEnabled,
+    scheduleCron,
+    lastScheduledAt,
+    pauseOnRepeatedFailures,
+    maxConsecutiveFailures
+  };
+}
+
+function getSupervisorRuntimeState(projectId) {
+  const normalizedId = String(projectId || '').trim();
+  if (!normalizedId) return null;
+  return runningProjectSupervisors.get(normalizedId) || null;
+}
+
+function setSupervisorRuntimeState(projectId, patch = {}) {
+  const normalizedId = String(projectId || '').trim();
+  if (!normalizedId) return;
+  const current = getSupervisorRuntimeState(normalizedId) || {
+    running: true,
+    lastPolledAt: 0,
+    inFlight: false,
+    lastPassAt: '',
+    lastAction: '',
+    lastActionAt: '',
+    lastError: '',
+    lastErrorAt: '',
+    lastRunId: '',
+    nextScheduledAt: '',
+    pausedReason: '',
+    history: []
+  };
+  const nowIso = now();
+  const nextHistory = Array.isArray(current.history) ? current.history.slice(-11) : [];
+  let historyEntry = patch.historyEntry && typeof patch.historyEntry === 'object'
+    ? patch.historyEntry
+    : null;
+  if (!historyEntry && String(patch.lastError || '').trim() && String(patch.lastError || '').trim() !== String(current.lastError || '').trim()) {
+    historyEntry = {
+      at: String(patch.lastErrorAt || nowIso),
+      kind: 'error',
+      detail: String(patch.lastError || '').trim(),
+      runId: String(patch.lastRunId || '').trim()
+    };
+  }
+  if (!historyEntry && String(patch.lastAction || '').trim() && String(patch.lastAction || '').trim() !== String(current.lastAction || '').trim()) {
+    historyEntry = {
+      at: String(patch.lastActionAt || nowIso),
+      kind: 'action',
+      detail: String(patch.lastAction || '').trim(),
+      runId: String(patch.lastRunId || '').trim()
+    };
+  }
+  if (historyEntry) {
+    nextHistory.push({
+      at: String(historyEntry.at || nowIso),
+      kind: String(historyEntry.kind || 'event'),
+      detail: String(historyEntry.detail || historyEntry.label || '').trim(),
+      runId: String(historyEntry.runId || '').trim()
+    });
+  }
+  runningProjectSupervisors.set(normalizedId, {
+    ...current,
+    ...patch,
+    history: nextHistory,
+    updatedAt: nowIso
+  });
+  void supervisorRuntimeStore.schedulePersist(runningProjectSupervisors);
+}
+
+function normalizeProjectAutoProgress(project = null) {
+  return normalizeAutoProgressSettings(project?.defaultSettings?.autoProgress, {
+    enabled: false,
+    pollIntervalMs: PROJECT_AUTOMATION_TICK_MS,
+    scheduleEnabled: false,
+    scheduleCron: '',
+    lastScheduledAt: '',
+    pauseOnRepeatedFailures: true,
+    maxConsecutiveFailures: 3
+  });
+}
+
+function shouldRunScheduledAutoPass(autoProgress, lastScheduledAt) {
+  if (!autoProgress.scheduleEnabled || !autoProgress.scheduleCron) return false;
+  const nextMinute = minuteKeyFromDate(new Date());
+  const alreadyRunThisMinute = String(lastScheduledAt || '').startsWith(`${nextMinute}:`) || String(lastScheduledAt || '').startsWith(nextMinute);
+  if (alreadyRunThisMinute) return false;
+  return cronMatchesNow(autoProgress.scheduleCron);
+}
+
+async function buildSupervisorDraftFromPhase(project, phase, continuationPolicy, phaseRuns = []) {
+  const summaryPhase = extractPhaseCarryOverSummary({
+    ...phase,
+    carryOverTasks: buildProjectContinuationContext(project, phase, phaseRuns).carryOverFocus,
+    cleanupLane: Array.isArray(phase.cleanupLane) ? phase.cleanupLane : []
+  });
+  summaryPhase.phaseContract = phase.phaseContract || {};
+  const memory = await searchContinuationMemory(project, summaryPhase, phaseRuns);
+  const draft = deriveAutoChainDraftFromPhase(project, summaryPhase, continuationPolicy, memory);
+  return {
+    draft,
+    summaryPhase,
+    memory
+  };
+}
+
+function listProjectPhaseRuns(projectId, phaseId, runs = []) {
+  return (Array.isArray(runs) ? runs : [])
+    .filter((run) => String(run?.project?.id || '').trim() === String(projectId || '').trim()
+      && String(run?.project?.phaseId || '').trim() === String(phaseId || '').trim())
+    .sort(compareNewest);
+}
+
+function summarizeProjectPhaseAutomation(project, phase, phaseRuns = []) {
+  const carryOverTasks = phaseRuns
+    .filter((run) => ['stopped', 'failed', 'partial_complete'].includes(String(run?.status || '')))
+    .flatMap((run) => (Array.isArray(run.tasks) ? run.tasks : [])
+      .filter((task) => !['done', 'skipped'].includes(String(task?.status || '')))
+      .map((task) => buildCarryOverTaskEntry(run, phase, task)))
+    .sort(compareNewest);
+  const pendingReview = phaseRuns
+    .flatMap((run) => buildProjectPendingReviewEntries(run, phase))
+    .sort(compareNewest)
+    .slice(0, 6);
+  const cleanupLane = (Array.isArray(project?.maintenance?.cleanupTasks) ? project.maintenance.cleanupTasks : [])
+    .filter((task) => String(task?.status || '') === 'ready' && String(task?.phaseId || '') === String(phase?.id || ''))
+    .sort(compareNewest)
+    .slice(0, 8);
+  const latestTerminalRun = phaseRuns.find((run) =>
+    ['completed', 'partial_complete', 'failed', 'stopped'].includes(String(run?.status || ''))
+  ) || null;
+  return {
+    carryOverTasks,
+    pendingReview,
+    cleanupLane,
+    latestTerminalRun
+  };
+}
+
+function findNextPendingPhase(phases = [], currentPhaseId = '') {
+  const items = Array.isArray(phases) ? phases : [];
+  const currentIndex = items.findIndex((phase) => String(phase?.id || '').trim() === String(currentPhaseId || '').trim());
+  if (currentIndex < 0) return null;
+  return items.slice(currentIndex + 1).find((phase) => String(phase?.status || '') !== 'done') || null;
+}
+
+export async function maybeAutoAdvanceProjectPhase(projectInput, allRuns = [], options = {}) {
+  const projectId = String(projectInput?.id || '').trim();
+  if (!projectId) {
+    return { project: projectInput, advanced: false, blockedReason: 'missing-project-id' };
+  }
+  let project = projectInput;
+  const phases = Array.isArray(project?.phases) ? project.phases : [];
+  const phase = findProjectCurrentPhase(project, phases);
+  if (!phase || String(phase?.status || '') === 'done') {
+    return { project, advanced: false, blockedReason: 'no-active-phase' };
+  }
+  const phaseRuns = listProjectPhaseRuns(projectId, phase.id, allRuns);
+  const { carryOverTasks, pendingReview, cleanupLane, latestTerminalRun } = summarizeProjectPhaseAutomation(project, phase, phaseRuns);
+  if (!latestTerminalRun || String(latestTerminalRun?.status || '') !== 'completed' || latestTerminalRun?.result?.goalAchieved !== true) {
+    return { project, advanced: false, blockedReason: 'phase-goal-not-met' };
+  }
+  if (pendingReview.length || carryOverTasks.length) {
+    return {
+      project,
+      advanced: false,
+      blockedReason: pendingReview.length ? 'pending-review' : 'carry-over-remaining'
+    };
+  }
+
+  const continuationPolicy = normalizeContinuationPolicy(project?.defaultSettings?.continuationPolicy);
+  let qualitySweepRan = false;
+  if (continuationPolicy.autoQualitySweepOnPhaseComplete === true) {
+    await runtimeObservability.withObservedFallback(
+      () => runProjectQualitySweep(projectId, { phaseId: phase.id }),
+      { scope: 'project.auto-quality-sweep', context: { projectId, phaseId: phase.id }, fallback: null }
+    );
+    qualitySweepRan = true;
+    project = await runtimeObservability.withObservedFallback(
+      () => getProject(projectId),
+      { scope: 'project.reload-after-quality-sweep', context: { projectId }, fallback: project }
+    );
+  }
+
+  const refreshedPhase = findProjectCurrentPhase(project, Array.isArray(project?.phases) ? project.phases : []);
+  const effectivePhase = refreshedPhase && String(refreshedPhase?.id || '') === String(phase.id || '') ? refreshedPhase : phase;
+  const refreshedCleanupLane = (Array.isArray(project?.maintenance?.cleanupTasks) ? project.maintenance.cleanupTasks : [])
+    .filter((task) => String(task?.status || '') === 'ready' && String(task?.phaseId || '') === String(effectivePhase?.id || ''))
+    .sort(compareNewest)
+    .slice(0, 8);
+  if (cleanupLane.length || refreshedCleanupLane.length) {
+    return { project, advanced: false, blockedReason: 'cleanup-pending', qualitySweepRan };
+  }
+
+  const nextPhase = findNextPendingPhase(project.phases, effectivePhase.id);
+  const phasePatch = [{ id: effectivePhase.id, status: 'done' }];
+  if (nextPhase?.id) {
+    phasePatch.push({ id: nextPhase.id, status: 'active' });
+  }
+  const updatedProject = await updateProject(projectId, {
+    phases: phasePatch,
+    currentPhaseId: nextPhase?.id || ''
+  });
+  const detail = nextPhase?.id
+    ? `phase-auto-advanced:${effectivePhase.id}->${nextPhase.id}`
+    : `phase-auto-completed:${effectivePhase.id}`;
+  setSupervisorRuntimeState(projectId, {
+    historyEntry: {
+      at: now(),
+      kind: 'action',
+      detail,
+      runId: String(options.runId || '').trim()
+    },
+    lastAction: detail,
+    lastActionAt: now()
+  });
+  if (options.runId) {
+    await runtimeObservability.withObservedFallback(
+      () => appendLog(options.runId, 'info', nextPhase?.id
+        ? `Phase ${effectivePhase.title || effectivePhase.id} closed automatically and advanced to ${nextPhase.title || nextPhase.id}.`
+        : `Phase ${effectivePhase.title || effectivePhase.id} closed automatically after meeting its goal.`, {
+        projectId,
+        phaseId: effectivePhase.id,
+        nextPhaseId: nextPhase?.id || '',
+        qualitySweepRan
+      }),
+      {
+        scope: 'project.phase-auto-advance.append-log',
+        context: { projectId, runId: options.runId, phaseId: effectivePhase.id, nextPhaseId: nextPhase?.id || '' },
+        fallback: null
+      }
+    );
+  }
+  return {
+    project: updatedProject,
+    advanced: true,
+    previousPhaseId: effectivePhase.id,
+    nextPhaseId: nextPhase?.id || '',
+    qualitySweepRan
+  };
+}
+
+function findProjectCurrentPhase(project, phases = []) {
+  const phaseId = String(project?.currentPhaseId || '').trim();
+  if (phaseId) {
+    return phases.find((item) => String(item?.id || '').trim() === phaseId) || null;
+  }
+  return phases.find((item) => String(item?.status || '') === 'active') || null;
+}
+
+function isProjectSupervisorActive(runtime = null, autoProgress = null) {
+  const runtimeRunning = runtime ? runtime.running !== false : true;
+  return runtimeRunning && !!(autoProgress ? autoProgress.enabled : false);
 }
 
 function defaultExecutionModelHint(run) {
@@ -320,15 +706,20 @@ export function buildCodexExecArgs(settings = {}, outputFileName = '') {
     DEFAULT_SETTINGS.codexRuntimeProfile
   );
   const runtimeProfile = codexRuntimeProfileSettings(runtimeProfileId);
+  const resolvedFastMode = normalizeCodexFastMode(
+    settings.codexFastMode,
+    String(settings.codexServiceTier || '').trim().toLowerCase() === 'fast'
+  );
+  const resolvedServiceTier = resolvedFastMode ? 'fast' : 'default';
   const args = [
     'exec',
     '--skip-git-repo-check',
     '--model',
-    settings.codexModel || DEFAULT_SETTINGS.codexModel,
+    normalizeCodexModel(settings.codexModel, DEFAULT_SETTINGS.codexModel),
     '-c',
     `model_reasoning_effort="${settings.codexReasoningEffort || DEFAULT_SETTINGS.codexReasoningEffort}"`,
     '-c',
-    `service_tier="${settings.codexServiceTier || DEFAULT_SETTINGS.codexServiceTier}"`,
+    `service_tier="${resolvedServiceTier}"`,
     '-c',
     `approval_policy="${runtimeProfile.approvalPolicy}"`,
     '-c',
@@ -688,6 +1079,7 @@ function defaultTaskExecution() {
     changedFiles: [],
     repoChangedFiles: [],
     outOfScopeFiles: [],
+    dependencyWarnings: [],
     scopeEnforcement: '',
     applyResult: '',
     lastExitCode: null,
@@ -1011,7 +1403,61 @@ function normalizeProjectPhase(raw, existingPhases = [], index = 0, language = D
   };
 }
 
-function materializePlannedTasks(rawTasks) {
+function deriveMemoryScopedFileHints(memory = {}, limit = 3) {
+  const hotFiles = (memory?.temporalInsights?.activeFiles || []).map((item) => item?.filePath);
+  const failureFiles = (memory?.failureAnalytics?.topFailureFiles || []).map((item) => item?.filePath);
+  return normalizeFilesLikely(uniqueBy([...hotFiles, ...failureFiles].filter(Boolean), (item) => item)).slice(0, Math.max(1, Number(limit || 3)));
+}
+
+function applyMemoryConstraintsToTask(task, memory = {}, options = {}) {
+  const normalizedFiles = normalizeFilesLikely(task.filesLikely);
+  const nextTask = {
+    ...task,
+    filesLikely: normalizedFiles.length === 1 && normalizedFiles[0] === '*' ? [] : normalizedFiles,
+    constraints: uniqueBy((Array.isArray(task.constraints) ? task.constraints : []).map(String).filter(Boolean), (item) => item),
+    checkpointNotes: uniqueBy((Array.isArray(task.checkpointNotes) ? task.checkpointNotes : []).map(String).filter(Boolean), (item) => item)
+  };
+  const failures = memory?.failureAnalytics || {};
+  const temporal = memory?.temporalInsights || {};
+  const scopedHintFiles = deriveMemoryScopedFileHints(memory, options.fileBudget || 3);
+  const temporalFocused = isTemporalMemoryConcentrated(temporal?.recentShare, temporalConcentrationThreshold());
+  const scopeRisk = Number(failures.scopeDriftCount || 0) >= 2 || Number(failures.scopeDriftPressure || 0) >= 1;
+  const retryPressure = Number(failures.retryCount || 0) >= 2 || Number(failures.retryPressure || 0) >= 1;
+
+  if (!nextTask.filesLikely.length && scopedHintFiles.length) {
+    nextTask.filesLikely = scopedHintFiles.slice(0, Math.max(1, Number(options.fileBudget || 3)));
+    nextTask.checkpointNotes = uniqueBy([
+      ...nextTask.checkpointNotes,
+      `Memory suggested initial filesLikely: ${nextTask.filesLikely.join(', ')}`
+    ], (item) => item);
+  }
+
+  if (scopeRisk && nextTask.filesLikely.length) {
+    nextTask.constraints = uniqueBy([
+      ...nextTask.constraints,
+      'Hard scope boundary: stay inside filesLikely. Replan instead of widening the file set.',
+      'If a required change falls outside filesLikely, stop and surface the boundary instead of editing it.'
+    ], (item) => item);
+  }
+
+  if (retryPressure) {
+    nextTask.constraints = uniqueBy([
+      ...nextTask.constraints,
+      'Close the highest-probability failure cause first and verify before broadening the change.'
+    ], (item) => item);
+  }
+
+  if (temporalFocused && scopedHintFiles.length) {
+    nextTask.checkpointNotes = uniqueBy([
+      ...nextTask.checkpointNotes,
+      `Temporal hot files to recheck before widening scope: ${scopedHintFiles.join(', ')}`
+    ], (item) => item);
+  }
+
+  return nextTask;
+}
+
+export function materializePlannedTasks(rawTasks, options = {}) {
   const tasks = [];
   const rawIndexToTaskId = new Map();
   for (const [index, rawTask] of rawTasks.entries()) {
@@ -1027,7 +1473,8 @@ function materializePlannedTasks(rawTasks) {
       return rawIndexToTaskId.get(Number(rawIndexMatch[1])) || String(dep);
     });
   }
-  return tasks;
+  const fileBudget = Number(options.fileBudget || 0);
+  return tasks.map((task) => applyMemoryConstraintsToTask(task, options.memory, { fileBudget }));
 }
 
 function mergeEditableBacklogTasks(existingTasks, rawTasks) {
@@ -1142,6 +1589,9 @@ function serializeState(state) {
 
 function summarizeRunState(state) {
   const tasks = Array.isArray(state?.tasks) ? state.tasks : [];
+  const chainMeta = state?.chainMeta && typeof state.chainMeta === 'object'
+    ? normalizeChainMeta(state.chainMeta)
+    : null;
   return {
     id: state.id,
     title: state.title,
@@ -1172,7 +1622,13 @@ function summarizeRunState(state) {
           summary: String(state.result.summary || '').trim(),
           goalAchieved: Boolean(state.result.goalAchieved)
         }
-      : null
+      : null,
+    chainDepth: normalizeChainDepth(state.chainDepth),
+    chainedFromRunId: String(state.chainedFromRunId || '').trim() || null,
+    chainMeta: chainMeta ? {
+      ...chainMeta,
+      stoppedAt: String(chainMeta.stoppedAt || '').trim()
+    } : null
   };
 }
 
@@ -1345,19 +1801,37 @@ async function loadProjectState(projectIdValue) {
   return readJson(projectStatePath(projectIdValue));
 }
 
-async function withLock(runId, action) {
+async function waitForQueuedLock(previous, timeoutMs, scope, context = {}) {
+  let timeoutHandle = null;
+  try {
+    await Promise.race([
+      previous,
+      new Promise((_, reject) => {
+        timeoutHandle = setTimeout(() => reject(new Error(`Timed out waiting for ${scope}`)), timeoutMs);
+      })
+    ]);
+  } catch (error) {
+    await runtimeObservability.recordHarnessError(scope, error, context);
+    throw error;
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
+}
+
+async function withLock(runId, action, options = {}) {
   const previous = writeLocks.get(runId) || Promise.resolve();
   let release;
   const current = new Promise((resolve) => {
     release = resolve;
   });
-  writeLocks.set(runId, previous.then(() => current));
-  await previous;
+  const next = previous.then(() => current);
+  writeLocks.set(runId, next);
+  await waitForQueuedLock(previous, Number(options.timeoutMs || RUN_LOCK_TIMEOUT_MS), 'run-lock.acquire', { runId });
   try {
     return await action();
   } finally {
     release();
-    if (writeLocks.get(runId) === current) {
+    if (writeLocks.get(runId) === next) {
       writeLocks.delete(runId);
     }
   }
@@ -1376,13 +1850,14 @@ async function appendFileLocked(targetPath, text) {
   const current = new Promise((resolve) => {
     release = resolve;
   });
-  appendLocks.set(targetPath, previous.then(() => current));
-  await previous;
+  const next = previous.then(() => current);
+  appendLocks.set(targetPath, next);
+  await waitForQueuedLock(previous, APPEND_LOCK_TIMEOUT_MS, 'append-lock.acquire', { targetPath });
   try {
     await fs.appendFile(targetPath, text, 'utf8');
   } finally {
     release();
-    if (appendLocks.get(targetPath) === current) {
+    if (appendLocks.get(targetPath) === next) {
       appendLocks.delete(targetPath);
     }
   }
@@ -1413,7 +1888,29 @@ function createBoundedOutputCollector(maxBytes = MAX_CAPTURED_PROCESS_OUTPUT_BYT
 }
 
 async function appendLog(runId, level, message, meta = {}) {
-  const entry = { at: now(), level, message, meta };
+  const taskId = String(meta?.taskId || '').trim();
+  const projectId = String(meta?.projectId || '').trim();
+  const correlationId = [
+    projectId ? `project:${projectId}` : '',
+    runId ? `run:${runId}` : '',
+    taskId ? `task:${taskId}` : ''
+  ].filter(Boolean).join('|');
+  const entry = {
+    at: now(),
+    level,
+    runId,
+    ...(taskId ? { taskId } : {}),
+    ...(projectId ? { projectId } : {}),
+    correlationId,
+    message,
+    meta: {
+      ...meta,
+      runId,
+      ...(taskId ? { taskId } : {}),
+      ...(projectId ? { projectId } : {}),
+      correlationId
+    }
+  };
   await withLock(runId, async () => {
     const recentLogs = [...(await readRecentLogs(runId)), entry].slice(-300);
     await writeJson(recentLogPath(runId), recentLogs);
@@ -1434,7 +1931,10 @@ async function appendTrace(runId, event, meta = {}) {
     event,
     meta
   };
-  await appendFileLocked(tracePath(runId), `${JSON.stringify(entry)}\n`).catch(() => {});
+  await runtimeObservability.withObservedFallback(
+    () => appendFileLocked(tracePath(runId), `${JSON.stringify(entry)}\n`),
+    { scope: 'trace.append', context: { runId, taskId, event }, fallback: null }
+  );
 }
 
 async function appendTaskTrajectory(runId, taskId, kind, payload = {}) {
@@ -1447,7 +1947,10 @@ async function appendTaskTrajectory(runId, taskId, kind, payload = {}) {
     kind,
     ...payload
   };
-  await appendFileLocked(taskTrajectoryPath(runId, taskId), `${JSON.stringify(entry)}\n`).catch(() => {});
+  await runtimeObservability.withObservedFallback(
+    () => appendFileLocked(taskTrajectoryPath(runId, taskId), `${JSON.stringify(entry)}\n`),
+    { scope: 'trajectory.append', context: { runId, taskId, kind }, fallback: null }
+  );
 }
 
 async function updateTask(runId, taskId, callback) {
@@ -1630,11 +2133,17 @@ export function buildActionReplayEnvelope(capabilityId, input, scope = {}) {
 }
 
 async function appendTaskActionRecord(runId, taskId, record) {
-  await appendFileLocked(taskActionPath(runId, taskId), `${JSON.stringify(record)}\n`).catch(() => {});
+  await runtimeObservability.withObservedFallback(
+    () => appendFileLocked(taskActionPath(runId, taskId), `${JSON.stringify(record)}\n`),
+    { scope: 'task-action.append', context: { runId, taskId, action: record?.action || '' }, fallback: null }
+  );
 }
 
 async function appendRunActionRecord(runId, record) {
-  await appendFileLocked(runActionPath(runId), `${JSON.stringify(record)}\n`).catch(() => {});
+  await runtimeObservability.withObservedFallback(
+    () => appendFileLocked(runActionPath(runId), `${JSON.stringify(record)}\n`),
+    { scope: 'run-action.append', context: { runId, action: record?.action || '' }, fallback: null }
+  );
 }
 
 async function runTaskAction(runId, taskId, actionPolicy, capabilityId, input, executor, actionState = null) {
@@ -2144,324 +2653,6 @@ function executionProfileLines(profile) {
   ];
 }
 
-function defaultExecutionPolicy(profile = null) {
-  return {
-    pattern: 'pipeline',
-    parallelMode: profile?.flowProfile || 'sequential',
-    policyNotes: profile ? [
-      `Task budget: ${profile.taskBudget}`,
-      `File budget: ${profile.fileBudget}`,
-      `Diagnosis-first: ${profile.diagnosisFirst === false ? 'optional' : 'required'}`,
-      `Fresh session threshold: ${profile.freshSessionThreshold}`
-    ] : [],
-    syntheticTasks: [],
-    verificationNudgeNeeded: false
-  };
-}
-
-function taskContainsText(task, patterns) {
-  const haystack = [
-    task.title,
-    task.goal,
-    ...(task.constraints || []),
-    ...(task.acceptanceChecks || [])
-  ].join('\n').toLowerCase();
-  return patterns.some((pattern) => haystack.includes(pattern));
-}
-
-function injectSyntheticTask(rawTasks, taskShape, position = 'prepend') {
-  return position === 'prepend' ? [taskShape, ...rawTasks] : [...rawTasks, taskShape];
-}
-
-function injectLeadingGateTask(rawTasks, taskShape) {
-  return injectSyntheticTask(
-    rawTasks.map((task) => ({
-      ...task,
-      dependsOn: Array.isArray(task?.dependsOn) && task.dependsOn.length
-        ? task.dependsOn.map(String)
-        : ['__RAW_0']
-    })),
-    {
-      ...taskShape,
-      dependsOn: Array.isArray(taskShape?.dependsOn) ? taskShape.dependsOn.map(String) : []
-    },
-    'prepend'
-  );
-}
-
-function hasMultiDependencyTask(tasks) {
-  return tasks.some((task) => Array.isArray(task.dependsOn) && task.dependsOn.length >= 2);
-}
-
-function taskHasFailedAcceptanceCheck(task) {
-  return normalizeAcceptanceCheckResults(task?.lastExecution?.acceptanceCheckResults)
-    .some((item) => item.status === 'fail');
-}
-
-function taskHistoryRank(task) {
-  const lastRunAt = Date.parse(task?.lastExecution?.lastRunAt || '') || 0;
-  const statusWeight = task?.status === 'failed'
-    ? 3
-    : (task?.status === 'in_progress' ? 2 : (task?.status === 'ready' ? 1 : 0));
-  return lastRunAt + (Number(task?.attempts || 0) * 1000) + statusWeight;
-}
-
-function compactTaskLedgerLine(task, focusTaskId = '') {
-  const bits = [`${task.id} ${task.status || 'unknown'}`];
-  if (focusTaskId && task.id === focusTaskId) bits.push('FOCUS');
-  if (task.attempts) bits.push(`attempts=${task.attempts}`);
-  if (taskHasFailedAcceptanceCheck(task)) bits.push('acceptance=failed');
-  if (task.reviewSummary) {
-    bits.push(clipText(task.reviewSummary, 120));
-  } else if (task.goal) {
-    bits.push(clipText(task.goal, 120));
-  }
-  return bits.join(' | ');
-}
-
-export function buildContinuationPromptLines(run, focusTaskId = '') {
-  const tasks = Array.isArray(run?.tasks) ? run.tasks : [];
-  const activeTask = tasks.find((task) => task.id === focusTaskId)
-    || tasks.find((task) => task.status === 'in_progress')
-    || tasks.find((task) => task.status === 'ready')
-    || tasks.find((task) => task.status === 'failed')
-    || null;
-  const counts = {
-    total: tasks.length,
-    done: tasks.filter((task) => task.status === 'done').length,
-    failed: tasks.filter((task) => task.status === 'failed').length,
-    ready: tasks.filter((task) => task.status === 'ready').length,
-    inProgress: tasks.filter((task) => task.status === 'in_progress').length
-  };
-  const recentTasks = tasks
-    .filter((task) => task.attempts || isTaskTerminalStatus(task.status) || task.status === 'in_progress' || task.id === focusTaskId)
-    .sort((left, right) => taskHistoryRank(right) - taskHistoryRank(left))
-    .slice(0, 5)
-    .map((task) => compactTaskLedgerLine(task, focusTaskId));
-
-  const summaryParts = [];
-  if (!counts.total) {
-    summaryParts.push('No prior task execution is recorded yet.');
-  } else {
-    summaryParts.push(`tasks=${counts.total}`);
-    summaryParts.push(`done=${counts.done}`);
-    summaryParts.push(`failed=${counts.failed}`);
-    if (counts.inProgress) summaryParts.push(`in_progress=${counts.inProgress}`);
-    if (counts.ready) summaryParts.push(`ready=${counts.ready}`);
-  }
-  if (run?.goalLoops) summaryParts.push(`goalLoops=${run.goalLoops}`);
-  if (run?.result?.summary) summaryParts.push(`latestResult=${clipText(run.result.summary, 140)}`);
-  if (run?.autoReplan?.latest?.summary) summaryParts.push(`latestReplan=${clipText(run.autoReplan.latest.summary, 140)}`);
-
-  const lines = [
-    'Continuation context:',
-    `- Summary: ${summaryParts.join(' | ')}`,
-    activeTask ? `- Current focus: ${activeTask.id} ${activeTask.title}` : '- Current focus: none',
-    run?.profile
-      ? `- Active profile: flow=${run.profile.flowProfile || 'sequential'} | taskBudget=${run.profile.taskBudget ?? '-'} | fileBudget=${run.profile.fileBudget ?? '-'} | diagnosisFirst=${run.profile.diagnosisFirst === false ? 'optional' : 'required'}`
-      : '- Active profile: default',
-    run?.profile?.freshSessionThreshold
-      ? `- Fresh session policy: ${run.profile.freshSessionThreshold}. If this threshold is crossed, stop and recommend a fresh session instead of forcing more replans.`
-      : '- Fresh session policy: none',
-    run?.project?.phaseTitle
-      ? `- Current phase boundary: stay inside ${run.project.phaseTitle}${run.project.phaseGoal ? ` | ${run.project.phaseGoal}` : ''}`
-      : '- Current phase boundary: current run objective only',
-    '- Direct resume rule: Continue from the latest unresolved task, failed check, or review decision. Do not restate the entire run history unless it changes the next action.'
-  ];
-  if (recentTasks.length) {
-    lines.push('- Compact task ledger:');
-    for (const item of recentTasks) {
-      lines.push(`  - ${item}`);
-    }
-  }
-  return lines;
-}
-
-function isDocsOnlyPath(filePath) {
-  return /^docs\//i.test(filePath) || /\.(md|mdx|txt)$/i.test(filePath);
-}
-
-function taskLooksDocsOnly(task) {
-  const files = normalizeTaskFiles(task?.filesLikely);
-  if (files.length > 0 && files.every((filePath) => isDocsOnlyPath(filePath))) return true;
-  return taskContainsText(task, ['readme', 'docs', 'spec', 'acceptance', 'requirements', 'architecture'])
-    && !taskContainsText(task, ['test', 'verify', 'verification', 'bug', 'fix', 'feature', 'refactor', 'api', 'schema', 'migration']);
-}
-
-function planLooksDocsOnly(rawTasks) {
-  return rawTasks.length > 0 && rawTasks.every((task) => taskLooksDocsOnly(task));
-}
-
-function taskHasVerificationIntent(task) {
-  return taskContainsText(task, [
-    'verify',
-    'verification',
-    'validated',
-    'test',
-    'tests',
-    'lint',
-    'typecheck',
-    'build',
-    'smoke',
-    'reproduce',
-    'regression',
-    'pytest',
-    'npm run',
-    'pnpm ',
-    'cargo test',
-    'go test',
-    'curl ',
-    'returns ',
-    'exits '
-  ]);
-}
-
-function planNeedsVerificationNudge(run, rawTasks) {
-  const validationCommands = Array.isArray(run?.projectContext?.validationCommands) ? run.projectContext.validationCommands : [];
-  if (!rawTasks.length) return false;
-  if (planLooksDocsOnly(rawTasks)) return false;
-  if (!validationCommands.length && (run?.preset?.id || '') !== 'existing-repo-bugfix') return false;
-  return !rawTasks.some((task) => taskHasVerificationIntent(task));
-}
-
-function taskNeedsDiagnosis(task, fileBudget = 0) {
-  const files = normalizeTaskFiles(task?.filesLikely);
-  if (!files.length) return true;
-  if (fileBudget && files.length > fileBudget) return true;
-  return taskContainsText(task, ['foundation', 'architecture', 'wire', 'bootstrap', 'set up', 'scaffold'])
-    && !taskContainsText(task, ['diagnose', 'analysis', 'inspect', 'map', 'audit', 'reproduce', 'verify']);
-}
-
-function planHasDiagnosisTask(rawTasks) {
-  return rawTasks.some((task) => taskContainsText(task, ['diagnose', 'analysis', 'inspect', 'map', 'audit', 'reproduce', 'verify'])
-    || /read-only|do not implement|do not edit/i.test((task?.constraints || []).join('\n')));
-}
-
-export function applyPlanPolicy(run, parsed) {
-  let rawTasks = Array.isArray(parsed.tasks) ? parsed.tasks.map((item) => ({ ...item })) : [];
-  const pattern = String(run.clarify?.architecturePattern || 'pipeline').trim() || 'pipeline';
-  const worktreeEligible = run?.preflight?.project?.worktreeEligible !== false;
-  const policy = {
-    ...defaultExecutionPolicy(run.profile),
-    pattern
-  };
-
-  if (pattern === 'fan-out/fan-in' || pattern === 'expert-pool') {
-    policy.parallelMode = 'parallel';
-  }
-  if (pattern === 'pipeline' || pattern === 'producer-reviewer' || pattern === 'supervisor') {
-    policy.parallelMode = 'sequential';
-  }
-  if ((run?.profile?.flowProfile || 'sequential') === 'hybrid') {
-    policy.parallelMode = 'parallel';
-    policy.policyNotes.push('Hybrid flow profile keeps parallel execution available when filesLikely are clearly disjoint.');
-  } else {
-    policy.parallelMode = 'sequential';
-  }
-  if (policy.parallelMode === 'parallel' && !worktreeEligible) {
-    policy.parallelMode = 'sequential';
-    policy.policyNotes.push('Parallel execution was downgraded because isolated worktrees are unavailable for this repo state.');
-  }
-
-  if (run?.profile?.diagnosisFirst && !planLooksDocsOnly(rawTasks) && !planHasDiagnosisTask(rawTasks)) {
-    const fileBudget = Number(run?.profile?.fileBudget || 0);
-    const needsDiagnosis = (run?.preset?.id || '') === 'greenfield-app'
-      || rawTasks.some((task) => taskNeedsDiagnosis(task, fileBudget));
-    if (needsDiagnosis) {
-      rawTasks = injectLeadingGateTask(rawTasks, {
-        title: 'Diagnose current phase scope and lock implementation boundaries',
-        goal: 'Narrow down the current phase goal, excluded scope, and concrete filesLikely before handing off to implementation tasks.',
-        dependsOn: [],
-        filesLikely: [],
-        constraints: [
-          'Read-only diagnosis.',
-          'Do not implement changes yet.',
-          'Do not expand scope beyond the current project phase.'
-        ],
-        acceptanceChecks: [
-          `filesLikely for follow-on tasks is narrowed to within file budget ${fileBudget || '-'}.`,
-          'Current phase goal and excluded scope are written back into the backlog.'
-        ]
-      });
-      policy.syntheticTasks.push('diagnosis-first');
-      policy.policyNotes.push('Diagnosis-first profile injected a read-only scoping task before implementation.');
-    }
-  }
-
-  if (run?.profile?.taskBudget && rawTasks.length > Number(run.profile.taskBudget)) {
-    policy.policyNotes.push(`Planned task count (${rawTasks.length}) exceeds the active task budget (${run.profile.taskBudget}). Keep this run scoped to the current phase slice.`);
-  }
-
-  if ((run.preset?.id || 'auto') === 'existing-repo-bugfix') {
-    policy.parallelMode = 'sequential';
-    if (!rawTasks.some((task) => taskContainsText(task, ['reproduce', 'regression', 'failing', 'test']))) {
-      rawTasks = injectLeadingGateTask(rawTasks, {
-        title: 'Reproduce the bug before implementation',
-        goal: 'Identify a failing check, reproduction path, or precise before-state for the reported bug before changing behavior.',
-        dependsOn: [],
-        filesLikely: [],
-        constraints: ['Do not implement the fix yet.', 'Capture a reproducible failing check or exact reproduction steps first.'],
-        acceptanceChecks: ['A failing test, command, or explicit reproduction path is documented for later validation.']
-      });
-      policy.syntheticTasks.push('bugfix-repro');
-      policy.policyNotes.push('Bugfix preset injected a reproduction task before implementation.');
-    }
-  }
-
-  if ((run.preset?.id || 'auto') === 'docs-spec-first') {
-    if (!rawTasks.some((task) => taskContainsText(task, ['spec', 'acceptance', 'doc', 'docs', 'requirements']))) {
-      rawTasks = injectLeadingGateTask(rawTasks, {
-        title: 'Lock the spec and acceptance criteria',
-        goal: 'Clarify the spec, acceptance criteria, and excluded scope before implementation begins.',
-        dependsOn: [],
-        filesLikely: ['README.md', 'docs/'],
-        constraints: ['Do not start implementation until the spec task is complete.'],
-        acceptanceChecks: ['Acceptance criteria and exclusions are written down in repo docs or the task handoff.']
-      });
-      policy.syntheticTasks.push('docs-spec');
-      policy.policyNotes.push('Docs-first preset injected a spec-alignment task before implementation.');
-    }
-  }
-
-  if (pattern === 'fan-out/fan-in' && rawTasks.length >= 2 && !hasMultiDependencyTask(rawTasks)) {
-    const fanOutCandidates = rawTasks
-      .map((task, index) => ({ task, index }))
-      .filter(({ task }) => !Array.isArray(task.dependsOn) || task.dependsOn.length === 0)
-      .slice(0, 4);
-    if (fanOutCandidates.length >= 2) {
-      rawTasks = injectSyntheticTask(rawTasks, {
-        title: 'Integrate fan-out task results',
-        goal: 'Combine and validate the outputs of the parallel implementation tasks into one coherent result.',
-        dependsOn: fanOutCandidates.map(({ index }) => `__RAW_${index}`),
-        filesLikely: [],
-        constraints: ['Review the outputs of parallel tasks together before finalizing.'],
-        acceptanceChecks: ['Integration changes are validated against the combined acceptance criteria.']
-      }, 'append');
-      policy.syntheticTasks.push('fan-in');
-      policy.policyNotes.push('Fan-out/fan-in pattern injected an explicit integration task.');
-    }
-  }
-
-  if (planNeedsVerificationNudge(run, rawTasks)) {
-    rawTasks = injectSyntheticTask(rawTasks, {
-      title: 'Verify the integrated changes mechanically',
-      goal: 'Inspect the changed workspace without editing files, run the smallest applicable verification commands, and record evidence for every acceptance check.',
-      dependsOn: rawTasks.map((_, index) => `__RAW_${index}`),
-      filesLikely: [],
-      constraints: ['Read-only verification.', 'Do not edit any files.', 'Use the harness-selected verification commands when they apply.'],
-      acceptanceChecks: [
-        'The selected verification commands exit 0 or each failure is captured precisely.',
-        'Each acceptance check is marked PASS, FAIL, or UNABLE-TO-VERIFY with evidence.'
-      ]
-    }, 'append');
-    policy.syntheticTasks.push('verification-nudge');
-    policy.policyNotes.push('A read-only verification task was injected because the original plan lacked an explicit mechanical verification step.');
-    policy.verificationNudgeNeeded = true;
-  }
-
-  return { rawTasks, policy };
-}
-
 function clipText(text, maxChars = 1200) {
   const value = String(text || '').trim();
   if (!value) return '';
@@ -2553,20 +2744,48 @@ function buildPromptSourceReport(settings, projectPromptSource) {
   };
 }
 
+function sanitizeHarnessSettingsOverride(value = {}) {
+  if (!value || typeof value !== 'object') return {};
+  return {
+    includeGlobalAgents: value.includeGlobalAgents !== false,
+    includeKarpathyGuidelines: value.includeKarpathyGuidelines !== false,
+    customConstitution: String(value.customConstitution || '').trim(),
+    plannerStrategy: String(value.plannerStrategy || '').trim(),
+    teamStrategy: String(value.teamStrategy || '').trim(),
+    codexRuntimeProfile: normalizeCodexRuntimeProfile(value.codexRuntimeProfile, DEFAULT_HARNESS_SETTINGS.codexRuntimeProfile),
+    codexModel: normalizeCodexModel(value.codexModel, DEFAULT_HARNESS_SETTINGS.codexModel),
+    codexFastMode: normalizeCodexFastMode(value.codexFastMode, DEFAULT_HARNESS_SETTINGS.codexFastMode),
+    uiLanguage: normalizeLanguage(value.uiLanguage, DEFAULT_HARNESS_SETTINGS.uiLanguage),
+    agentLanguage: normalizeLanguage(value.agentLanguage, DEFAULT_HARNESS_SETTINGS.agentLanguage),
+    codexNotes: String(value.codexNotes || '').trim(),
+    coordinationProvider: normalizeAgentProvider(value.coordinationProvider, DEFAULT_HARNESS_SETTINGS.coordinationProvider),
+    workerProvider: normalizeAgentProvider(value.workerProvider, DEFAULT_HARNESS_SETTINGS.workerProvider),
+    claudeNotes: String(value.claudeNotes || '').trim(),
+    geminiNotes: String(value.geminiNotes || '').trim(),
+    claudeModel: String(value.claudeModel || '').trim(),
+    geminiModel: String(value.geminiModel || DEFAULT_HARNESS_SETTINGS.geminiModel).trim() || DEFAULT_HARNESS_SETTINGS.geminiModel,
+    geminiProjectId: String(value.geminiProjectId || '').trim()
+  };
+}
+
+function getHarnessSettingsOverride() {
+  return harnessSettingsContext.getStore()?.overrides || null;
+}
+
 export async function getHarnessSettings(projectPath = '') {
   await ensureDir(HARNESS_META_DIR);
-  const saved = await readJson(HARNESS_SETTINGS_FILE).catch(() => ({}));
+  const saved = {
+    ...(await readJson(HARNESS_SETTINGS_FILE).catch(() => ({}))),
+    ...(getHarnessSettingsOverride() || {})
+  };
   const globalSources = await loadGlobalPromptSources();
   const projectPromptSource = await loadProjectPromptSource(projectPath);
-  const normalizeLanguage = (value, fallback = 'en') => {
-    const normalized = String(value || '').trim().toLowerCase();
-    if (normalized === 'en' || normalized === 'ko') return normalized;
-    return fallback;
-  };
   const resolved = {
     ...DEFAULT_HARNESS_SETTINGS,
     ...saved,
     codexRuntimeProfile: normalizeCodexRuntimeProfile(saved.codexRuntimeProfile, DEFAULT_HARNESS_SETTINGS.codexRuntimeProfile),
+    codexModel: normalizeCodexModel(saved.codexModel, DEFAULT_HARNESS_SETTINGS.codexModel),
+    codexFastMode: normalizeCodexFastMode(saved.codexFastMode, DEFAULT_HARNESS_SETTINGS.codexFastMode),
     coordinationProvider: normalizeAgentProvider(saved.coordinationProvider, DEFAULT_HARNESS_SETTINGS.coordinationProvider),
     workerProvider: normalizeAgentProvider(saved.workerProvider, DEFAULT_HARNESS_SETTINGS.workerProvider),
     uiLanguage: normalizeLanguage(saved.uiLanguage, DEFAULT_HARNESS_SETTINGS.uiLanguage),
@@ -2591,30 +2810,13 @@ export async function getHarnessSettings(projectPath = '') {
 export async function updateHarnessSettings(input = {}) {
   await ensureDir(HARNESS_META_DIR);
   const current = await getHarnessSettings();
-  const normalizeLanguage = (value, fallback = 'en') => {
-    const normalized = String(value || '').trim().toLowerCase();
-    if (normalized === 'en' || normalized === 'ko') return normalized;
-    return fallback;
-  };
   const next = {
     ...DEFAULT_HARNESS_SETTINGS,
     ...current,
-    includeGlobalAgents: input.includeGlobalAgents !== false,
-    includeKarpathyGuidelines: input.includeKarpathyGuidelines !== false,
-    customConstitution: String(input.customConstitution || '').trim(),
-    plannerStrategy: String(input.plannerStrategy || '').trim(),
-    teamStrategy: String(input.teamStrategy || '').trim(),
-    codexRuntimeProfile: normalizeCodexRuntimeProfile(input.codexRuntimeProfile, current.codexRuntimeProfile || DEFAULT_HARNESS_SETTINGS.codexRuntimeProfile),
-    uiLanguage: normalizeLanguage(input.uiLanguage, current.uiLanguage || DEFAULT_HARNESS_SETTINGS.uiLanguage),
-    agentLanguage: normalizeLanguage(input.agentLanguage, current.agentLanguage || DEFAULT_HARNESS_SETTINGS.agentLanguage),
-    codexNotes: String(input.codexNotes || '').trim(),
-    coordinationProvider: normalizeAgentProvider(input.coordinationProvider, current.coordinationProvider || DEFAULT_HARNESS_SETTINGS.coordinationProvider),
-    workerProvider: normalizeAgentProvider(input.workerProvider, current.workerProvider || DEFAULT_HARNESS_SETTINGS.workerProvider),
-    claudeNotes: String(input.claudeNotes || '').trim(),
-    geminiNotes: String(input.geminiNotes || '').trim(),
-    claudeModel: String(input.claudeModel || '').trim(),
-    geminiModel: String(input.geminiModel || DEFAULT_HARNESS_SETTINGS.geminiModel).trim() || DEFAULT_HARNESS_SETTINGS.geminiModel,
-    geminiProjectId: String(input.geminiProjectId || '').trim()
+    ...sanitizeHarnessSettingsOverride({
+      ...current,
+      ...input
+    })
   };
   await writeJson(HARNESS_SETTINGS_FILE, {
     includeGlobalAgents: next.includeGlobalAgents,
@@ -2623,6 +2825,8 @@ export async function updateHarnessSettings(input = {}) {
     plannerStrategy: next.plannerStrategy,
     teamStrategy: next.teamStrategy,
     codexRuntimeProfile: next.codexRuntimeProfile,
+    codexModel: next.codexModel,
+    codexFastMode: next.codexFastMode,
     uiLanguage: next.uiLanguage,
     agentLanguage: next.agentLanguage,
     codexNotes: next.codexNotes,
@@ -2633,6 +2837,9 @@ export async function updateHarnessSettings(input = {}) {
     claudeModel: next.claudeModel,
     geminiModel: next.geminiModel,
     geminiProjectId: next.geminiProjectId
+  });
+  harnessSettingsContext.enterWith({
+    overrides: sanitizeHarnessSettingsOverride(next)
   });
   return getHarnessSettings();
 }
@@ -2983,15 +3190,18 @@ function buildMemoryPromptLines(memory) {
     lines.push(`Trace memory summary: artifacts=${memory.traceSummary.artifactCount || 0} | tasks=${memory.traceSummary.taskCount || 0} | lastDecision=${memory.traceSummary.lastDecision || 'none'}`);
   }
   if (Array.isArray(memory?.graphInsights?.topEdges) && memory.graphInsights.topEdges.length > 0) {
-    lines.push(`Graph memory edges: ${memory.graphInsights.topEdges.slice(0, 4).map((item) => item.edge).join(' | ')}`);
+    lines.push(`Graph memory edges: ${memory.graphInsights.topEdges.slice(0, 4).map((item) => `${item.edge} (count=${Number(item?.count || 0)}, weight=${Number(item?.weight || 0).toFixed(1)})`).join(' | ')}`);
   }
   if (Array.isArray(memory?.graphInsights?.topSymbols) && memory.graphInsights.topSymbols.length > 0) {
-    lines.push(`Graph memory symbols: ${memory.graphInsights.topSymbols.slice(0, 6).map((item) => item.symbol).join(', ')}`);
+    lines.push(`Graph memory symbols: ${memory.graphInsights.topSymbols.slice(0, 6).map((item) => `${item.symbol} (count=${Number(item?.count || 0)}, weight=${Number(item?.weight || 0).toFixed(1)})`).join(' | ')}`);
   }
   if (memory?.temporalInsights) {
     const topDecision = memory.temporalInsights.activeDecisions?.[0];
     const hotFiles = (memory.temporalInsights.activeFiles || []).slice(0, 3).map((item) => item.filePath).join(', ');
     lines.push(`Temporal memory: recentShare=${memory.temporalInsights.recentShare || 0} | hottestDecision=${topDecision?.decision || 'none'} | hottestFiles=${hotFiles || 'none'}`);
+    if (isTemporalMemoryConcentrated(memory.temporalInsights.recentShare, temporalConcentrationThreshold()) && hotFiles) {
+      lines.push(`Temporal action bias: start from ${hotFiles} before reopening colder files or symbols.`);
+    }
   }
 
   if (Array.isArray(memory?.searchResults) && memory.searchResults.length > 0) {
@@ -3009,11 +3219,30 @@ function buildMemoryPromptLines(memory) {
   return lines;
 }
 
-export function buildProjectPlanningPriorLines(memory, run = null) {
+function formatProjectPlanningSymbolLine(symbolMeta, projectIntelligence = null) {
+  const roleContext = resolveSymbolRoleContext(symbolMeta?.symbol, { projectGraph: projectIntelligence });
+  const bits = [];
+  if (roleContext?.role === 'exported' && roleContext.filePath) {
+    bits.push(`exported from ${roleContext.filePath}`);
+  } else if (roleContext?.role === 'imported' && roleContext.filePath) {
+    bits.push(`imported in ${roleContext.filePath}`);
+  } else if (Array.isArray(symbolMeta?.definedIn) && symbolMeta.definedIn.length) {
+    bits.push(`exported from ${symbolMeta.definedIn[0]}`);
+  } else if (Array.isArray(symbolMeta?.targetFiles) && symbolMeta.targetFiles.length) {
+    bits.push(`touches ${symbolMeta.targetFiles[0]}`);
+  }
+  bits.push(`imported by ${Number(symbolMeta?.importerCount ?? roleContext?.importedByCount ?? 0)} file(s)`);
+  bits.push(`called by ${Number(symbolMeta?.callerCount ?? roleContext?.calledByCount ?? 0)} file(s)`);
+  if (Number(symbolMeta?.riskScore || 0) > 0) bits.push(`risk=${Number(symbolMeta.riskScore).toFixed(1)}`);
+  return `${symbolMeta.symbol} (${bits.join(', ')})`;
+}
+
+export function buildProjectPlanningPriorLines(memory, run = null, projectIntelligence = null) {
   const lines = [];
   const failures = memory?.failureAnalytics || {};
   const trace = memory?.traceSummary || {};
   const temporal = memory?.temporalInsights || {};
+  const temporalHotFiles = Array.isArray(temporal.activeFiles) ? temporal.activeFiles.map((item) => String(item?.filePath || '').trim()).filter(Boolean) : [];
   if (Number(failures.scopeDriftCount || 0) > 0) {
     lines.push('- Project-specific prior: recent runs drifted scope. Lock excluded scope and filesLikely before widening the graph.');
   }
@@ -3039,69 +3268,30 @@ export function buildProjectPlanningPriorLines(memory, run = null) {
   if (Array.isArray(memory?.graphInsights?.topEdges) && memory.graphInsights.topEdges.length > 0) {
     lines.push(`- Project-specific prior: recent graph edges touched together: ${memory.graphInsights.topEdges.slice(0, 3).map((item) => item.edge).join(' | ')}`);
   }
-  if (Number(temporal.recentShare || 0) >= 0.55 && Array.isArray(temporal.activeFiles) && temporal.activeFiles.length > 0) {
-    lines.push(`- Project-specific prior: recent memory dominates. Start from these hot files before reopening older areas: ${temporal.activeFiles.slice(0, 3).map((item) => item.filePath).join(' | ')}`);
+  if (projectIntelligence?.criticalSymbols?.length) {
+    lines.push(`- Project-specific prior: critical symbols with repo-wide impact: ${projectIntelligence.criticalSymbols.slice(0, 3).map((item) => formatProjectPlanningSymbolLine(item, projectIntelligence)).join(' | ')}`);
+  } else if (projectIntelligence?.topSymbols?.length) {
+    lines.push(`- Project-specific prior: high-impact symbols: ${projectIntelligence.topSymbols.slice(0, 3).map((item) => formatProjectPlanningSymbolLine(item, projectIntelligence)).join(' | ')}`);
+  }
+  if (projectIntelligence?.topFiles?.length) {
+    lines.push(`- Project-specific prior: high-impact files: ${projectIntelligence.topFiles.slice(0, 3).map((item) => `${item.path} (importedBy=${item.importedByCount || 0}, calledBy=${item.calledByCount || 0})`).join(' | ')}`);
+  }
+  if (projectIntelligence?.topEdges?.length) {
+    lines.push(`- Project-specific prior: repo-wide hot edges: ${projectIntelligence.topEdges.slice(0, 2).map((item) => `${item.targetPath}${Array.isArray(item.importedSymbols) && item.importedSymbols.length ? `#${item.importedSymbols.join(',')}` : ''} (importers=${item.importerCount || 0}, callers=${item.callerCount || 0})`).join(' | ')}`);
+  }
+  if (isTemporalMemoryConcentrated(temporal.recentShare, temporalConcentrationThreshold()) && temporalHotFiles.length > 0) {
+    lines.push(`- Project-specific prior: recent memory dominates. Start from these hot files before reopening older areas: ${temporalHotFiles.slice(0, 3).join(' | ')}`);
+  }
+  const hotImpactFiles = temporalHotFiles
+    .filter((filePath) => (projectIntelligence?.topFiles || []).some((item) => normalizeFilesLikely([item?.path])[0] === normalizeFilesLikely([filePath])[0]))
+    .slice(0, 2);
+  if (hotImpactFiles.length) {
+    lines.push(`- Project-specific prior: temporal-hot files are also repo-wide high-impact. Treat these as scope anchors: ${hotImpactFiles.join(' | ')}`);
   }
   if (Array.isArray(temporal.activeRootCauses) && temporal.activeRootCauses.length > 0) {
     lines.push(`- Project-specific prior: recurring recent root causes: ${temporal.activeRootCauses.slice(0, 2).map((item) => item.reason).join(' | ')}`);
   }
   return lines;
-}
-
-async function resolvePromptMemory(run, query, limit = 4, options = {}) {
-  if (!run.memory?.projectKey) {
-    return {
-      memoryFile: '',
-      dailyDir: '',
-      recentSummary: '',
-      searchQuery: '',
-      searchResults: [],
-      retrievedContext: 'No relevant project memory found.',
-      searchBackend: 'none',
-      failureAnalytics: null,
-      traceSummary: null,
-      graphInsights: { topEdges: [], topSymbols: [] },
-      temporalInsights: { activeDecisions: [], activeFiles: [], activeRootCauses: [], recentShare: 0 }
-    };
-  }
-  return searchProjectMemory(ROOT_DIR, run.memory.projectKey, query, limit, {
-    projectPath: run.projectPath || ''
-  }, options);
-}
-
-async function applyMemorySnapshot(runId, snapshot) {
-  await withLock(runId, async () => {
-    const fresh = await loadState(runId);
-    fresh.memory = {
-      ...fresh.memory,
-      dir: snapshot.baseDir,
-      memoryFile: snapshot.memoryFile,
-      dailyDir: snapshot.dailyDir,
-      dailyFile: snapshot.dailyFile,
-      indexFile: snapshot.indexFile,
-      recentSummary: snapshot.recentSummary,
-      searchQuery: snapshot.searchQuery,
-      searchResults: snapshot.searchResults,
-      retrievedContext: snapshot.retrievedContext,
-      searchBackend: snapshot.searchBackend,
-      failureAnalytics: snapshot.failureAnalytics || null,
-      traceSummary: snapshot.traceSummary || null,
-      graphInsights: snapshot.graphInsights || { topEdges: [], topSymbols: [] },
-      temporalInsights: snapshot.temporalInsights || { activeDecisions: [], activeFiles: [], activeRootCauses: [], recentShare: 0 }
-    };
-    await saveState(fresh);
-  });
-}
-
-async function refreshRunMemory(runId, query) {
-  const run = await loadState(runId);
-  const snapshot = await resolvePromptMemory(
-    run,
-    query || run.clarify?.clarifiedObjective || run.input.objective || run.title,
-    4
-  );
-  await applyMemorySnapshot(runId, snapshot);
-  return snapshot;
 }
 
 function buildClarifyPrompt(run, memory, provider = 'codex') {
@@ -3167,6 +3357,18 @@ function killProcessTree(child) {
     try { child.kill('SIGKILL'); } catch {}
   }
 }
+
+const runBrowserVerification = createBrowserVerificationRunner({
+  clipLine,
+  firstUrlFromTask,
+  fs,
+  killProcessTree,
+  normalizeBrowserVerificationConfig,
+  normalizeDevServerConfig,
+  probeHttpUrl,
+  startBackgroundCommand,
+  waitForHttpUrl
+});
 
 async function runProcess(command, args, cwd, controller, track = true, envOverrides = null, timeoutMs = 0, stdinText = '') {
   return new Promise((resolve, reject) => {
@@ -3684,94 +3886,7 @@ async function runTaskVerification(run, task, executionCtx, currentTaskDir, cont
   return report;
 }
 
-export async function runBrowserVerification(run, task, executionCtx, currentTaskDir, controller) {
-  const browserConfig = normalizeBrowserVerificationConfig(run?.projectContext?.browserVerification) || {};
-  const devServerConfig = normalizeDevServerConfig(run?.projectContext?.devServer, run?.projectPath || executionCtx?.reviewCwd || '') || null;
-  const targetUrl = browserConfig.url || devServerConfig?.url || firstUrlFromTask(task);
-  const selector = browserConfig.selector || '';
-  const timeoutMs = Number(browserConfig.timeoutMs || devServerConfig?.timeoutMs || 15000);
-  const result = {
-    required: true,
-    status: 'unverifiable',
-    ok: false,
-    targetUrl,
-    selector,
-    note: '',
-    usedExistingServer: false,
-    startedServer: false,
-    screenshotPath: '',
-    consoleSummary: [],
-    stepLog: []
-  };
-  if (!targetUrl) {
-    result.note = 'No browser target URL configured for this task.';
-    return result;
-  }
-
-  let serverHandle = null;
-  try {
-    const alreadyHealthy = await probeHttpUrl(targetUrl, 1500);
-    if (alreadyHealthy) {
-      result.usedExistingServer = true;
-      result.stepLog.push(`Attached to existing server at ${targetUrl}.`);
-    } else if (devServerConfig?.command) {
-      serverHandle = await startBackgroundCommand(devServerConfig.command, devServerConfig.cwd || run.projectPath || executionCtx.reviewCwd, controller);
-      result.startedServer = true;
-      result.stepLog.push(`Started dev server with command: ${devServerConfig.command}`);
-      const healthy = await waitForHttpUrl(targetUrl, devServerConfig.timeoutMs || timeoutMs);
-      if (!healthy) {
-        const output = serverHandle.readOutput();
-        await fs.writeFile(path.join(currentTaskDir, 'browser-dev-server.log'), `${output.stdout || ''}\n${output.stderr || ''}`.trim(), 'utf8').catch(() => {});
-        result.note = `Dev server did not become healthy at ${targetUrl}.`;
-        return result;
-      }
-    } else {
-      result.note = `Target URL ${targetUrl} is not reachable and no dev server command was configured.`;
-      return result;
-    }
-
-    let playwrightModule = null;
-    try {
-      playwrightModule = await import('playwright');
-    } catch {
-      result.note = 'Playwright is not installed, so browser verification was recorded as unverifiable.';
-      return result;
-    }
-
-    const browser = await playwrightModule.chromium.launch({ headless: true });
-    const context = await browser.newContext();
-    const page = await context.newPage();
-    page.on('console', (message) => {
-      if (result.consoleSummary.length >= 12) return;
-      result.consoleSummary.push(`${message.type()}: ${clipLine(message.text(), 180)}`);
-    });
-    await page.goto(targetUrl, { waitUntil: browserConfig.waitUntil || 'domcontentloaded', timeout: timeoutMs });
-    result.stepLog.push(`Navigated to ${targetUrl}.`);
-    if (selector) {
-      await page.waitForSelector(selector, { timeout: timeoutMs });
-      result.stepLog.push(`Selector matched: ${selector}`);
-    }
-    const screenshotPath = path.join(currentTaskDir, 'browser-screenshot.png');
-    await page.screenshot({ path: screenshotPath, fullPage: true });
-    result.screenshotPath = screenshotPath;
-    result.status = 'passed';
-    result.ok = true;
-    result.note = selector ? `Browser verification passed for selector ${selector}.` : 'Browser verification passed.';
-    await context.close();
-    await browser.close();
-    return result;
-  } catch (error) {
-    result.status = 'failed';
-    result.ok = false;
-    result.note = clipLine(error?.message || 'Browser verification failed.');
-    return result;
-  } finally {
-    if (serverHandle?.child) {
-      killProcessTree(serverHandle.child);
-      if (controller) controller.children.delete(serverHandle.child);
-    }
-  }
-}
+export { runBrowserVerification };
 
 async function applyTaskPatch(run, currentTaskDir) {
   return withLock(run.id, async () => {
@@ -3800,19 +3915,20 @@ async function applyTaskPatch(run, currentTaskDir) {
   });
 }
 
-function buildPlannerPrompt(run, memory, provider = 'codex') {
+async function buildPlannerPrompt(run, memory, provider = 'codex') {
   const clarify = run.clarify || {};
   const policy = run.executionPolicy || defaultExecutionPolicy(run.profile);
   const presetBaseline = presetPolicyBaseline(run);
   const teamBlueprint = run.harnessConfig?.teamBlueprint || deriveTeamBlueprint(run);
   const providerName = providerDisplayName(provider);
+  const projectIntelligence = run.projectPath ? await buildProjectCodeIntelligence(run.projectPath) : null;
   return [
     `You are the ${providerName} supervisor for a local engineering harness.`,
     'Read the spec bundle and project summary files from disk before answering.',
     `Spec bundle: ${path.join(runDir(run.id), 'input', 'spec-bundle.md')}`,
     `Project summary: ${path.join(runDir(run.id), 'context', 'project-summary.md')}`,
     ...buildMemoryPromptLines(memory),
-    ...buildProjectPlanningPriorLines(memory, run),
+    ...buildProjectPlanningPriorLines(memory, run, projectIntelligence),
     ...buildHarnessGuidanceLines(run.harnessConfig, 'planner', provider),
     run.projectPath ? `Project root: ${run.projectPath}` : 'Project root: none',
     ...buildProjectPromptLines(run),
@@ -3896,18 +4012,297 @@ async function readFilesLikelyContents(run, task, executionCtx, maxFiles = 3) {
   return sections;
 }
 
-function buildRetryContext(task) {
-  if (!task.attempts) return [];
-  const priorAcceptance = normalizeAcceptanceCheckResults(task.lastExecution?.acceptanceCheckResults)
-    .slice(0, 5)
-    .map((item) => `${item.check}: ${item.status || 'unknown'}${item.note ? ` (${item.note})` : ''}`);
-  return [
-    `Previous attempt count: ${task.attempts}`,
-    `Previous reviewer summary: ${task.reviewSummary || 'None recorded.'}`,
-    `Previous findings: ${(task.findings || []).join(' | ') || 'None recorded.'}`,
-    ...(priorAcceptance.length ? [`Previous acceptance check results: ${priorAcceptance.join(' | ')}`] : []),
-    'Do not repeat the same failed approach. Change the method if the prior attempt did not converge.'
-  ];
+function parseGraphEdge(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return { raw: '', source: '', target: '', symbols: [] };
+  const [edgePart, symbolPart = ''] = raw.split('#');
+  const [source = '', target = ''] = edgePart.split('->').map((item) => String(item || '').trim());
+  return {
+    raw,
+    source,
+    target,
+    symbols: symbolPart
+      .split(',')
+      .map((item) => String(item || '').trim())
+      .filter(Boolean)
+  };
+}
+
+function formatGraphEdgeSummary(edgeMeta) {
+  if (!edgeMeta?.source || !edgeMeta?.target) return '';
+  const via = edgeMeta.symbols?.length ? ` via ${edgeMeta.symbols.join(', ')}` : '';
+  const counts = [];
+  if (Number(edgeMeta.currentCount || 0) > 0) counts.push(`current imports=${edgeMeta.currentCount}`);
+  if (Number(edgeMeta.callCount || 0) > 0) counts.push(`call refs=${edgeMeta.callCount}`);
+  if (Number(edgeMeta.callerCount || 0) > 0) counts.push(`active callers=${edgeMeta.callerCount}`);
+  if (Number(edgeMeta.memoryCount || 0) > 0) counts.push(`recent hits=${edgeMeta.memoryCount}`);
+  if (Number(edgeMeta.memoryWeight || 0) > 0) counts.push(`memory weight=${edgeMeta.memoryWeight}`);
+  return `${edgeMeta.source} -> ${edgeMeta.target}${via}${counts.length ? ` (${counts.join(', ')})` : ''}`;
+}
+
+function resolveSymbolRoleContext(symbol, codeContext = null) {
+  const normalizedSymbol = String(symbol || '').trim().toLowerCase();
+  if (!normalizedSymbol) return null;
+  const projectSymbol = [
+    ...(Array.isArray(codeContext?.projectGraph?.criticalSymbols) ? codeContext.projectGraph.criticalSymbols : []),
+    ...(Array.isArray(codeContext?.projectGraph?.topSymbols) ? codeContext.projectGraph.topSymbols : [])
+  ].find((item) => String(item?.symbol || '').trim().toLowerCase() === normalizedSymbol);
+  if (Array.isArray(projectSymbol?.definedIn) && projectSymbol.definedIn.length) {
+    return {
+      role: 'exported',
+      filePath: projectSymbol.definedIn[0],
+      importedByCount: Number(projectSymbol?.importerCount || 0),
+      calledByCount: Number(projectSymbol?.callerCount || 0)
+    };
+  }
+  for (const item of Array.isArray(codeContext?.relatedFiles) ? codeContext.relatedFiles : []) {
+    const exported = [...(item?.codeGraph?.exports || []), ...(item?.codeGraph?.declarations || [])]
+      .find((entry) => String(entry || '').trim().toLowerCase() === normalizedSymbol);
+    if (exported) {
+      return {
+        role: 'exported',
+        filePath: item.path,
+        importedByCount: Number(item?.impact?.importedByCount || 0),
+        calledByCount: Number(item?.impact?.calledByCount || 0)
+      };
+    }
+    const imported = (item?.codeGraph?.importedSymbols || [])
+      .find((entry) => String(entry || '').trim().toLowerCase() === normalizedSymbol);
+    if (imported) {
+      return {
+        role: 'imported',
+        filePath: item.path,
+        importedByCount: Number(item?.impact?.importedByCount || 0),
+        calledByCount: Number(item?.impact?.calledByCount || 0)
+      };
+    }
+  }
+  return null;
+}
+
+function formatSymbolRiskLine(symbolMeta, codeContext = null) {
+  const roleContext = resolveSymbolRoleContext(symbolMeta?.symbol, codeContext);
+  const counts = [];
+  if (roleContext?.role === 'imported') {
+    counts.push(`scope imports it`);
+  } else if (roleContext?.role === 'exported') {
+    counts.push(`scope exports it`);
+  }
+  if (Number(symbolMeta?.currentCount || 0) > 0) counts.push(`${symbolMeta.currentCount} importer`);
+  if (Number(symbolMeta?.currentCount || 0) > 1) counts[counts.length - 1] += 's';
+  if (Number(symbolMeta?.callerCount || 0) > 0) counts.push(`${symbolMeta.callerCount} active caller${Number(symbolMeta.callerCount) > 1 ? 's' : ''}`);
+  if (Number(symbolMeta?.memoryWeight || 0) > 0) counts.push(`recent weight ${Number(symbolMeta.memoryWeight).toFixed(1)}`);
+  const location = roleContext?.filePath ? ` in ${roleContext.filePath}` : '';
+  return `${symbolMeta.symbol}:${location} ${counts.join(', ') || 'present in scope'}`;
+}
+
+function selectDisplayedSymbolSignals(symbolSignals = []) {
+  const displayDefaults = GRAPH_INTELLIGENCE_DEFAULTS?.display || {};
+  const poolSize = Math.max(1, Number(displayDefaults.symbolRiskPoolSize || 8) || 8);
+  const minLines = Math.max(1, Number(displayDefaults.symbolRiskMinLines || 2) || 2);
+  const maxLines = Math.max(minLines, Number(displayDefaults.symbolRiskMaxLines || 4) || 4);
+  const memoryRatioCutoff = Number(displayDefaults.symbolRiskMemoryWeightRatioCutoff || 0.45);
+  const riskRatioCutoff = Number(displayDefaults.symbolRiskScoreRatioCutoff || 0.7);
+  const prioritizedPool = symbolSignals
+    .slice(0, poolSize)
+    .sort((left, right) => right.memoryWeight - left.memoryWeight || right.memoryCount - left.memoryCount || right.riskScore - left.riskScore || left.symbol.localeCompare(right.symbol));
+  if (!prioritizedPool.length) return [];
+  const topMemoryWeight = Math.max(...prioritizedPool.map((item) => Number(item.memoryWeight || 0)));
+  const topRiskScore = Math.max(...prioritizedPool.map((item) => Number(item.riskScore || 0)));
+  const selected = prioritizedPool.filter((item, index) => {
+    if (index < minLines) return true;
+    if (topMemoryWeight > 0 && Number(item.memoryWeight || 0) >= topMemoryWeight * memoryRatioCutoff) return true;
+    return Number(item.riskScore || 0) >= topRiskScore * riskRatioCutoff;
+  });
+  return (selected.length ? selected : prioritizedPool.slice(0, minLines)).slice(0, maxLines);
+}
+
+export function deriveExecutionGraphSignals(task, codeContext = null, memory = null) {
+  const relatedFiles = Array.isArray(codeContext?.relatedFiles) ? codeContext.relatedFiles : [];
+  const scopedFiles = new Set(normalizeFilesLikely(task?.filesLikely).filter((item) => item && item !== '*'));
+  const edgeMap = new Map();
+  const symbolMap = new Map();
+  const memoryEdgeEntries = Array.isArray(memory?.graphInsights?.topEdges) ? memory.graphInsights.topEdges : [];
+  const memorySymbolEntries = Array.isArray(memory?.graphInsights?.topSymbols) ? memory.graphInsights.topSymbols : [];
+  const projectTopSymbols = Array.isArray(codeContext?.projectGraph?.topSymbols) ? codeContext.projectGraph.topSymbols : [];
+  const projectTopFiles = Array.isArray(codeContext?.projectGraph?.topFiles) ? codeContext.projectGraph.topFiles : [];
+
+  for (const entry of relatedFiles) {
+    const sourcePath = String(entry?.path || '').trim().replace(/\\/g, '/');
+    if (!sourcePath) continue;
+
+    for (const impactEntry of [
+      ...(Array.isArray(entry?.impact?.exportedSymbolImpact) ? entry.impact.exportedSymbolImpact : []),
+      ...(Array.isArray(entry?.impact?.importedSymbolImpact) ? entry.impact.importedSymbolImpact : []),
+      ...(Array.isArray(entry?.impact?.calledSymbolImpact) ? entry.impact.calledSymbolImpact : [])
+    ]) {
+      const normalizedSymbol = String(impactEntry?.symbol || '').trim();
+      if (!normalizedSymbol) continue;
+      const previous = symbolMap.get(normalizedSymbol) || { symbol: normalizedSymbol, currentCount: 0, callerCount: 0, callCount: 0, memoryCount: 0, memoryWeight: 0 };
+      previous.currentCount = Math.max(previous.currentCount, Number(impactEntry?.importerCount || 0));
+      previous.callerCount = Math.max(previous.callerCount, Number(impactEntry?.callerCount || 0));
+      previous.callCount = Math.max(previous.callCount, Number(impactEntry?.callCount || 0));
+      symbolMap.set(normalizedSymbol, previous);
+    }
+
+    for (const symbol of [
+      ...(Array.isArray(entry?.codeGraph?.exports) ? entry.codeGraph.exports : []),
+      ...(Array.isArray(entry?.codeGraph?.declarations) ? entry.codeGraph.declarations : []),
+      ...(Array.isArray(entry?.codeGraph?.importedSymbols) ? entry.codeGraph.importedSymbols : [])
+    ]) {
+      const normalizedSymbol = String(symbol || '').trim();
+      if (!normalizedSymbol) continue;
+      const previous = symbolMap.get(normalizedSymbol) || { symbol: normalizedSymbol, currentCount: 0, callerCount: 0, callCount: 0, memoryCount: 0, memoryWeight: 0 };
+      previous.currentCount = Math.max(previous.currentCount, 1);
+      symbolMap.set(normalizedSymbol, previous);
+    }
+
+    const imports = Array.isArray(entry?.codeGraph?.imports) ? entry.codeGraph.imports : [];
+    for (const link of imports) {
+      const targetPath = String(link?.target || '').trim().replace(/\\/g, '/');
+      if (!targetPath) continue;
+      const importedSymbols = (Array.isArray(link?.importedSymbols) ? link.importedSymbols : [])
+        .map((item) => String(item || '').trim())
+        .filter(Boolean);
+      const outgoingImpact = (Array.isArray(entry?.impact?.outgoingEdgeImpact) ? entry.impact.outgoingEdgeImpact : [])
+        .find((item) => String(item?.target || '').trim().replace(/\\/g, '/') === targetPath);
+      const rawEdge = `${sourcePath}->${targetPath}${importedSymbols.length ? `#${importedSymbols.join(',')}` : ''}`;
+      const previous = edgeMap.get(rawEdge) || {
+        raw: rawEdge,
+        source: sourcePath,
+        target: targetPath,
+        symbols: importedSymbols,
+        currentCount: 0,
+        callerCount: 0,
+        callCount: 0,
+        memoryCount: 0,
+        memoryWeight: 0,
+        riskScore: 0
+      };
+      previous.currentCount = Math.max(previous.currentCount, Number(outgoingImpact?.importerCount || 0), 1);
+      previous.callerCount = Math.max(previous.callerCount, Number(outgoingImpact?.callerCount || 0), 0);
+      previous.callCount = Math.max(previous.callCount, Number(outgoingImpact?.callCount || 0), 0);
+      edgeMap.set(rawEdge, previous);
+    }
+  }
+
+  const relevantSymbolKeys = new Set([
+    ...symbolMap.keys(),
+    ...(Array.isArray(codeContext?.symbolHints) ? codeContext.symbolHints : []).map((item) => String(item || '').trim())
+      .filter(Boolean)
+  ].map((item) => item.toLowerCase()));
+  for (const projectSymbol of projectTopSymbols) {
+    const normalizedSymbol = String(projectSymbol?.symbol || '').trim();
+    if (!normalizedSymbol) continue;
+    if (relevantSymbolKeys.size && !relevantSymbolKeys.has(normalizedSymbol.toLowerCase())) continue;
+    const previous = symbolMap.get(normalizedSymbol) || { symbol: normalizedSymbol, currentCount: 0, callerCount: 0, callCount: 0, memoryCount: 0, memoryWeight: 0 };
+    previous.currentCount = Math.max(previous.currentCount, Number(projectSymbol?.importerCount || 0));
+    previous.callerCount = Math.max(previous.callerCount, Number(projectSymbol?.callerCount || 0));
+    previous.callCount = Math.max(previous.callCount, Number(projectSymbol?.callCount || 0));
+    symbolMap.set(normalizedSymbol, previous);
+  }
+
+  for (const item of memoryEdgeEntries) {
+    const parsed = parseGraphEdge(item?.edge);
+    if (!parsed.raw) continue;
+    const exact = edgeMap.get(parsed.raw);
+    if (exact) {
+      exact.memoryCount = Number(item?.count || 0);
+      exact.memoryWeight = Number(item?.weight || 0);
+      continue;
+    }
+    for (const candidate of edgeMap.values()) {
+      const samePair = candidate.source === parsed.source && candidate.target === parsed.target;
+      const sharedSymbols = candidate.symbols.some((symbol) => parsed.symbols.includes(symbol));
+      if (!samePair && !sharedSymbols) continue;
+      candidate.memoryCount = Math.max(candidate.memoryCount, Number(item?.count || 0));
+      candidate.memoryWeight = Math.max(candidate.memoryWeight, Number(item?.weight || 0));
+    }
+  }
+
+  for (const item of memorySymbolEntries) {
+    const normalizedSymbol = String(item?.symbol || '').trim();
+    if (!normalizedSymbol) continue;
+    const previous = symbolMap.get(normalizedSymbol) || { symbol: normalizedSymbol, currentCount: 0, callerCount: 0, callCount: 0, memoryCount: 0, memoryWeight: 0 };
+    previous.memoryCount = Math.max(previous.memoryCount, Number(item?.count || 0));
+    previous.memoryWeight = Math.max(previous.memoryWeight, Number(item?.weight || 0));
+    symbolMap.set(normalizedSymbol, previous);
+  }
+
+  const edgeSignals = [...edgeMap.values()]
+    .map((item) => ({
+      ...item,
+      riskScore: calculateExecutionEdgeRiskScore(item)
+    }))
+    .sort((left, right) => right.riskScore - left.riskScore || right.memoryWeight - left.memoryWeight || left.raw.localeCompare(right.raw));
+
+  const symbolSignals = [...symbolMap.values()]
+    .map((item) => ({
+      ...item,
+      riskScore: calculateExecutionSymbolRiskScore(item)
+    }))
+    .sort((left, right) => right.riskScore - left.riskScore || right.memoryWeight - left.memoryWeight || left.symbol.localeCompare(right.symbol));
+  const prioritizedSymbolSignals = selectDisplayedSymbolSignals(symbolSignals);
+
+  const dependencyWarnings = edgeSignals
+    .filter((item) => scopedFiles.size > 0 && scopedFiles.has(normalizeFilesLikely([item.source])[0]) && !scopedFiles.has(normalizeFilesLikely([item.target])[0]))
+    .slice(0, 3)
+    .map((item) => {
+      const via = item.symbols.length ? ` via ${item.symbols.join(', ')}` : '';
+      const targetImpact = projectTopFiles.find((entry) => normalizeFilesLikely([entry?.path])[0] === normalizeFilesLikely([item.target])[0]);
+      const impactTail = targetImpact?.importedByCount
+        ? ` ${item.target} is currently imported by ${targetImpact.importedByCount} file(s).`
+        : '';
+      const callTail = targetImpact?.calledByCount
+        ? ` ${item.target} is actively called by ${targetImpact.calledByCount} file(s).`
+        : '';
+      const memoryTail = item.memoryCount > 0 || item.memoryWeight > 0
+        ? ` Recent memory saw this edge ${item.memoryCount || 0} time(s) with weight ${item.memoryWeight || 0}.`
+        : '';
+      return `filesLikely excludes ${item.target}, but ${item.source} imports it${via}. Confirm whether the task should stay scoped or explicitly widen the boundary.${impactTail}${callTail}${memoryTail}`;
+    });
+
+  const relationshipLines = edgeSignals.slice(0, 3).map(formatGraphEdgeSummary).filter(Boolean);
+  const symbolRiskLines = prioritizedSymbolSignals.map((item) => formatSymbolRiskLine(item, codeContext));
+  const criticalSymbolRiskLines = prioritizedSymbolSignals
+    .filter((item) => isCriticalGraphRisk(item.riskScore, graphCriticalRiskThreshold()))
+    .slice(0, 3)
+    .map((item) => `${formatSymbolRiskLine(item, codeContext)} (risk=${item.riskScore.toFixed(1)})`);
+  const temporalHotFiles = (memory?.temporalInsights?.activeFiles || [])
+    .map((item) => String(item?.filePath || '').trim())
+    .filter(Boolean)
+    .slice(0, 3);
+  const temporalScopeWarnings = temporalHotFiles
+    .filter((filePath) => scopedFiles.size > 0 && !scopedFiles.has(normalizeFilesLikely([filePath])[0]))
+    .slice(0, 2)
+    .map((filePath) => `Recent memory is concentrated on ${filePath}, but filesLikely does not include it. Reconfirm whether the task scope is stale.`);
+  const temporalActionLine = isTemporalMemoryConcentrated(memory?.temporalInsights?.recentShare, temporalConcentrationThreshold()) && temporalHotFiles.length
+    ? `Recent memory is concentrated on ${temporalHotFiles.join(', ')}. Re-enter through those files before widening to colder areas.`
+    : '';
+  const topSymbol = symbolSignals[0] || null;
+  const topSymbolRole = resolveSymbolRoleContext(topSymbol?.symbol, codeContext);
+  const temporalHotSymbolFile = topSymbolRole?.filePath && temporalHotFiles.some((filePath) =>
+    normalizeFilesLikely([filePath])[0] === normalizeFilesLikely([topSymbolRole.filePath])[0]
+  )
+    ? topSymbolRole.filePath
+    : '';
+  const reentryLine = topSymbol
+    ? `Re-enter through ${topSymbol.symbol} (risk=${topSymbol.riskScore.toFixed(2)})${topSymbolRole?.filePath ? ` in ${topSymbolRole.filePath}` : ''}${temporalHotSymbolFile ? ' (temporal hot)' : ''}`
+    : '';
+
+  return {
+    relationshipLines,
+    symbolRiskLines,
+    criticalSymbolRiskLines,
+    dependencyWarnings: [...dependencyWarnings, ...temporalScopeWarnings],
+    retryLines: [
+      ...(relationshipLines.length ? [`Prior graph relationships: ${relationshipLines.join(' | ')}`] : []),
+      ...(reentryLine ? [reentryLine] : []),
+      ...(temporalActionLine ? [temporalActionLine] : [])
+    ],
+    edgeSignals,
+    symbolSignals
+  };
 }
 
 function buildUpstreamContext(run, task) {
@@ -3942,270 +4337,45 @@ function buildScopeRules(expectedScope) {
   ];
 }
 
-function isReadOnlyVerificationTask(task) {
-  const constraintText = Array.isArray(task?.constraints) ? task.constraints.join('\n') : '';
-  return /read-only review|do not edit any files|read-only|읽기 전용|파일을 수정하지 않는다|파일을 수정하지 않음|수정하지 않는다|코드를 수정하지 않는다/i.test(constraintText);
+const promptBuilders = createPromptBuilders({
+  ROOT_DIR,
+  buildContinuationPromptLines,
+  buildHarnessGuidanceLines,
+  buildMemoryPromptLines,
+  buildProjectPlanningPriorLines,
+  buildProjectPromptLines,
+  buildProjectCodeIntelligence,
+  buildPromptContextExcerpts,
+  buildScopeRules,
+  buildUpstreamContext,
+  clipText,
+  deriveExecutionGraphSignals,
+  harnessGuidancePath,
+  normalizeAcceptanceCheckResults,
+  predictTaskScopeEnforcement,
+  providerDisplayName,
+  readFilesLikelyContents,
+  runCheckpointPath,
+  runDir,
+  searchProjectMemory,
+  selectVerificationCommands,
+  writeInPreferredLanguageRule
+});
+
+export function buildRetryContext(task, memory = null, codeContext = null, graphSignals = null) {
+  return promptBuilders.buildRetryContext(task, memory, codeContext, graphSignals);
 }
 
-function taskCanSucceedWithoutRepoDiff(task) {
-  if (isReadOnlyVerificationTask(task)) return true;
-  return taskContainsText(task, [
-    'spec',
-    'acceptance',
-    'scope',
-    'requirements',
-    'verify',
-    'verification',
-    'read-only',
-    'do not implement',
-    'inspect',
-    'analysis',
-    'confirm',
-    'reproduce'
-  ]);
+export function buildCodeContextPromptLines(codeContext, memory = null, task = null, graphSignals = null) {
+  return promptBuilders.buildCodeContextPromptLines(codeContext, memory, task, graphSignals);
 }
 
-function buildCodeContextPromptLines(codeContext) {
-  if (!codeContext) return ['Code context: unavailable'];
-  const lines = [`Code context summary: ${clipText(codeContext.summary || 'None', 400)}`];
-  if (Array.isArray(codeContext.relatedFiles) && codeContext.relatedFiles.length > 0) {
-    lines.push('Relevant code files and symbols:');
-    for (const item of codeContext.relatedFiles.slice(0, 4)) {
-      const symbolText = Array.isArray(item.symbols) ? item.symbols.join(' | ') : '';
-      const exportText = Array.isArray(item.codeGraph?.exports) && item.codeGraph.exports.length ? ` exports=${item.codeGraph.exports.join(',')}` : '';
-      const importText = Array.isArray(item.codeGraph?.imports) && item.codeGraph.imports.length ? ` imports=${item.codeGraph.imports.map((entry) => entry.target || entry.specifier).join(',')}` : '';
-      lines.push(`- ${item.path}: ${clipText(`${symbolText || item.snippet || ''}${exportText}${importText}`, 220)}`);
-    }
-  } else {
-    lines.push('Relevant code files and symbols: none');
-  }
-  return lines;
-}
-
-async function buildCodexPrompt(run, task, memory, executionCtx, codeContext = null, provider = 'codex') {
-  const verificationCommands = selectVerificationCommands(run, task);
-  const contextExcerpts = await buildPromptContextExcerpts(run);
-  const expectedScope = predictTaskScopeEnforcement(task, executionCtx);
-  const fileContexts = await readFilesLikelyContents(run, task, executionCtx);
-  const upstreamContext = buildUpstreamContext(run, task);
-  const retryContext = buildRetryContext(task);
-  const providerName = providerDisplayName(provider);
-  const riskMemory = await searchProjectMemory(ROOT_DIR, run.memory.projectKey, 'task risk failure out-of-scope retry', 3, {
-    projectPath: run.projectPath || ''
-  }, {
-    reindex: false,
-    stage: 'review',
-    taskId: task.id,
-    filesLikely: task.filesLikely,
-    relatedFiles: codeContext?.relatedFiles || [],
-    symbolHints: codeContext?.symbolHints || []
-  }).catch(() => ({ searchResults: [] }));
-  return [
-    `You are the ${providerName} implementation executor inside a local engineering harness.`,
-    'Read the spec bundle and project summary files first, then edit the current working directory directly.',
-    `Spec bundle: ${path.join(runDir(run.id), 'input', 'spec-bundle.md')}`,
-    `Project summary: ${path.join(runDir(run.id), 'context', 'project-summary.md')}`,
-    `Harness guidance: ${harnessGuidancePath(run.id)}`,
-    ...buildMemoryPromptLines(memory),
-    ...buildCodeContextPromptLines(codeContext),
-    ...buildHarnessGuidanceLines(run.harnessConfig, 'implementer', provider),
-    '',
-    ...buildContinuationPromptLines(run, task.id),
-    '',
-    ...contextExcerpts,
-    ...(fileContexts.length ? ['', 'FilesLikely current contents:', ...fileContexts] : []),
-    ...(upstreamContext.length ? ['', 'Completed upstream context:', ...upstreamContext] : []),
-    ...(retryContext.length ? ['', 'Retry context:', ...retryContext] : []),
-    ...(riskMemory.searchResults?.length ? ['', 'Known failure patterns from previous runs:', ...riskMemory.searchResults.map((hit) => `- ${clipText(hit.snippet || '', 260)}`)] : []),
-    '',
-    `Task ID: ${task.id}`,
-    `Title: ${task.title}`,
-    `Goal: ${task.goal}`,
-    `Files likely: ${(task.filesLikely || []).join(', ') || 'Unknown'}`,
-    `Expected scope enforcement: ${expectedScope}`,
-    `Constraints: ${(task.constraints || []).join(' | ') || 'None'}`,
-    `Acceptance checks: ${(task.acceptanceChecks || []).join(' | ') || 'None'}`,
-    `Checkpoint notes: ${(task.checkpointNotes || []).join(' | ') || 'None'}`,
-    `Recommended verification commands: ${verificationCommands.join(' | ') || 'None selected by harness'}`,
-    '',
-    'Rules:',
-    '- You are the implementation executor for the current task, not the planner for the entire run.',
-    '- Read the three files above before editing.',
-    '- Keep the diff inside filesLikely unless the spec clearly requires a small adjacent change.',
-    ...buildScopeRules(expectedScope),
-    '- The recommended verification commands are required unless they clearly do not apply to this task.',
-    '- Resume directly from the current task state and prior findings instead of rewriting the whole history.',
-    '- Keep the required output section headers in English exactly as written below.',
-    writeInPreferredLanguageRule(run.harnessConfig, `Write the body content of Summary, Risks or follow-ups, ${providerName} handoff, and acceptance check notes`),
-    '',
-    'Required output sections:',
-    'Context read',
-    'Summary',
-    'Files changed',
-    'Checks run',
-    'Acceptance check results',
-    '- For each acceptance check, report PASS / FAIL / UNABLE-TO-VERIFY and why.',
-    ...(task.acceptanceChecks || []).map((check, index) => `  ${index + 1}. ${check}`),
-    'Risks or follow-ups',
-    `${providerName} handoff`
-  ].join('\n');
+async function buildCodexPrompt(run, task, memory, executionCtx, codeContext = null, provider = 'codex', graphSignals = null) {
+  return promptBuilders.buildCodexPrompt(run, task, memory, executionCtx, codeContext, provider, graphSignals);
 }
 
 function buildReviewPrompt(run, task, outputFile, diffFile, verificationFile, scopeSummary, memory, provider = 'codex') {
-  const providerName = providerDisplayName(provider);
-  return [
-    `You are the ${providerName} verifier for a local engineering harness.`,
-    `Read the spec bundle, project summary, ${providerName} handoff, task diff, and inspect the current project before deciding.`,
-    `Spec bundle: ${path.join(runDir(run.id), 'input', 'spec-bundle.md')}`,
-    `Project summary: ${path.join(runDir(run.id), 'context', 'project-summary.md')}`,
-    ...buildMemoryPromptLines(memory),
-    ...buildHarnessGuidanceLines(run.harnessConfig, 'verifier', provider),
-    ...buildContinuationPromptLines(run, task.id),
-    `${providerName} handoff: ${outputFile}`,
-    `Task diff: ${diffFile}`,
-    `Verification report: ${verificationFile}`,
-    `Repository changed files: ${(scopeSummary?.repoChangedFiles || []).join(', ') || 'None'}`,
-    `Out-of-scope file changes: ${(scopeSummary?.outOfScopeFiles || []).join(', ') || 'None'}`,
-    `Scope enforcement level: ${scopeSummary?.scopeEnforcement || 'unknown'}`,
-    run.projectPath ? `Project root: ${run.projectPath}` : 'Project root: none',
-    '',
-    `Task ID: ${task.id}`,
-    `Current goal: ${task.goal}`,
-    `Acceptance checks: ${(task.acceptanceChecks || []).map((check, index) => `${index + 1}. ${check}`).join(' | ') || 'None defined'}`,
-    `Previous attempts: ${task.attempts || 0}`,
-    `Previous review summary: ${task.reviewSummary || 'None'}`,
-    `Previous findings: ${(task.findings || []).join(' | ') || 'None'}`,
-    ...(task.attempts >= 2 ? [
-      'WARNING: This task has already failed multiple times.',
-      'You must identify the repeated root cause and propose a materially different retry plan if you choose retry.'
-    ] : []),
-    '',
-    'Return JSON only with this shape:',
-    '{',
-    '  "decision":"approve|retry",',
-    '  "summary":"string",',
-    '  "findings":["string"],',
-    '  "functionalFindings":["string"],',
-    '  "structuralFindings":["string"],',
-    '  "codeFindings":["string"],',
-    '  "staticVerificationFindings":["string"],',
-    '  "browserUxFindings":["string"],',
-    '  "acceptanceCheckResults":[{"check":"string","status":"pass|fail|unverifiable","note":"string"}],',
-    '  "retryDiagnosis":"string",',
-    '  "updatedTask": {',
-    '    "goal":"string",',
-    '    "filesLikely":["string"],',
-    '    "constraints":["string"],',
-    '    "acceptanceChecks":["string"]',
-    '  }',
-    '}',
-    'Use updatedTask only when decision is retry.',
-    writeInPreferredLanguageRule(run.harnessConfig, 'Write summary, findings, retryDiagnosis, and updatedTask fields'),
-    'Keep a single verdict, but place findings into the most specific categories you can.',
-    'functionalFindings covers spec alignment, behavior, acceptance evidence, scope, integration, and operator-visible regressions.',
-    'structuralFindings covers architecture boundaries, ownership, module fit, duplicated state, and layering concerns.',
-    'codeFindings covers logic bugs, risky patterns, and newly introduced maintenance debt.',
-    'staticVerificationFindings covers syntax/build/type/lint/test failures or high-confidence static breakage risks.',
-    'browserUxFindings covers browser-visible UX, accessibility, loading/error states, and missing frontend wiring.',
-    'If a category is clean, return an empty array for that category.',
-    'Do not block approval on style-only remarks unless they imply a real defect, static failure risk, or clear maintenance regression.',
-    'Prioritize the verification artifact and acceptance check evidence over the model handoff narrative.',
-    'Resume directly from the latest task artifacts and do not recap unrelated run history.',
-    'If this task has failed repeatedly, diagnose the root cause instead of repeating the same advice.'
-  ].join('\n');
-}
-
-function normalizeChangedPaths(changedFiles = []) {
-  return changedFiles
-    .map((item) => String(item?.path || item || '').trim().replace(/\\/g, '/'))
-    .filter(Boolean);
-}
-
-function isDocsOnlyReviewCandidate(paths) {
-  if (!paths.length || paths.length > 3) return false;
-  return paths.every((filePath) => /\.(md|mdx|txt)$/i.test(filePath));
-}
-
-function isHighRiskReviewTask(run, task, changedPaths) {
-  const haystack = [
-    run.preset?.id || '',
-    task.title,
-    task.goal,
-    ...(task.constraints || []),
-    ...(task.acceptanceChecks || []),
-    ...changedPaths
-  ].join('\n').toLowerCase();
-  const patterns = [
-    'bugfix',
-    'refactor',
-    'auth',
-    'security',
-    'payment',
-    'billing',
-    'schema',
-    'migration',
-    'database',
-    'public api',
-    'breaking',
-    'package.json',
-    'pnpm-lock',
-    'package-lock',
-    'yarn.lock',
-    '.env',
-    'dockerfile'
-  ];
-  return patterns.some((pattern) => haystack.includes(pattern));
-}
-
-function buildPrescreenReview(decision, summary, findings, route) {
-  return {
-    decision,
-    summary,
-    findings,
-    updatedTask: {},
-    reviewer: 'rule-prescreen',
-    route
-  };
-}
-
-export function decideReviewRoute(run, task, changedFiles, scopeSummary, verification) {
-  const changedPaths = normalizeChangedPaths(changedFiles);
-  if (!changedPaths.length) {
-    if (taskCanSucceedWithoutRepoDiff(task)) {
-      return null;
-    }
-    return buildPrescreenReview(
-      'retry',
-      'Rule-based prescreen blocked this task because no file changes were detected.',
-      ['No file changes were detected after Codex execution.'],
-      'rule-blocked'
-    );
-  }
-  if ((scopeSummary?.outOfScopeFiles || []).length > 0) {
-    return buildPrescreenReview(
-      'retry',
-      'Rule-based prescreen blocked this task because out-of-scope files changed.',
-      [`Out-of-scope files changed: ${scopeSummary.outOfScopeFiles.join(', ')}`],
-      'rule-blocked'
-    );
-  }
-  if (verification?.ok === false) {
-    return buildPrescreenReview(
-      'retry',
-      'Rule-based prescreen blocked this task because automatic verification failed.',
-      [`Automatic verification failed: ${(verification.selectedCommands || []).join(' | ') || 'No command recorded.'}`],
-      'rule-blocked'
-    );
-  }
-  if (!isHighRiskReviewTask(run, task, changedPaths) && isDocsOnlyReviewCandidate(changedPaths)) {
-    return buildPrescreenReview(
-      'approve',
-      'Rule-based prescreen auto-approved this low-risk docs-only change.',
-      [`Docs-only changed files: ${changedPaths.join(', ')}`],
-      'rule-auto-approve'
-    );
-  }
-  return null;
+  return promptBuilders.buildReviewPrompt(run, task, outputFile, diffFile, verificationFile, scopeSummary, memory, provider);
 }
 
 function buildGoalJudgePrompt(run, memory, provider = 'codex') {
@@ -4312,88 +4482,31 @@ export function evaluateFreshSessionState(run, prospective = {}) {
   return { recommended: false, reason: '', elapsedMinutes, pauseCount, highDriftCount };
 }
 
-function buildAutomaticReplanPrompt(run, memory, checkpoint, provider = 'codex') {
-  const ledger = run.tasks.map((task) => ({
-    id: task.id,
-    title: task.title,
-    status: task.status,
-    goal: task.goal,
-    dependsOn: task.dependsOn || [],
-    filesLikely: task.filesLikely || [],
-    constraints: task.constraints || [],
-    acceptanceChecks: task.acceptanceChecks || [],
-    checkpointNotes: task.checkpointNotes || [],
-    reviewSummary: task.reviewSummary || '',
-    attempts: task.attempts || 0
-  }));
+function normalizeReplanThreshold(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return normalized || 'task-batch';
+}
 
-  const providerName = providerDisplayName(provider);
-  return [
-    `You are ${providerName} acting as the automatic replanner for a local engineering harness.`,
-    'Read the spec bundle, project summary, harness guidance, and current checkpoint before deciding.',
-    `Spec bundle: ${path.join(runDir(run.id), 'input', 'spec-bundle.md')}`,
-    `Project summary: ${path.join(runDir(run.id), 'context', 'project-summary.md')}`,
-    `Harness guidance: ${harnessGuidancePath(run.id)}`,
-    `Current checkpoint: ${runCheckpointPath(run.id)}`,
-    ...buildMemoryPromptLines(memory),
-    ...buildProjectPlanningPriorLines(memory, run),
-    ...buildHarnessGuidanceLines(run.harnessConfig, 'replanner', provider),
-    run.projectPath ? `Project root: ${run.projectPath}` : 'Project root: none',
-    ...buildProjectPromptLines(run),
-    '',
-    ...buildContinuationPromptLines(run),
-    '',
-    'Checkpoint summary:',
-    JSON.stringify(checkpoint, null, 2),
-    '',
-    'Current task ledger:',
-    JSON.stringify(ledger, null, 2),
-    '',
-    'Non-negotiable rules:',
-    '- Preserve the clarified objective, spec bundle intent, and prompt-source precedence.',
-    '- You may edit only tasks whose current status is "ready".',
-    '- Never rewrite done, skipped, failed, or in_progress tasks.',
-    '- Do not silently broaden scope or weaken acceptance checks.',
-    '- Prefer the smallest backlog change that improves the next batch.',
-    `- Keep the backlog inside the active task budget (${run.profile?.taskBudget ?? '-'}).`,
-    `- Keep each task inside the active file budget (${run.profile?.fileBudget ?? '-'} filesLikely) unless you are explicitly inserting a read-only diagnosis task.`,
-    `- Diagnosis-first is ${run.profile?.diagnosisFirst === false ? 'optional' : 'required'} for this run.`,
-    `- Fresh session threshold: ${run.profile?.freshSessionThreshold || '-'}. If crossed, stop and recommend a fresh session instead of forcing more replans.`,
-    '- If the current objective or scope no longer looks safe or valid, do not auto-apply changes. Request a human pause instead.',
-    '',
-    'Return JSON only with this shape:',
-    '{',
-    '  "shouldReplan": true,',
-    '  "summary":"string",',
-    '  "objectiveStillValid": true,',
-    '  "driftRisk":"low",',
-    '  "pauseForHuman": false,',
-    '  "preserve":["string"],',
-    '  "whyNow":["string"],',
-    '  "edits":[{',
-    '    "id":"T002",',
-    '    "title":"string",',
-    '    "goal":"string",',
-    '    "dependsOn":["T001"],',
-    '    "filesLikely":["relative/path.ts"],',
-    '    "constraints":["string"],',
-    '    "acceptanceChecks":["string"],',
-    '    "checkpointNotes":["string"]',
-    '  }],',
-    '  "newTasks":[{',
-    '    "title":"string",',
-    '    "goal":"string",',
-    '    "dependsOn":["T002"],',
-    '    "filesLikely":["relative/path.ts"],',
-    '    "constraints":["string"],',
-    '    "acceptanceChecks":["string"],',
-    '    "checkpointNotes":["string"]',
-    '  }]',
-    '}',
-    'If shouldReplan is false, return empty edits and newTasks.',
-    'If objectiveStillValid is false or driftRisk is high, set pauseForHuman to true.',
-    writeInPreferredLanguageRule(run.harnessConfig, 'Write summary, preserve, whyNow, and task fields')
-  ].join('\n');
+export function shouldRunAutomaticReplan(run) {
+  const threshold = normalizeReplanThreshold(run?.profile?.replanThreshold);
+  if (threshold !== 'phase-boundary') return true;
+
+  const tasks = Array.isArray(run?.tasks) ? run.tasks : [];
+  const readyCount = tasks.filter((task) => task.status === 'ready').length;
+  const failedCount = tasks.filter((task) => task.status === 'failed').length;
+  return failedCount > 0 || readyCount === 0;
+}
+
+export function buildAutomaticReplanParseFailure(error, rawOutput) {
+  return {
+    summary: 'Skipped automatic replanning because the provider returned invalid JSON.',
+    parseError: String(error?.message || error || 'Invalid automatic replanning JSON.').trim(),
+    rawSnippet: clipText(String(rawOutput || '').replace(/\s+/g, ' ').trim(), 280)
+  };
+}
+
+async function buildAutomaticReplanPrompt(run, memory, checkpoint, provider = 'codex') {
+  return promptBuilders.buildAutomaticReplanPrompt(run, memory, checkpoint, provider);
 }
 
 function buildCheckpointSuggestions(run, blockedTasks) {
@@ -4487,12 +4600,18 @@ function buildRunCheckpoint(run, trigger = 'unknown') {
           at: latestReplan.at,
           applied: Boolean(latestReplan.applied),
           pauseForHuman: Boolean(latestReplan.pauseForHuman),
+          skipped: Boolean(latestReplan.skipped),
           driftRisk: latestReplan.driftRisk || 'medium',
           summary: latestReplan.summary || '',
+          pauseReason: latestReplan.pauseReason || '',
+          objectiveStillValid: latestReplan.objectiveStillValid !== false,
+          freshSessionRecommended: Boolean(latestReplan.freshSessionRecommended),
           changedTaskIds: Array.isArray(latestReplan.changedTaskIds) ? latestReplan.changedTaskIds : [],
           newTaskIds: Array.isArray(latestReplan.newTaskIds) ? latestReplan.newTaskIds : [],
           preserve: Array.isArray(latestReplan.preserve) ? latestReplan.preserve : [],
-          whyNow: Array.isArray(latestReplan.whyNow) ? latestReplan.whyNow : []
+          whyNow: Array.isArray(latestReplan.whyNow) ? latestReplan.whyNow : [],
+          parseError: latestReplan.parseError || '',
+          rawSnippet: latestReplan.rawSnippet || ''
         }
       : null,
     recentFindings: uniqueBy(
@@ -4515,9 +4634,15 @@ async function writeRunCheckpoint(runId, trigger = 'unknown') {
   const checkpoint = buildRunCheckpoint(run, trigger);
   await fs.writeFile(runCheckpointPath(runId), JSON.stringify(checkpoint, null, 2), 'utf8');
   if (run.memory?.projectKey && shouldPersistCheckpointMemory(checkpoint)) {
-    const snapshot = await appendCheckpointMemory(ROOT_DIR, run, checkpoint).catch(() => null);
+    const snapshot = await runtimeObservability.withObservedFallback(
+      () => appendCheckpointMemory(ROOT_DIR, run, checkpoint),
+      { scope: 'checkpoint-memory.append', context: { runId, trigger, projectKey: run.memory.projectKey }, fallback: null }
+    );
     if (snapshot) {
-      await applyMemorySnapshot(runId, snapshot).catch(() => {});
+      await runtimeObservability.withObservedFallback(
+        () => applyMemorySnapshot(runId, snapshot),
+        { scope: 'checkpoint-memory.apply-snapshot', context: { runId, trigger }, fallback: null }
+      );
     }
   }
   return checkpoint;
@@ -4527,9 +4652,7 @@ async function maybeAutomaticReplan(runId, controller, checkpoint = null) {
   const run = await loadState(runId);
   if (run.status !== 'running') return null;
   if (run.tasks.some((task) => task.status === 'in_progress')) return null;
-
-  const unresolvedTasks = run.tasks.filter((task) => !isTaskTerminalStatus(task.status));
-  if (!unresolvedTasks.length) return null;
+  if (!shouldRunAutomaticReplan(run)) return null;
 
   const readyTasks = run.tasks.filter((task) => task.status === 'ready');
   const failedTasks = run.tasks.filter((task) => task.status === 'failed');
@@ -4566,13 +4689,65 @@ async function maybeAutomaticReplan(runId, controller, checkpoint = null) {
     'replan',
     replanProvider,
     { cwd: run.projectPath || runDir(runId), objective: currentCheckpoint.objective },
-    () => runAgentProvider(replanProvider, buildAutomaticReplanPrompt(run, memory, currentCheckpoint, replanProvider), run.projectPath || runDir(runId), run.settings, controller),
+    async () => runAgentProvider(replanProvider, await buildAutomaticReplanPrompt(run, memory, currentCheckpoint, replanProvider), run.projectPath || runDir(runId), run.settings, controller),
     phaseActions
   );
   if (result.code !== 0) {
     throw new Error(result.stderr || result.stdout || `${providerDisplayName(replanProvider)} automatic replanning failed.`);
   }
-  const parsed = parseJsonReply(result.stdout);
+  let parsed;
+  try {
+    parsed = parseJsonReply(result.stdout);
+  } catch (error) {
+    const latestAt = now();
+    const failure = buildAutomaticReplanParseFailure(error, result.stdout);
+    await withLock(runId, async () => {
+      const fresh = await loadState(runId);
+      if (fresh.status !== 'running') return;
+      fresh.metrics.replanRuns = Number(fresh.metrics.replanRuns || 0) + 1;
+      fresh.autoReplan = {
+        lastRunAt: latestAt,
+        latest: {
+          at: latestAt,
+          summary: failure.summary,
+          objectiveStillValid: true,
+          driftRisk: 'medium',
+          pauseForHuman: false,
+          freshSessionRecommended: false,
+          pauseReason: '',
+          applied: false,
+          changedTaskIds: [],
+          newTaskIds: [],
+          preserve: [],
+          whyNow: [],
+          skipped: true,
+          parseError: failure.parseError,
+          rawSnippet: failure.rawSnippet
+        }
+      };
+      await saveState(fresh);
+    });
+    await applyMemorySnapshot(runId, memory);
+    await appendLog(runId, 'warning', `${providerDisplayName(replanProvider)} automatic replanning returned invalid JSON. Skipping this replanning pass.`, {
+      parseError: failure.parseError,
+      rawSnippet: failure.rawSnippet
+    });
+    await appendTrace(runId, 'replan.skipped-invalid-json', {
+      parseError: failure.parseError,
+      rawSnippet: failure.rawSnippet
+    });
+    await writeRunCheckpoint(runId, 'replan-skipped-invalid-json');
+    return {
+      applied: false,
+      pauseForHuman: false,
+      changedTaskIds: [],
+      newTaskIds: [],
+      driftRisk: 'medium',
+      preserve: [],
+      whyNow: [],
+      summary: failure.summary
+    };
+  }
 
   let applied = false;
   let pauseForHuman = false;
@@ -4731,7 +4906,7 @@ async function planRun(runId, controller) {
     'plan',
     planningProvider,
     { cwd: runDir(runId), objective: state.clarify?.clarifiedObjective || state.input.objective || state.title },
-    () => runAgentProvider(planningProvider, buildPlannerPrompt(state, memory, planningProvider), runDir(runId), state.settings, controller),
+    async () => runAgentProvider(planningProvider, await buildPlannerPrompt(state, memory, planningProvider), runDir(runId), state.settings, controller),
     phaseActions
   );
   if (result.code !== 0) {
@@ -4739,7 +4914,10 @@ async function planRun(runId, controller) {
   }
   const parsed = parseJsonReply(result.stdout);
   const { rawTasks, policy } = applyPlanPolicy(state, parsed);
-  const plannedTasks = materializePlannedTasks(rawTasks);
+  const plannedTasks = materializePlannedTasks(rawTasks, {
+    memory,
+    fileBudget: state.profile?.fileBudget || 0
+  });
   await withLock(runId, async () => {
     const fresh = await loadState(runId);
     fresh.planSummary = String(parsed.summary || '').trim();
@@ -5168,12 +5346,18 @@ async function executeTask(runId, taskId, controller) {
         runId,
         taskId,
         generatedAt: now(),
-        summary: 'Code context was skipped because no project root is attached.',
-        queryTokens: [],
-        symbolHints: [],
-        relatedFiles: [],
-        diagnostics: ['Code context skipped.']
-      };
+      summary: 'Code context was skipped because no project root is attached.',
+      queryTokens: [],
+      symbolHints: [],
+      relatedFiles: [],
+      projectGraph: {
+        indexedFileCount: 0,
+        truncated: false,
+        topSymbols: [],
+        topFiles: []
+      },
+      diagnostics: ['Code context skipped.']
+    };
   const memory = await runTaskAction(
     runId,
     taskId,
@@ -5196,7 +5380,27 @@ async function executeTask(runId, taskId, controller) {
     }),
     actionState
   );
-  const prompt = await buildCodexPrompt(run, task, memory, executionCtx, codeContext, implementerProvider);
+  const graphSignals = deriveExecutionGraphSignals(task, codeContext, memory);
+  await updateTask(runId, taskId, async (current) => {
+    current.lastExecution = {
+      ...(current.lastExecution || defaultTaskExecution()),
+      dependencyWarnings: graphSignals.dependencyWarnings
+    };
+  });
+  if (graphSignals.dependencyWarnings.length) {
+    await appendLog(runId, 'warning', `Task ${taskId} has graph-derived scope boundary warnings before execution.`, {
+      taskId,
+      warnings: graphSignals.dependencyWarnings
+    });
+    await appendTrace(runId, 'task.scope-risk-detected', {
+      taskId,
+      warnings: graphSignals.dependencyWarnings
+    });
+    await appendTaskTrajectory(runId, taskId, 'scope-risk-detected', {
+      warnings: graphSignals.dependencyWarnings
+    });
+  }
+  const prompt = await buildCodexPrompt(run, task, memory, executionCtx, codeContext, implementerProvider, graphSignals);
   const promptFile = taskPrimaryArtifactPath(runId, taskId, 'prompt');
   for (const fileName of taskArtifactFileNames('prompt')) {
     await fs.writeFile(path.join(currentTaskDir, fileName), prompt, 'utf8');
@@ -5602,6 +5806,369 @@ async function executeTask(runId, taskId, controller) {
   await executionCtx.cleanup();
 }
 
+function extractPhaseCarryOverSummary(phase = {}) {
+  return {
+    phaseId: String(phase.id || '').trim(),
+    phaseTitle: String(phase.title || phase.id || 'Current phase').trim(),
+    phaseGoal: String(phase.goal || phase.title || '').trim(),
+    carryOverTasks: Array.isArray(phase.carryOverTasks) ? phase.carryOverTasks : [],
+    cleanupLane: Array.isArray(phase.cleanupLane) ? phase.cleanupLane : [],
+    pendingReview: Array.isArray(phase.pendingReview) ? phase.pendingReview : [],
+    phaseContract: phase?.phaseContract || {}
+  };
+}
+
+function buildContinuationMemorySpecLines(memory = null) {
+  if (!memory || typeof memory !== 'object') return [];
+  const lines = [];
+  const failures = memory.failureAnalytics || {};
+  const temporal = memory.temporalInsights || {};
+  const graph = memory.graphInsights || {};
+  const topRootCauses = (failures.topRootCauses || []).slice(0, 2).map((item) => item.reason).filter(Boolean);
+  const topFailureFiles = (failures.topFailureFiles || []).slice(0, 2).map((item) => item.filePath).filter(Boolean);
+  const topTemporalFiles = (temporal.activeFiles || []).slice(0, 2).map((item) => item.filePath).filter(Boolean);
+  const propagatedPaths = (graph.topPaths || []).slice(0, 2).map((item) => item.path).filter(Boolean);
+  const propagatedFiles = (graph.propagatedFiles || []).slice(0, 2).map((item) => item.filePath).filter(Boolean);
+  const propagatedSymbols = (graph.propagatedSymbols || []).slice(0, 2).map((item) => item.symbol).filter(Boolean);
+
+  if (topRootCauses.length) {
+    lines.push(`Avoid repeating recent failure patterns: ${topRootCauses.join(' | ')}.`);
+  }
+  if (Number(failures.retryCount || 0) > 0 || Number(failures.scopeDriftCount || 0) > 0 || Number(failures.verificationFailures || 0) > 0) {
+    lines.push(`Recent failure pressure: retries=${failures.retryCount || 0}, verification=${failures.verificationFailures || 0}, scope drift=${failures.scopeDriftCount || 0}.`);
+  }
+  if (topFailureFiles.length) {
+    lines.push(`Re-enter through recent failure files first: ${topFailureFiles.join(' | ')}.`);
+  }
+  if (topTemporalFiles.length) {
+    lines.push(`Recent memory is concentrated on: ${topTemporalFiles.join(' | ')}.`);
+  }
+  if (propagatedPaths.length) {
+    lines.push(`Propagation chains explaining why scope could spread: ${propagatedPaths.join(' | ')}.`);
+  }
+  if (propagatedFiles.length) {
+    lines.push(`Boundary checklist files reached by those chains: ${propagatedFiles.join(' | ')}.`);
+  }
+  if (propagatedSymbols.length) {
+    lines.push(`High-impact propagated symbols: ${propagatedSymbols.join(' | ')}.`);
+  }
+  return lines;
+}
+
+async function searchContinuationMemory(project, phase = {}, phaseRuns = []) {
+  const memoryKey = String(project?.sharedMemoryKey || '').trim();
+  if (!memoryKey) return null;
+  const queryParts = [
+    String(phase.phaseTitle || phase.title || '').trim(),
+    String(phase.phaseGoal || phase.goal || '').trim(),
+    ...(Array.isArray(phase.carryOverTasks) ? phase.carryOverTasks : []).slice(0, 2).map((item) => item?.title || item?.goal || item?.summary || ''),
+    ...(Array.isArray(phase.cleanupLane) ? phase.cleanupLane : []).slice(0, 1).map((item) => item?.title || item?.goal || ''),
+    ...(Array.isArray(phaseRuns) ? phaseRuns : []).slice(0, 2).map((run) => run?.result?.summary || run?.planSummary || '')
+  ].map((item) => String(item || '').trim()).filter(Boolean);
+  if (!queryParts.length) return null;
+  const filesLikely = normalizeFilesLikely(
+    uniqueBy(
+      [
+        ...(Array.isArray(phase.carryOverTasks) ? phase.carryOverTasks : []).flatMap((item) => Array.isArray(item?.filesLikely) ? item.filesLikely : []),
+        ...(Array.isArray(phase.cleanupLane) ? phase.cleanupLane : []).flatMap((item) => Array.isArray(item?.filesLikely) ? item.filesLikely : [])
+      ],
+      (item) => item
+    )
+  );
+  return searchProjectMemory(ROOT_DIR, memoryKey, queryParts.join(' '), 6, {
+    projectPath: project?.rootPath || '',
+    filesLikely
+  }, {
+    reindex: false
+  }).catch(() => null);
+}
+
+export function deriveAutoChainDraftFromPhase(project, phase = {}, policy = {}, memory = null) {
+  const phaseTitle = String(phase.phaseTitle || phase.title || '').trim() || 'Current phase';
+  const phaseGoal = String(phase.phaseGoal || phase.goal || '').trim() || `${phaseTitle} 목표`;
+  const contract = phase.phaseContract || {};
+  const deliverables = Array.isArray(contract.deliverables) ? contract.deliverables : [];
+  const verification = Array.isArray(contract.verification) ? contract.verification : [];
+  const docsRule = normalizeContinuationPolicy(policy).keepDocsInSync
+    ? 'docs and implementation source-of-record should be aligned in the next run.'
+    : 'Implementation-first follow-up can proceed from the selected carry-over backlog.';
+  const memoryLines = buildContinuationMemorySpecLines(memory);
+
+  const firstCarryOver = phase.carryOverTasks?.[0];
+  if (firstCarryOver) {
+    const taskId = String(firstCarryOver.taskId || firstCarryOver.id || '').trim() || 'carry-over-task';
+    const taskTitle = String(firstCarryOver.title || firstCarryOver.summary || firstCarryOver.goal || '').trim() || 'carry-over backlog';
+    return {
+      title: `${project.title || 'project'}-continue-${taskId}`.replace(/[^a-zA-Z0-9_.-]/g, '-'),
+      objective: `${phaseTitle}에서 남은 ${taskId} ${taskTitle} 작업을 먼저 마무리하세요.`,
+      specText: `Carry over from previous run: ${taskId}. ${taskTitle}.\n\nSuccess criteria:\n- Close ${taskId} with existing constraints.\n- Keep updated files and continuation context aligned.\n- ${docsRule}${memoryLines.length ? `\n\n## Prior Run Memory\n${memoryLines.map((item) => `- ${item}`).join('\n')}` : ''}`
+    };
+  }
+
+  const firstCleanup = phase.cleanupLane?.[0];
+  if (firstCleanup) {
+    const cleanupTitle = String(firstCleanup.title || firstCleanup.goal || 'Cleanup work').trim();
+    return {
+      title: `${project.title || 'project'}-cleanup-next`.replace(/[^a-zA-Z0-9_.-]/g, '-'),
+      objective: `${phaseTitle}에서 정리 작업 ${cleanupTitle}을 먼저 완료하세요.`,
+      specText: `Cleanup follow-up run for ${cleanupTitle}.\n\nSuccess criteria:\n- Complete the cleanup item selected for ${phaseTitle}.\n- Leave backlog ready for the next feature slice.\n- ${docsRule}${memoryLines.length ? `\n\n## Prior Run Memory\n${memoryLines.map((item) => `- ${item}`).join('\n')}` : ''}`
+    };
+  }
+
+  const objectivePieces = [
+    `${phaseTitle} 목표: ${phaseGoal}.`,
+    ...(deliverables || []).map((item) => String(item || '').trim()).filter(Boolean).slice(0, 2),
+    ...(verification || []).map((item) => String(item || '').trim()).filter(Boolean).slice(0, 1),
+    docsRule
+  ].filter(Boolean);
+  const specText = `Next phase slice continuation.\n\nSuccess criteria:\n${objectivePieces.map((item) => `- ${item}`).join('\n')}`;
+  return {
+    title: `${project.title || 'project'}-${phaseTitle.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`.replace(/-+/g, '-').replace(/^-|-$/g, ''),
+    objective: `${phaseTitle}에서 남은 작업 범위를 이어받아 다음 단계를 진행합니다.`,
+    specText: `${specText}${memoryLines.length ? `\n\n## Prior Run Memory\n${memoryLines.map((item) => `- ${item}`).join('\n')}` : ''}`
+  };
+}
+
+async function maybeTriggerAutoChainRun(runId) {
+  const run = await loadState(runId);
+  const finalStatus = String(run?.status || '');
+  const runLoop = normalizeRunLoopSettings(run?.chainMeta?.loop);
+  const projectTerminal = ['completed', 'partial_complete'].includes(finalStatus);
+  const loopTerminal = ['completed', 'partial_complete', 'failed'].includes(finalStatus);
+  if (!projectTerminal && !(runLoop.enabled && loopTerminal)) {
+    return null;
+  }
+
+  if (run.chainMeta?.chainStopped === true) {
+    return null;
+  }
+
+  const projectId = String(run.project?.id || '').trim();
+  const project = projectId
+    ? await runtimeObservability.withObservedFallback(
+        () => getProject(projectId),
+        { scope: 'auto-chain.project-load', context: { runId, projectId }, fallback: null }
+      )
+    : null;
+  const continuationPolicy = normalizeContinuationPolicy(project?.defaultSettings?.continuationPolicy);
+  const wantsProjectAutoChain = Boolean(
+    project
+    && projectTerminal
+    && continuationPolicy.mode === 'guided'
+    && continuationPolicy.autoChainOnComplete === true
+  );
+  const wantsRunLoop = runLoop.enabled && loopTerminal;
+  if (!wantsProjectAutoChain && !wantsRunLoop) {
+    return null;
+  }
+
+  const chainDepth = normalizeChainDepth(run.chainDepth);
+  const maxDepth = normalizeChainDepth(continuationPolicy.maxChainDepth);
+  if (project && maxDepth > 0 && chainDepth >= maxDepth) {
+    await appendLog(runId, 'info', 'Auto-chain skipped because max chain depth has been reached.', {
+      fromRunId: run.id,
+      chainDepth,
+      maxDepth
+    });
+    await appendTrace(runId, 'run.auto-chain.skipped', {
+      reason: 'max-depth-reached',
+      chainDepth,
+      maxDepth
+    });
+    return null;
+  }
+
+  const currentLoopIndex = Math.max(1, Number(runLoop.currentRunIndex || 1));
+  const countsAsFailure = finalStatus === 'failed' || (finalStatus === 'partial_complete' && run.result?.goalAchieved !== true);
+  const nextFailureStreak = countsAsFailure ? Math.max(0, Number(runLoop.consecutiveFailures || 0)) + 1 : 0;
+  if (wantsRunLoop && runLoop.mode === 'until-goal' && run.result?.goalAchieved === true && finalStatus === 'completed') {
+    await appendLog(runId, 'info', 'Run loop stopped because the goal has already been achieved.', {
+      currentRunIndex,
+      maxRuns: runLoop.maxRuns
+    });
+    await appendTrace(runId, 'run.loop.stopped', {
+      reason: 'goal-achieved',
+      currentRunIndex,
+      maxRuns: runLoop.maxRuns
+    });
+    return null;
+  }
+  if (wantsRunLoop && currentLoopIndex >= Math.max(1, Number(runLoop.maxRuns || 1))) {
+    await appendLog(runId, 'info', 'Run loop skipped because the configured repeat count has been reached.', {
+      currentRunIndex,
+      maxRuns: runLoop.maxRuns
+    });
+    await appendTrace(runId, 'run.loop.skipped', {
+      reason: 'max-runs-reached',
+      currentRunIndex,
+      maxRuns: runLoop.maxRuns
+    });
+    return null;
+  }
+  if (wantsRunLoop && countsAsFailure && nextFailureStreak >= Math.max(1, Number(runLoop.maxConsecutiveFailures || 3))) {
+    await withLock(runId, async () => {
+      const fresh = await loadState(runId);
+      fresh.chainMeta = normalizeChainMeta({
+        ...fresh.chainMeta,
+        chainStopped: true,
+        reason: `Auto-paused after ${nextFailureStreak} consecutive failed runs.`,
+        stoppedAt: now(),
+        loop: {
+          ...runLoop,
+          consecutiveFailures: nextFailureStreak,
+          lastRunStatus: finalStatus
+        }
+      });
+      await saveState(fresh);
+    });
+    await appendLog(runId, 'warning', 'Run loop auto-paused after repeated failures.', {
+      currentRunIndex,
+      consecutiveFailures: nextFailureStreak,
+      maxConsecutiveFailures: runLoop.maxConsecutiveFailures
+    });
+    await appendTrace(runId, 'run.loop.paused', {
+      reason: 'repeated-failures',
+      currentRunIndex,
+      consecutiveFailures: nextFailureStreak,
+      maxConsecutiveFailures: runLoop.maxConsecutiveFailures
+    });
+    if (projectId) {
+      const autoProgress = normalizeProjectAutoProgress(project);
+      if (autoProgress.enabled && autoProgress.pauseOnRepeatedFailures !== false) {
+        await stopProjectSupervisor(projectId, {
+          reason: `auto-paused after ${nextFailureStreak} consecutive failed runs`
+        }).catch(() => {});
+      }
+    }
+    return null;
+  }
+
+  let phaseId = '';
+  let continuationDraft = null;
+  if (projectId && project) {
+    const allRuns = await listRuns();
+    const phaseAdvance = await maybeAutoAdvanceProjectPhase(project, allRuns, { runId });
+    const activeProject = phaseAdvance.project || project;
+    phaseId = String(activeProject.currentPhaseId || '').trim()
+      || String(run.project?.phaseId || '').trim()
+      || String(project.currentPhaseId || '').trim();
+    if (phaseId) {
+      const phase = (Array.isArray(activeProject.phases) ? activeProject.phases : []).find((item) => String(item.id || '').trim() === phaseId);
+      if (phase) {
+        const phaseRuns = listProjectPhaseRuns(projectId, phaseId, allRuns);
+        const summaryPhase = extractPhaseCarryOverSummary({
+          ...phase,
+          carryOverTasks: buildProjectContinuationContext(activeProject, phase, phaseRuns).carryOverFocus,
+          cleanupLane: Array.isArray(phase.cleanupLane) ? phase.cleanupLane : []
+        });
+        summaryPhase.phaseContract = phase.phaseContract || {};
+        if (summaryPhase.pendingReview.length > 0) {
+          await appendLog(runId, 'info', 'Auto continuation paused due to pending review items in the current phase.', {
+            phaseId,
+            pendingReviewCount: summaryPhase.pendingReview.length
+          });
+          await appendTrace(runId, 'run.auto-chain.paused', {
+            reason: 'pending-review',
+            phaseId
+          });
+          return null;
+        }
+        const continuationMemory = await searchContinuationMemory(activeProject, summaryPhase, phaseRuns);
+        continuationDraft = deriveAutoChainDraftFromPhase(activeProject, summaryPhase, continuationPolicy, continuationMemory);
+      }
+    }
+  }
+
+  if (!continuationDraft?.title || !continuationDraft?.objective) {
+    continuationDraft = {
+      title: run.title,
+      objective: String(run.input?.objective || run.title).trim(),
+      specText: String(run.input?.specText || '').trim(),
+      specFiles: Array.isArray(run.input?.specFiles) ? run.input.specFiles.join('\n') : ''
+    };
+  }
+  if (!continuationDraft?.title || !continuationDraft?.objective) {
+    await appendLog(runId, 'warning', 'Auto continuation draft was not generated, so continuation was skipped.', {
+      runId: run.id,
+      phaseId
+    });
+    return null;
+  }
+
+  const nextChainDepth = chainDepth + 1;
+  const nextRun = await createRun({
+    projectId,
+    phaseId,
+    title: continuationDraft.title,
+    objective: continuationDraft.objective,
+    specText: continuationDraft.specText || '',
+    specFiles: continuationDraft.specFiles || '',
+    presetId: String(run.preset?.id || project?.defaultPresetId || 'auto').trim() || 'auto',
+    settings: {
+      maxParallel: Number(run.settings?.maxParallel || 1),
+      maxTaskAttempts: Number(run.settings?.maxTaskAttempts || 2),
+      maxGoalLoops: Number(run.settings?.maxGoalLoops || 3),
+      codexRuntimeProfile: run.settings?.codexRuntimeProfile || DEFAULT_SETTINGS.codexRuntimeProfile
+    },
+    chainDepth: nextChainDepth,
+    chainedFromRunId: run.id,
+    chainMeta: {
+      trigger: wantsRunLoop ? 'run-loop' : 'auto-chain',
+      reason: wantsRunLoop ? `Run loop continuation from ${run.id}` : `Auto-chain from ${run.id}`,
+      lineageId: String(run.chainMeta?.lineageId || run.id).trim() || run.id,
+      originRunId: String(run.chainMeta?.originRunId || run.id).trim() || run.id,
+      loop: wantsRunLoop
+        ? {
+            ...runLoop,
+            currentRunIndex: currentLoopIndex + 1,
+            consecutiveFailures: nextFailureStreak,
+            lastRunStatus: finalStatus,
+            originRunId: String(runLoop.originRunId || run.id).trim() || run.id
+          }
+        : null
+    },
+    runLoop: wantsRunLoop
+      ? {
+          ...runLoop,
+          currentRunIndex: currentLoopIndex + 1,
+          consecutiveFailures: nextFailureStreak,
+          lastRunStatus: finalStatus,
+          originRunId: String(runLoop.originRunId || run.id).trim() || run.id
+        }
+      : null
+  });
+
+  try {
+    await startRun(nextRun.id);
+  } catch (startErr) {
+    await withLock(nextRun.id, async () => {
+      const orphan = await loadState(nextRun.id);
+      orphan.status = 'failed';
+      orphan.result = { goalAchieved: false, summary: `Auto-chain failed to start: ${startErr.message || String(startErr)}`, findings: [] };
+      orphan.updatedAt = now();
+      await saveState(orphan);
+    }).catch(() => {});
+    throw startErr;
+  }
+  await appendLog(runId, 'info', 'Auto-chain run created and started.', {
+    fromRunId: run.id,
+    toRunId: nextRun.id,
+    chainDepth: nextChainDepth,
+    phaseId,
+    trigger: wantsRunLoop ? 'run-loop' : 'auto-chain',
+    loopIndex: wantsRunLoop ? currentLoopIndex + 1 : 0
+  });
+  await appendTrace(runId, 'run.auto-chain.started', {
+    fromRunId: run.id,
+    toRunId: nextRun.id,
+    chainDepth: nextChainDepth,
+    phaseId,
+    trigger: wantsRunLoop ? 'run-loop' : 'auto-chain',
+    loopIndex: wantsRunLoop ? currentLoopIndex + 1 : 0
+  });
+  return nextRun;
+}
+
 async function loopRun(runId, controller) {
   try {
     let state = await loadState(runId);
@@ -5715,6 +6282,16 @@ async function loopRun(runId, controller) {
       const finalState = await loadState(runId);
       if (finalState.status === 'completed' || finalState.status === 'failed' || finalState.status === 'partial_complete') {
         await persistProjectMemory(runId);
+        try {
+          await maybeTriggerAutoChainRun(runId);
+        } catch (error) {
+          await appendLog(runId, 'warning', 'Auto-chain trigger failed.', {
+            error: error.message || String(error || '')
+          });
+          await appendTrace(runId, 'run.auto-chain.failed', {
+            error: error.message || String(error || '')
+          });
+        }
         await appendTrace(runId, 'run.completed', {
           status: finalState.status,
           summary: finalState.result?.summary || ''
@@ -5736,40 +6313,55 @@ export async function initHarness() {
   await ensureDir(PROJECTS_DIR);
   await ensureDir(MEMORY_DIR);
   await ensureDir(HARNESS_META_DIR);
-  const entries = await fs.readdir(RUNS_DIR, { withFileTypes: true }).catch(() => []);
-  for (const entry of entries) {
+  await supervisorRuntimeStore.restore(runningProjectSupervisors);
+  await recoverPersistedRunsAfterRestart({
+    RUNS_DIR,
+    runtimeObservability,
+    readJson,
+    statePath,
+    writeJson,
+    serializeState,
+    writeRunCheckpoint,
+    taskWorkspaceDir,
+    resolveGitProject,
+    runGit,
+    uniqueBy,
+    now
+  });
+
+  // Restore project supervisors that were enabled before restart.
+  const projectEntries = await fs.readdir(PROJECTS_DIR, { withFileTypes: true }).catch(() => []);
+  let supervisorCount = 0;
+  for (const entry of projectEntries) {
     if (!entry.isDirectory()) continue;
-    const runId = entry.name;
-    const state = await readJson(statePath(runId)).catch(() => null);
-    if (!state) continue;
-
-    let changed = false;
-    if (state.status === 'running') {
-      state.status = 'stopped';
-      changed = true;
-    }
-
-    for (const task of Array.isArray(state.tasks) ? state.tasks : []) {
-      if (task.status === 'in_progress') {
-        task.status = 'ready';
-        task.reviewSummary = task.reviewSummary || 'Recovered after harness restart.';
-        task.findings = uniqueBy([...(task.findings || []), 'Recovered after harness restart.'], (item) => item);
-        changed = true;
+    const projectState = await readJson(path.join(PROJECTS_DIR, entry.name, 'project.json')).catch(() => null);
+    if (!projectState) continue;
+    const autoProgress = normalizeProjectAutoProgress(projectState);
+    if (autoProgress.enabled) {
+      const projectIdStr = String(projectState.id || entry.name).trim();
+      const restoredRuntime = getSupervisorRuntimeState(projectIdStr);
+      setSupervisorRuntimeState(projectIdStr, restoredRuntime
+        ? {
+            ...restoredRuntime,
+            lastAction: restoredRuntime.lastAction || 'restored-after-restart',
+            lastActionAt: restoredRuntime.lastActionAt || now(),
+            lastScheduledAt: restoredRuntime.lastScheduledAt || autoProgress.lastScheduledAt || '',
+            nextScheduledAt: autoProgress.scheduleEnabled ? findNextCronOccurrence(autoProgress.scheduleCron) : ''
+          }
+        : {
+            running: true,
+            lastAction: 'restored-after-restart',
+            lastActionAt: now(),
+            lastScheduledAt: autoProgress.lastScheduledAt || '',
+            nextScheduledAt: autoProgress.scheduleEnabled ? findNextCronOccurrence(autoProgress.scheduleCron) : ''
+          });
+      if (getSupervisorRuntimeState(projectIdStr)?.running !== false) {
+        supervisorCount += 1;
       }
-      if (task.lastExecution?.workspaceMode === 'git-worktree' || await fs.access(taskWorkspaceDir(runId, task.id)).then(() => true).catch(() => false)) {
-        const gitRoot = await resolveGitProject(state.projectPath || '').catch(() => null);
-        const workspaceDir = taskWorkspaceDir(runId, task.id);
-        if (gitRoot) {
-          await runGit(gitRoot, ['worktree', 'remove', '--force', workspaceDir], null, false).catch(() => {});
-        }
-        await fs.rm(workspaceDir, { recursive: true, force: true }).catch(() => {});
-      }
     }
-
-    if (changed) {
-      await writeJson(statePath(runId), serializeState({ ...state, updatedAt: now() }));
-      await writeRunCheckpoint(runId, 'recovered-after-restart').catch(() => {});
-    }
+  }
+  if (supervisorCount > 0) {
+    startGlobalSupervisorTick();
   }
 }
 
@@ -5788,7 +6380,18 @@ export async function createProject(input = {}) {
   const uiLanguage = normalizeLanguage(input.uiLanguage || harnessSettings?.uiLanguage || harnessSettings?.agentLanguage, DEFAULT_HARNESS_SETTINGS.uiLanguage);
   const title = String(input.title || path.basename(rootPath) || 'Project').trim();
   const id = projectId(title, rootPath);
-  const existing = await loadProjectState(id).catch(() => null);
+  let existing = null;
+  try {
+    existing = await loadProjectState(id);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      await runtimeObservability.recordHarnessError('project.create.load-existing', error, {
+        projectId: id,
+        projectPath: rootPath
+      });
+      throw error;
+    }
+  }
   if (existing) {
     return existing;
   }
@@ -5817,6 +6420,7 @@ export async function createProject(input = {}) {
   if (providerProfile) defaultSettings.providerProfile = providerProfile;
   else delete defaultSettings.providerProfile;
   defaultSettings.continuationPolicy = normalizeContinuationPolicy(defaultSettings.continuationPolicy);
+  defaultSettings.autoProgress = normalizeAutoProgressSettings(defaultSettings.autoProgress);
 
   const project = {
     id,
@@ -5930,6 +6534,9 @@ export async function updateProject(projectIdValue, input = {}) {
     defaultSettings.continuationPolicy = normalizeContinuationPolicy(input.continuationPolicy, project.defaultSettings?.continuationPolicy);
   } else {
     defaultSettings.continuationPolicy = normalizeContinuationPolicy(defaultSettings.continuationPolicy, project.defaultSettings?.continuationPolicy);
+  }
+  if (Object.prototype.hasOwnProperty.call(input, 'autoProgress')) {
+    defaultSettings.autoProgress = normalizeAutoProgressSettings(input.autoProgress, project.defaultSettings?.autoProgress);
   }
 
   updatedProject.defaultSettings = defaultSettings;
@@ -6439,6 +7046,43 @@ function compareNewest(left, right) {
   return a < b ? 1 : -1;
 }
 
+const supervisorLoop = createSupervisorLoop({
+  PROJECT_AUTOMATION_TICK_MS,
+  buildProjectHealthDashboard,
+  buildSupervisorDraftFromPhase,
+  createRun,
+  DEFAULT_HARNESS_SETTINGS,
+  findNextCronOccurrence,
+  getProject,
+  getSupervisorRuntimeState,
+  listRuns,
+  loadState,
+  maybeAutoAdvanceProjectPhase,
+  minuteKeyFromDate,
+  normalizeContinuationPolicy,
+  normalizeProjectAutoProgress,
+  now,
+  runtimeObservability,
+  runningProjectSupervisors,
+  saveState,
+  shouldRunScheduledAutoPass,
+  updateProject,
+  withLock,
+  compareNewest,
+  setSupervisorRuntimeState,
+  startRun
+});
+const {
+  runProjectSupervisorPass,
+  startGlobalSupervisorTick,
+  startProjectSupervisor,
+  stopProjectSupervisor,
+  triggerProjectSupervisorPass,
+  getProjectSupervisorStatus
+} = supervisorLoop;
+
+export { startProjectSupervisor, stopProjectSupervisor, triggerProjectSupervisorPass, getProjectSupervisorStatus };
+
 function buildCarryOverTaskEntry(run, phase, task) {
   const findings = Array.isArray(task?.findings) ? task.findings.filter(Boolean) : [];
   const checkpointNotes = Array.isArray(task?.checkpointNotes) ? task.checkpointNotes.filter(Boolean) : [];
@@ -6631,8 +7275,8 @@ function buildProjectRuntimeObservability(project, phaseRuns = [], browserReadin
   return projectHealth.buildProjectRuntimeObservability(project, phaseRuns, browserReadiness, language);
 }
 
-function buildProjectHealthDashboard(project, phases = [], runs = [], browserReadiness = null, language = DEFAULT_HARNESS_SETTINGS.uiLanguage) {
-  return projectHealth.buildProjectHealthDashboard(project, phases, runs, browserReadiness, language);
+function buildProjectHealthDashboard(project, phases = [], runs = [], browserReadiness = null, language = DEFAULT_HARNESS_SETTINGS.uiLanguage, codeIntelligence = null, supervisorRuntime = null) {
+  return projectHealth.buildProjectHealthDashboard(project, phases, runs, browserReadiness, language, codeIntelligence, supervisorRuntime);
 }
 
 export async function getProjectOverview(projectIdValue) {
@@ -6640,6 +7284,12 @@ export async function getProjectOverview(projectIdValue) {
   const environment = await buildEnvironmentDiagnostics();
   const harnessSettings = await getHarnessSettings(project?.rootPath || '');
   const uiLanguage = normalizeLanguage(harnessSettings?.uiLanguage || harnessSettings?.agentLanguage, DEFAULT_HARNESS_SETTINGS.uiLanguage);
+  const codeIntelligence = project?.rootPath
+    ? await runtimeObservability.withObservedFallback(
+        () => buildProjectCodeIntelligence(project.rootPath),
+        { scope: 'project-overview.code-intelligence', context: { projectId: project.id, projectPath: project.rootPath }, fallback: null }
+      )
+    : null;
   const runs = (await listRuns()).filter((run) => run?.project?.id === projectIdValue);
   const retention = await buildProjectRetentionSummary(project, runs);
   const phases = (Array.isArray(project?.phases) ? project.phases : []).map((phase) => {
@@ -6704,7 +7354,13 @@ export async function getProjectOverview(projectIdValue) {
   });
 
   const browserReadiness = buildProjectBrowserReadiness(project, environment);
-  const healthDashboard = buildProjectHealthDashboard(project, phases, runs, browserReadiness, uiLanguage);
+  const autoProgress = normalizeProjectAutoProgress(project);
+  const supervisorRuntime = getSupervisorRuntimeState(projectIdValue) || null;
+  const healthDashboard = buildProjectHealthDashboard(project, phases, runs, browserReadiness, uiLanguage, codeIntelligence, supervisorRuntime);
+  const supervisorActive = isProjectSupervisorActive(supervisorRuntime, autoProgress);
+  const nextScheduledAt = autoProgress.scheduleEnabled && autoProgress.scheduleCron
+    ? findNextCronOccurrence(autoProgress.scheduleCron)
+    : '';
   return {
     project: {
       ...project,
@@ -6712,7 +7368,33 @@ export async function getProjectOverview(projectIdValue) {
         browser: browserReadiness
       },
       retention,
-      healthDashboard
+      healthDashboard,
+      codeIntelligence,
+      supervisorStatus: {
+        active: supervisorActive,
+        enabled: autoProgress.enabled,
+        pollIntervalMs: autoProgress.pollIntervalMs,
+        scheduleEnabled: autoProgress.scheduleEnabled,
+        scheduleCron: autoProgress.scheduleCron,
+        pauseOnRepeatedFailures: autoProgress.pauseOnRepeatedFailures !== false,
+        maxConsecutiveFailures: autoProgress.maxConsecutiveFailures,
+        nextScheduledAt,
+        runtime: supervisorRuntime
+          ? {
+              running: supervisorRuntime.running !== false,
+              lastPolledAt: supervisorRuntime.lastPolledAt || 0,
+              lastPassAt: supervisorRuntime.lastPassAt || '',
+              lastAction: supervisorRuntime.lastAction || '',
+              lastActionAt: supervisorRuntime.lastActionAt || '',
+              lastError: supervisorRuntime.lastError || '',
+              lastErrorAt: supervisorRuntime.lastErrorAt || '',
+              lastRunId: supervisorRuntime.lastRunId || '',
+              nextScheduledAt: supervisorRuntime.nextScheduledAt || nextScheduledAt,
+              pausedReason: supervisorRuntime.pausedReason || '',
+              history: Array.isArray(supervisorRuntime.history) ? supervisorRuntime.history.slice(-8) : []
+            }
+          : null
+      }
     },
     phases
   };
@@ -6837,6 +7519,61 @@ export async function submitClarifyAnswers(runId, answers) {
   return loadState(runId);
 }
 
+function enrichMemoryGraphInsights(graphInsights = null, projectIntelligence = null) {
+  const base = graphInsights || { topEdges: [], topSymbols: [] };
+  const symbolMap = new Map(
+    (Array.isArray(projectIntelligence?.topSymbols) ? projectIntelligence.topSymbols : [])
+      .map((item) => [String(item?.symbol || '').trim().toLowerCase(), item])
+  );
+  const criticalMap = new Map(
+    (Array.isArray(projectIntelligence?.criticalSymbols) ? projectIntelligence.criticalSymbols : [])
+      .map((item) => [String(item?.symbol || '').trim().toLowerCase(), item])
+  );
+  const fileMap = new Map(
+    (Array.isArray(projectIntelligence?.topFiles) ? projectIntelligence.topFiles : [])
+      .map((item) => [normalizeFilesLikely([item?.path])[0], item])
+  );
+  return {
+    topEdges: (Array.isArray(base.topEdges) ? base.topEdges : []).map((item) => {
+      const parsed = parseGraphEdge(item?.edge);
+      const fileImpact = fileMap.get(normalizeFilesLikely([parsed.target])[0]) || null;
+      return {
+        ...item,
+        importedByCount: Number(fileImpact?.importedByCount || 0),
+        calledByCount: Number(fileImpact?.calledByCount || 0),
+        riskScore: calculateExecutionEdgeRiskScore({
+          currentCount: Number(fileImpact?.importedByCount || 0),
+          callerCount: Number(fileImpact?.calledByCount || 0),
+          memoryCount: Number(item?.count || 0),
+          memoryWeight: Number(item?.weight || 0),
+          callCount: 0
+        })
+      };
+    }),
+    topSymbols: (Array.isArray(base.topSymbols) ? base.topSymbols : []).map((item) => {
+      const projectSymbol = symbolMap.get(String(item?.symbol || '').trim().toLowerCase()) || null;
+      const critical = criticalMap.get(String(item?.symbol || '').trim().toLowerCase()) || null;
+      return {
+        ...item,
+        importerCount: Number(projectSymbol?.importerCount || 0),
+        callerCount: Number(projectSymbol?.callerCount || 0),
+        callCount: Number(projectSymbol?.callCount || 0),
+        definedIn: projectSymbol?.definedIn || [],
+        riskScore: Number(
+          critical?.riskScore
+          || calculateExecutionSymbolRiskScore({
+            currentCount: Number(projectSymbol?.importerCount || 0),
+            callerCount: Number(projectSymbol?.callerCount || 0),
+            callCount: Number(projectSymbol?.callCount || 0),
+            memoryCount: Number(item?.count || 0),
+            memoryWeight: Number(item?.weight || 0)
+          })
+        )
+      };
+    })
+  };
+}
+
 export async function approvePlan(runId) {
   await withLock(runId, async () => {
     const state = await loadState(runId);
@@ -6884,7 +7621,10 @@ export async function updatePlanDraft(runId, input = {}) {
     const agents = Array.isArray(input.agents) ? input.agents.map(normalizeAgent).filter((agent) => agent.name) : state.agents;
     const tasks = Array.isArray(input.tasks)
       ? (['draft', 'needs_approval'].includes(state.status)
-        ? materializePlannedTasks(input.tasks)
+        ? materializePlannedTasks(input.tasks, {
+          memory: state.memory,
+          fileBudget: state.profile?.fileBudget || 0
+        })
         : mergeEditableBacklogTasks(state.tasks, input.tasks))
       : state.tasks;
 
@@ -6918,6 +7658,13 @@ export async function searchRunMemory(runId, query) {
   const run = await loadState(runId);
   const snapshot = await resolvePromptMemory(run, query || run.memory?.searchQuery || '');
   await applyMemorySnapshot(runId, snapshot);
+  const projectIntelligence = run.projectPath
+    ? await runtimeObservability.withObservedFallback(
+        () => buildProjectCodeIntelligence(run.projectPath),
+        { scope: 'run-memory.code-intelligence', context: { runId, projectPath: run.projectPath }, fallback: null }
+      )
+    : null;
+  const enrichedGraphInsights = enrichMemoryGraphInsights(snapshot.graphInsights, projectIntelligence);
   return {
     query: snapshot.searchQuery,
     recentSummary: snapshot.recentSummary,
@@ -6927,7 +7674,8 @@ export async function searchRunMemory(runId, query) {
     dailyDir: snapshot.dailyDir,
     failureAnalytics: snapshot.failureAnalytics || null,
     traceSummary: snapshot.traceSummary || null,
-    graphInsights: snapshot.graphInsights || { topEdges: [], topSymbols: [] },
+    graphInsights: enrichedGraphInsights,
+    projectCodeIntelligence: projectIntelligence,
     temporalInsights: snapshot.temporalInsights || { activeDecisions: [], activeFiles: [], activeRootCauses: [], recentShare: 0 }
   };
 }
@@ -7147,6 +7895,22 @@ export async function createRun(input) {
         : effectiveHarnessSettings.codexRuntimeProfile),
     DEFAULT_SETTINGS.codexRuntimeProfile
   );
+  const effectiveCodexModel = normalizeCodexModel(
+    hasOwnSetting(rawInputSettings, 'codexModel')
+      ? rawInputSettings.codexModel
+      : (hasOwnSetting(projectDefaultSettings, 'codexModel')
+        ? projectDefaultSettings.codexModel
+        : effectiveHarnessSettings.codexModel),
+    DEFAULT_SETTINGS.codexModel
+  );
+  const effectiveCodexFastMode = normalizeCodexFastMode(
+    hasOwnSetting(rawInputSettings, 'codexFastMode')
+      ? rawInputSettings.codexFastMode
+      : (hasOwnSetting(projectDefaultSettings, 'codexFastMode')
+        ? projectDefaultSettings.codexFastMode
+        : effectiveHarnessSettings.codexFastMode),
+    DEFAULT_SETTINGS.codexFastMode
+  );
   const preflight = await buildPreflight(projectPath, resolvedSpecFiles, effectiveHarnessSettings);
   const validationCommands = await detectProjectValidationCommands(projectPath, PROJECT_INTEL_HELPERS);
   const browserVerification = normalizeBrowserVerificationConfig(input.browserVerification || attachedProject?.defaultSettings?.browserVerification);
@@ -7191,6 +7955,27 @@ export async function createRun(input) {
     profile: runProfile,
     harnessConfig: effectiveHarnessSettings
   });
+  const chainDepth = normalizeChainDepth(input.chainDepth);
+  const chainFromRunId = String(input.chainedFromRunId || '').trim() || null;
+  const chainMetaInput = input.chainMeta && typeof input.chainMeta === 'object' && Object.keys(input.chainMeta || {}).length ? input.chainMeta : null;
+  const requestedRunLoop = normalizeRunLoopSettings(
+    input.runLoop,
+    attachedProject?.defaultSettings?.continuationPolicy?.runLoop
+  );
+  const chainMeta = normalizeChainMeta({
+    ...chainMetaInput,
+    lineageId: String(chainMetaInput?.lineageId || runId).trim() || runId,
+    originRunId: String(chainMetaInput?.originRunId || chainFromRunId || runId).trim() || runId,
+    loop: requestedRunLoop.enabled
+      ? {
+          ...requestedRunLoop,
+          originRunId: String(chainMetaInput?.loop?.originRunId || chainFromRunId || runId).trim() || runId,
+          currentRunIndex: Number(chainMetaInput?.loop?.currentRunIndex || requestedRunLoop.currentRunIndex || 1),
+          consecutiveFailures: Number(chainMetaInput?.loop?.consecutiveFailures || requestedRunLoop.consecutiveFailures || 0),
+          lastRunStatus: String(chainMetaInput?.loop?.lastRunStatus || requestedRunLoop.lastRunStatus || '').trim()
+        }
+      : chainMetaInput?.loop
+  });
 
   const state = {
     id: runId,
@@ -7232,9 +8017,10 @@ export async function createRun(input) {
       ) || runOperationDefaults.maxGoalLoops),
       requirePlanApproval: mergedInputSettings.requirePlanApproval !== false,
       codexRuntimeProfile: effectiveCodexRuntimeProfile,
-      codexModel: String(mergedInputSettings.codexModel || DEFAULT_SETTINGS.codexModel).trim() || DEFAULT_SETTINGS.codexModel,
+      codexModel: effectiveCodexModel,
+      codexFastMode: effectiveCodexFastMode,
       codexReasoningEffort: String(mergedInputSettings.codexReasoningEffort || DEFAULT_SETTINGS.codexReasoningEffort).trim() || DEFAULT_SETTINGS.codexReasoningEffort,
-      codexServiceTier: String(mergedInputSettings.codexServiceTier || DEFAULT_SETTINGS.codexServiceTier).trim() || DEFAULT_SETTINGS.codexServiceTier,
+      codexServiceTier: effectiveCodexFastMode ? 'fast' : 'default',
       coordinationProvider: effectiveProviderProfile.coordinationProvider,
       workerProvider: effectiveProviderProfile.workerProvider,
       claudeModel: String(effectiveHarnessSettings.claudeModel || DEFAULT_SETTINGS.claudeModel).trim(),
@@ -7244,6 +8030,8 @@ export async function createRun(input) {
     profile: runProfile,
     harnessConfig: {
       ...effectiveHarnessSettings,
+      codexModel: effectiveCodexModel,
+      codexFastMode: effectiveCodexFastMode,
       teamBlueprint: starterTeamBlueprint
     },
     preset: selectedPreset,
@@ -7304,7 +8092,13 @@ export async function createRun(input) {
       latest: null
     },
     goalLoops: 0,
-    result: null
+    result: null,
+    chainDepth,
+    chainedFromRunId: chainFromRunId,
+    chainMeta: chainFromRunId || chainMetaInput || requestedRunLoop.enabled ? {
+      ...chainMeta,
+      chainStopped: chainMeta.chainStopped === true
+    } : null
   };
 
   await saveState(state);
@@ -7328,7 +8122,12 @@ export async function createRun(input) {
 
 export async function startRun(runId, { additionalRequirements = '' } = {}) {
   if (activeRuns.has(runId)) {
-    return loadState(runId);
+    const existing = await loadState(runId).catch(() => null);
+    if (!existing || ['stopped', 'failed', 'completed', 'partial_complete'].includes(String(existing.status || ''))) {
+      activeRuns.delete(runId);
+    } else {
+      return existing;
+    }
   }
   const controller = { stopRequested: false, children: new Set() };
   activeRuns.set(runId, controller);
@@ -7378,5 +8177,30 @@ export async function stopRun(runId) {
   }
   await appendLog(runId, 'warning', 'Stop requested.');
   await writeRunCheckpoint(runId, 'stop-requested');
+  return loadState(runId);
+}
+
+export async function stopRunChain(runId, { reason = '' } = {}) {
+  const stoppedAt = now();
+  const resolvedReason = String(reason || '').trim() || 'Auto-chain stopped by user.';
+  await withLock(runId, async () => {
+    const state = await loadState(runId);
+    const previous = state.chainMeta && typeof state.chainMeta === 'object' ? state.chainMeta : {};
+    state.chainMeta = normalizeChainMeta({
+      ...previous,
+      chainStopped: true,
+      reason: resolvedReason,
+      stoppedAt,
+      trigger: previous.trigger || 'manual'
+    });
+    await saveState(state);
+  });
+  await appendLog(runId, 'warning', 'Auto-chain was stopped for this run.', {
+    reason: resolvedReason
+  });
+  await appendTrace(runId, 'run.auto-chain.stopped', {
+    reason: resolvedReason
+  });
+  await writeRunCheckpoint(runId, 'run-auto-chain-stopped');
   return loadState(runId);
 }

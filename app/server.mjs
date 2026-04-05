@@ -41,7 +41,12 @@ import {
   runProjectQualitySweep,
   searchRunMemory,
   skipTask,
+  stopRunChain,
   startRun,
+  getProjectSupervisorStatus,
+  startProjectSupervisor,
+  stopProjectSupervisor,
+  triggerProjectSupervisorPass,
   stopRun,
   submitClarifyAnswers,
   subscribe,
@@ -56,7 +61,16 @@ const clients = new Set();
 
 const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
 const INDEX_HTML = await fs.readFile(path.join(PUBLIC_DIR, 'index.html'), 'utf8');
-const STATIC_ASSET_PATHS = new Set(['/app.js', '/app.css', '/app-helpers.js', '/app-artifact-renderers.js', '/app-project-renderers.js', '/app-modal-actions.js']);
+const STATIC_ASSET_PATHS = new Set([
+  '/app.js',
+  '/app.css',
+  '/app-helpers.js',
+  '/app-state.js',
+  '/app-artifact-renderers.js',
+  '/app-project-renderers.js',
+  '/app-run-renderers.js',
+  '/app-modal-actions.js'
+]);
 
 function contentTypeForStatic(filePath) {
   const ext = path.extname(filePath).toLowerCase();
@@ -76,6 +90,20 @@ async function sendStatic(res, relativePath) {
 function sendJson(res, status, value) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(value));
+}
+
+function buildErrorPayload(error, status) {
+  const requestId = `req-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
+  return {
+    error: error?.message || String(error || 'Unknown error'),
+    errorCode: error?.code || error?.name || 'Error',
+    status,
+    requestId
+  };
+}
+
+function sendErrorJson(res, status, error) {
+  sendJson(res, status, buildErrorPayload(error, status));
 }
 
 class BadRequestError extends Error {
@@ -578,10 +606,13 @@ function buildRecoveryGuide(run, analytics) {
 
 async function readTaskArtifacts(runId, taskId) {
   const taskRoot = path.join(RUNS_DIR, runId, 'tasks', taskId);
+  const run = await getRun(runId).catch(() => null);
+  const task = Array.isArray(run?.tasks) ? run.tasks.find((item) => item.id === taskId) : null;
   const promptText = await readOptionalTextFirst([path.join(taskRoot, 'agent-prompt.md'), path.join(taskRoot, 'codex-prompt.md')]);
   const outputText = await readOptionalTextFirst([path.join(taskRoot, 'agent-output.md'), path.join(taskRoot, 'codex-output.md')]);
   const reviewText = await readOptionalTextFirst([path.join(taskRoot, 'agent-review.json'), path.join(taskRoot, 'codex-review.json')]);
   const changedFilesText = await readOptionalText(path.join(taskRoot, 'changed-files.json'));
+  const executionSummary = await readOptionalJson(path.join(taskRoot, 'execution-summary.json'));
   let changedFiles = [];
   if (changedFilesText.trim()) {
     try {
@@ -589,6 +620,18 @@ async function readTaskArtifacts(runId, taskId) {
     } catch {
       changedFiles = [];
     }
+  }
+  if (!changedFiles.length && Array.isArray(executionSummary?.changedFiles)) {
+    changedFiles = executionSummary.changedFiles
+      .map((item) => {
+        if (typeof item === 'string') return { path: item };
+        if (item && typeof item === 'object' && item.path) return { ...item, path: String(item.path) };
+        return null;
+      })
+      .filter(Boolean);
+  }
+  if (!changedFiles.length && Array.isArray(task?.lastExecution?.changedFiles)) {
+    changedFiles = task.lastExecution.changedFiles.map((item) => ({ path: String(item) }));
   }
   const traceEntries = (await readOptionalJsonLines(path.join(RUNS_DIR, runId, 'trace.ndjson')))
     .filter((entry) => String(entry?.taskId || entry?.meta?.taskId || '') === taskId)
@@ -608,7 +651,7 @@ async function readTaskArtifacts(runId, taskId) {
     handoff: await readOptionalJson(path.join(taskRoot, 'handoff.json')),
     reviewVerdict: await readOptionalJson(path.join(taskRoot, 'review-verdict.json')),
     retryPlan: await readOptionalJson(path.join(taskRoot, 'retry-plan.json')),
-    executionSummary: await readOptionalJson(path.join(taskRoot, 'execution-summary.json')),
+    executionSummary,
     traceEntries,
     trajectoryEntries,
     actionRecords: (await readOptionalJsonLines(path.join(taskRoot, 'actions.jsonl'))).slice(-120),
@@ -891,6 +934,15 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    if (req.method === 'POST' && url.pathname.endsWith('/chain-stop')) {
+      const runId = matchRunId(url.pathname, '/chain-stop$');
+      if (runId) {
+        const body = await readBody(req);
+        sendJson(res, 200, await stopRunChain(runId, { reason: body.reason || '' }));
+        return;
+      }
+    }
+
     if (req.method === 'POST' && url.pathname.endsWith('/requeue-failed')) {
       const runId = matchRunId(url.pathname, '/requeue-failed$');
       if (runId) {
@@ -899,9 +951,33 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    sendJson(res, 404, { error: 'Not found' });
+    if (url.pathname.includes('/supervisor')) {
+      const projectId = matchProjectIdAction(url.pathname, 'supervisor');
+      if (projectId) {
+        if (req.method === 'GET') {
+          sendJson(res, 200, getProjectSupervisorStatus(projectId));
+          return;
+        }
+        if (req.method === 'POST') {
+          const body = await readBody(req);
+          const action = String(body.action || '').trim();
+          if (action === 'start') {
+            sendJson(res, 200, await startProjectSupervisor(projectId, { immediate: body.immediate === true }));
+          } else if (action === 'stop') {
+            sendJson(res, 200, await stopProjectSupervisor(projectId, { reason: body.reason || '' }));
+          } else if (action === 'run-now') {
+            sendJson(res, 200, await triggerProjectSupervisorPass(projectId));
+          } else {
+            sendErrorJson(res, 400, new BadRequestError('action must be "start", "stop", or "run-now"'));
+          }
+          return;
+        }
+      }
+    }
+
+    sendErrorJson(res, 404, new Error('Not found'));
   } catch (error) {
-    sendJson(res, error.statusCode || 500, { error: error.message });
+    sendErrorJson(res, error.statusCode || 500, error);
   }
 });
 

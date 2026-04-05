@@ -5,6 +5,7 @@ export const DEFAULT_SETTINGS = {
   requirePlanApproval: true,
   codexRuntimeProfile: 'yolo',
   codexModel: 'gpt-5.4',
+  codexFastMode: true,
   codexReasoningEffort: 'high',
   codexServiceTier: 'fast',
   claudeModel: '',
@@ -39,6 +40,25 @@ export const CODEX_RUNTIME_PROFILES = {
 export function normalizeCodexRuntimeProfile(value, fallback = DEFAULT_SETTINGS.codexRuntimeProfile) {
   const normalized = String(value || '').trim().toLowerCase();
   return Object.hasOwn(CODEX_RUNTIME_PROFILES, normalized) ? normalized : fallback;
+}
+
+export const SUPPORTED_CODEX_MODELS = new Set([
+  'gpt-5.4',
+  'gpt-5.3-codex-spark'
+]);
+
+export function normalizeCodexModel(value, fallback = DEFAULT_SETTINGS.codexModel) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return SUPPORTED_CODEX_MODELS.has(normalized) ? normalized : fallback;
+}
+
+export function normalizeCodexFastMode(value, fallback = DEFAULT_SETTINGS.codexFastMode) {
+  if (typeof value === 'boolean') return value;
+  if (value == null || value === '') return fallback;
+  const normalized = String(value).trim().toLowerCase();
+  if (['true', '1', 'yes', 'on', 'fast'].includes(normalized)) return true;
+  if (['false', '0', 'no', 'off', 'default'].includes(normalized)) return false;
+  return fallback;
 }
 
 export const SUPPORTED_AGENT_PROVIDERS = new Set(['codex', 'claude', 'gemini']);
@@ -160,6 +180,8 @@ export const DEFAULT_HARNESS_SETTINGS = {
   plannerStrategy: '',
   teamStrategy: '',
   codexRuntimeProfile: DEFAULT_SETTINGS.codexRuntimeProfile,
+  codexModel: DEFAULT_SETTINGS.codexModel,
+  codexFastMode: DEFAULT_SETTINGS.codexFastMode,
   codexNotes: '',
   coordinationProvider: 'codex',
   workerProvider: 'codex',
@@ -168,4 +190,43 @@ export const DEFAULT_HARNESS_SETTINGS = {
   claudeModel: '',
   geminiModel: DEFAULT_SETTINGS.geminiModel,
   geminiProjectId: ''
+};
+
+export const GRAPH_INTELLIGENCE_DEFAULTS = {
+  thresholds: {
+    criticalRisk: 15,
+    temporalConcentration: 0.55
+  },
+  propagation: {
+    damping: 0.62,
+    maxDepth: 3
+  },
+  display: {
+    symbolRiskPoolSize: 8,
+    symbolRiskMinLines: 2,
+    symbolRiskMaxLines: 4,
+    symbolRiskMemoryWeightRatioCutoff: 0.45,
+    symbolRiskScoreRatioCutoff: 0.7
+  },
+  weights: {
+    projectSymbol: {
+      importerCount: 2,
+      callerCount: 3,
+      callCount: 1.5
+    },
+    executionSymbol: {
+      importerCount: 2,
+      callerCount: 3,
+      callCount: 1.5,
+      memoryCount: 1,
+      memoryWeight: 4
+    },
+    executionEdge: {
+      importerCount: 3,
+      callerCount: 4,
+      callCount: 2,
+      memoryCount: 2,
+      memoryWeight: 4
+    }
+  }
 };

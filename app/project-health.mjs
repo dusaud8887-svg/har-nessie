@@ -52,6 +52,14 @@ export function createProjectHealth(deps) {
   function buildProjectRepeatedFailureSummary(runs = [], language = 'en') {
     const grouped = new Map();
     let totalSignals = 0;
+    let consecutiveFailedRuns = 0;
+    for (const run of runs) {
+      const failedTasks = (Array.isArray(run?.tasks) ? run.tasks : []).filter((task) => String(task?.status || '') === 'failed');
+      const isFailedRun = ['failed', 'partial_complete'].includes(String(run?.status || ''))
+        && (failedTasks.length > 0 || run?.result?.goalAchieved !== true);
+      if (!isFailedRun) break;
+      consecutiveFailedRuns += 1;
+    }
     for (const run of runs.slice(0, 8)) {
       for (const task of (Array.isArray(run?.tasks) ? run.tasks : [])) {
         const signals = [];
@@ -74,6 +82,7 @@ export function createProjectHealth(deps) {
     const patterns = [...grouped.values()].filter((item) => item.count >= 2).sort((left, right) => right.count - left.count).slice(0, 4);
     return {
       totalSignals,
+      consecutiveFailedRuns,
       repeatedCount: patterns.reduce((sum, item) => sum + item.count, 0),
       patterns,
       warning: patterns.length > 0,
@@ -229,7 +238,90 @@ export function createProjectHealth(deps) {
     };
   }
 
-  function buildProjectHealthDashboard(project, phases = [], runs = [], browserReadiness = null, language = 'en') {
+  function isAutomatedRun(run) {
+    const loop = run?.chainMeta?.loop || null;
+    return loop?.enabled === true
+      || Boolean(String(run?.chainedFromRunId || '').trim())
+      || Number(run?.chainDepth || 0) > 0
+      || Boolean(String(run?.chainMeta?.trigger || '').trim());
+  }
+
+  function isTerminalRunStatus(status = '') {
+    return ['completed', 'failed', 'partial_complete', 'stopped'].includes(String(status || '').trim());
+  }
+
+  function isSuccessfulTerminalRun(run) {
+    return String(run?.status || '').trim() === 'completed' && run?.result?.goalAchieved === true;
+  }
+
+  function buildAutomationScorecard(runs = [], docsDrift = null, repeatedFailures = null, supervisorRuntime = null, language = 'en') {
+    const recentRuns = [...(Array.isArray(runs) ? runs : [])].sort(compareNewest).slice(0, 12);
+    const automatedRuns = recentRuns.filter(isAutomatedRun);
+    const terminalRuns = automatedRuns.filter((run) => isTerminalRunStatus(run?.status));
+    const successfulRuns = terminalRuns.filter(isSuccessfulTerminalRun);
+    const interruptedRuns = terminalRuns.filter((run) => !isSuccessfulTerminalRun(run));
+    const chronological = [...terminalRuns].sort((left, right) =>
+      (Date.parse(left?.updatedAt || left?.createdAt || '') || 0) - (Date.parse(right?.updatedAt || right?.createdAt || '') || 0)
+    );
+    let pendingRecoveries = 0;
+    let recoveredRuns = 0;
+    for (const run of chronological) {
+      if (isSuccessfulTerminalRun(run)) {
+        if (pendingRecoveries > 0) {
+          recoveredRuns += 1;
+          pendingRecoveries -= 1;
+        }
+      } else {
+        pendingRecoveries += 1;
+      }
+    }
+    const successRate = terminalRuns.length ? Number((successfulRuns.length / terminalRuns.length).toFixed(3)) : 0;
+    const recoveryRate = interruptedRuns.length ? Number((recoveredRuns / interruptedRuns.length).toFixed(3)) : 1;
+    const avgChainDepth = automatedRuns.length
+      ? Number((automatedRuns.reduce((sum, run) => sum + Math.max(0, Number(run?.chainDepth || 0)), 0) / automatedRuns.length).toFixed(2))
+      : 0;
+    const loopedRuns = automatedRuns.filter((run) => run?.chainMeta?.loop?.enabled === true).length;
+    const supervisorPauses = (Array.isArray(supervisorRuntime?.history) ? supervisorRuntime.history : [])
+      .filter((entry) => /paused|auto-paused/i.test(String(entry?.detail || '')))
+      .length + (String(supervisorRuntime?.pausedReason || '').trim() ? 1 : 0);
+    const evidenceScore = Math.min(15, terminalRuns.length * 5);
+    const stabilityScore = repeatedFailures?.warning ? 0 : 10;
+    const docsScore = docsDrift?.level === 'high' ? 0 : (docsDrift?.level === 'medium' ? 5 : 10);
+    const score = Math.max(0, Math.min(100, Math.round((successRate * 55) + (recoveryRate * 15) + evidenceScore + stabilityScore + docsScore)));
+    const status = score >= 80
+      ? 'healthy'
+      : (score >= 60 ? 'watch' : 'attention');
+    return {
+      status,
+      statusLabel: status === 'healthy'
+        ? t(language, '안정권', 'Healthy')
+        : (status === 'watch' ? t(language, '관찰 필요', 'Watch') : t(language, '주의 필요', 'Attention')),
+      score,
+      recentAutomatedRuns: automatedRuns.length,
+      terminalRuns: terminalRuns.length,
+      successfulRuns: successfulRuns.length,
+      interruptedRuns: interruptedRuns.length,
+      recoveredRuns,
+      loopedRuns,
+      avgChainDepth,
+      supervisorPauses,
+      successRate,
+      recoveryRate,
+      proofReady: terminalRuns.length >= 3,
+      summary: terminalRuns.length >= 3
+        ? t(language, `최근 자동화 run ${terminalRuns.length}개 기준 성공률 ${Math.round(successRate * 100)}%, 복구율 ${Math.round(recoveryRate * 100)}%입니다.`, `Across the latest ${terminalRuns.length} automated runs, success is ${Math.round(successRate * 100)}% and recovery is ${Math.round(recoveryRate * 100)}%.`)
+        : t(language, `자동화 burn-in 증거가 아직 ${terminalRuns.length}개뿐이므로 운영 점수는 보수적으로 계산합니다.`, `Only ${terminalRuns.length} automated burn-in proof point(s) exist so far, so the operating score stays conservative.`),
+      recommendedAction: terminalRuns.length < 3
+        ? t(language, '최소 3개 이상의 자동화 terminal run을 더 쌓아 burn-in 증거를 보강하세요.', 'Accumulate at least 3 automated terminal runs to strengthen burn-in evidence.')
+        : (status === 'attention'
+          ? t(language, '반복 실패 또는 문서 drift를 먼저 줄인 뒤 자동화를 다시 넓히는 편이 안전합니다.', 'Reduce repeated failures or docs drift before widening automation again.')
+          : (status === 'watch'
+            ? t(language, '자동화는 작동하지만 아직 관찰 구간입니다. 연속 성공 run을 더 확보하세요.', 'Automation is working, but still in watch mode. Gather a few more consecutive successful runs.')
+            : t(language, '현재 자동화 burn-in은 안정권입니다. 새 phase에도 같은 guardrail을 유지하세요.', 'The current automation burn-in is healthy. Keep the same guardrails in the next phase.')))
+    };
+  }
+
+  function buildProjectHealthDashboard(project, phases = [], runs = [], browserReadiness = null, language = 'en', codeIntelligence = null, supervisorRuntime = null) {
     const activePhase = phases.find((phase) => String(phase?.id || '') === String(project?.currentPhaseId || ''))
       || phases.find((phase) => String(phase?.status || '') === 'active')
       || phases[0]
@@ -238,6 +330,7 @@ export function createProjectHealth(deps) {
     const docsDrift = buildProjectDocsDriftSummary(project, activePhaseRuns, language);
     const repeatedFailures = buildProjectRepeatedFailureSummary(activePhaseRuns, language);
     const runtimeObservability = buildProjectRuntimeObservability(project, activePhaseRuns, browserReadiness, language);
+    const automationScorecard = buildAutomationScorecard(runs, docsDrift, repeatedFailures, supervisorRuntime, language);
     const latestSweep = activePhase?.latestQualitySweep || null;
     const successor = activePhase
       ? (activePhase.pendingReview?.length
@@ -250,15 +343,20 @@ export function createProjectHealth(deps) {
       : { ready: false, source: 'no-phase', title: t(language, '활성 단계 없음', 'No active phase'), detail: t(language, '새 단계를 추가하거나 재분석으로 현재 목표를 먼저 고정해야 합니다.', 'Add a phase or re-analyze first to lock the current goal.') };
     const reminder = docsDrift.reintakeRecommended
       ? { title: t(language, '재분석 권장', 'Re-analysis recommended'), detail: docsDrift.recommendedAction }
+      : ((Array.isArray(codeIntelligence?.criticalSymbols) && codeIntelligence.criticalSymbols.length)
+        ? { title: t(language, '고영향 심볼 주의', 'Critical symbols active'), detail: t(language, '다음 run 전 critical-risk 심볼과 고영향 파일의 scope boundary를 먼저 확인하는 편이 안전합니다.', 'Before the next run, confirm the scope boundary around the critical-risk symbols and high-impact files.') }
       : (!latestSweep && activePhaseRuns.length >= 3
         ? { title: t(language, '정리 점검 권장', 'Quality sweep recommended'), detail: t(language, '최근 run이 누적됐으므로 quality sweep으로 cleanup lane과 열린 위험을 한 번 정리하는 편이 좋습니다.', 'Recent runs have piled up, so it is a good moment to use a quality sweep to clean up the cleanup lane and open risks.') }
         : (repeatedFailures.warning
           ? { title: t(language, '반복 실패 패턴 점검 권장', 'Review repeated failure pattern'), detail: t(language, '같은 실패 원인이 반복되므로 범위를 줄여 다시 계획하거나 docs 기준을 다시 맞추는 편이 좋습니다.', 'The same failure cause is repeating, so it is better to narrow the scope and replan or realign the docs baseline.') }
-          : { title: t(language, '현재 cadence 양호', 'Cadence looks healthy'), detail: t(language, '지금은 권장 다음 작업 초안으로 현재 단계를 이어가면 됩니다.', 'You can continue the current phase with the suggested next-run draft now.') }));
+          : { title: t(language, '현재 cadence 양호', 'Cadence looks healthy'), detail: t(language, '지금은 권장 다음 작업 초안으로 현재 단계를 이어가면 됩니다.', 'You can continue the current phase with the suggested next-run draft now.') })));
     const docsFlow = docsDrift.docsPriority
       ? { label: t(language, '문서 기준 프로젝트', 'Docs-first project'), detail: t(language, '다음 run도 docs/source-of-record와 구현을 함께 맞추는 흐름이 권장됩니다.', 'For the next run, keep docs/source-of-record aligned with implementation.') }
       : { label: t(language, '구현 중심 프로젝트', 'Implementation-first project'), detail: t(language, '문서는 필요할 때만 보강하고, 기본은 구현 slice 중심으로 이어가면 됩니다.', 'Only update docs when needed. The default flow can stay implementation-slice driven.') };
-    const status = docsDrift.level === 'high' || repeatedFailures.warning ? 'attention' : (runtimeObservability.warning ? 'watch' : 'healthy');
+    const symbolAttention = Array.isArray(codeIntelligence?.criticalSymbols) && codeIntelligence.criticalSymbols.length > 0;
+    const status = docsDrift.level === 'high' || repeatedFailures.warning || symbolAttention || automationScorecard.status === 'attention'
+      ? 'attention'
+      : ((runtimeObservability.warning || automationScorecard.status === 'watch') ? 'watch' : 'healthy');
     return {
       status,
       statusLabel: status === 'attention'
@@ -269,6 +367,19 @@ export function createProjectHealth(deps) {
       docsDrift,
       repeatedFailures,
       runtimeObservability,
+      automationScorecard,
+      codeIntelligence: codeIntelligence
+        ? {
+            indexedFileCount: codeIntelligence.indexedFileCount || 0,
+            truncated: codeIntelligence.truncated === true,
+            thresholds: codeIntelligence.thresholds || null,
+            criticalSymbols: (codeIntelligence.criticalSymbols || []).slice(0, 4),
+            topSymbols: (codeIntelligence.topSymbols || []).slice(0, 4),
+            topFiles: (codeIntelligence.topFiles || []).slice(0, 4),
+            topEdges: (codeIntelligence.topEdges || []).slice(0, 3),
+            cache: codeIntelligence.cache || null
+          }
+        : null,
       reminder,
       docsFlow
     };

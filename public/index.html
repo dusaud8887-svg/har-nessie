@@ -192,6 +192,28 @@
                 <label>Max goal loops</label>
                 <input id="run-max-goal-loops-input" type="number" name="maxGoalLoops" value="3" min="1">
               </div>
+              <div class="form-group">
+                <label style="display:flex; align-items:center; gap:8px;">
+                  <input id="run-loop-enabled-input" type="checkbox" name="runLoopEnabled">
+                  Enable run-to-run loop
+                </label>
+                <div class="helper-text">Repeat this run automatically as a short chain until the cap is reached or the goal is achieved.</div>
+              </div>
+              <div class="form-group">
+                <label>Run loop mode</label>
+                <select id="run-loop-mode-input" name="runLoopMode">
+                  <option value="repeat-count">Repeat N runs</option>
+                  <option value="until-goal">Repeat until goal achieved</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>Max loop runs</label>
+                <input id="run-loop-max-runs-input" type="number" name="runLoopMaxRuns" value="3" min="1">
+              </div>
+              <div class="form-group">
+                <label>Auto-stop after consecutive failed runs</label>
+                <input id="run-loop-max-failures-input" type="number" name="runLoopMaxFailures" value="3" min="1">
+              </div>
             </div>
           </details>
           <div id="draft-diagnostics" class="inline-diagnostics" style="display:none"></div>
@@ -368,6 +390,21 @@
             </div>
           </div>
           <div class="form-group">
+            <label>Codex model</label>
+            <select id="codex-model">
+              <option value="gpt-5.4">GPT-5.4</option>
+              <option value="gpt-5.3-codex-spark">GPT-5.3-Codex-Spark</option>
+            </select>
+            <div class="helper-text">GPT-5.4 stays the default. Switch only when you explicitly want the faster Codex Spark path.</div>
+          </div>
+          <div class="form-group">
+            <label>
+              <input id="codex-fast-mode" type="checkbox" checked style="width:auto; margin-right:8px;">
+              Codex fast mode
+            </label>
+            <div class="helper-text">On keeps the fast service tier. Off falls back to the default service tier.</div>
+          </div>
+          <div class="form-group">
             <label>UI language</label>
             <select id="ui-language">
               <option value="en">English</option>
@@ -542,8 +579,10 @@
   <div id="global-banner" style="position:fixed; top:18px; right:18px; z-index:120; display:none; max-width:420px;"></div>
 
   <script src="/app-helpers.js"></script>
+  <script src="/app-state.js"></script>
   <script src="/app-artifact-renderers.js"></script>
   <script src="/app-project-renderers.js"></script>
+  <script src="/app-run-renderers.js"></script>
   <script src="/app-modal-actions.js"></script>
   <script src="/app.js"></script>
 </body>

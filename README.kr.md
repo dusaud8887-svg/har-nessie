@@ -81,6 +81,8 @@ harness.cmd
 
 같은 run 안에서 계획은 하나, 구현은 다른 CLI로 섞어 쓸 수도 있다.
 
+전역 설정에서 Codex 기본 모델을 `GPT-5.4`로 유지하면서 필요할 때 `GPT-5.3-Codex-Spark`로 바꾸고, Codex fast mode도 설정 파일을 직접 열지 않고 켜고 끌 수 있다.
+
 <p align="center">
   <img src="docs/screenshots/screenshot-create-run.png" alt="run 만들기 — 폴더, 목표, 선택적 제약" width="80%">
   <br><em>폴더 + 목표. 하네스가 나머지를 처리한다.</em>
@@ -104,6 +106,8 @@ memory/projects/<project-key>/
 ```
 
 전부 로컬. 기본적으로 gitignore에 포함됨.
+
+선택한 Codex 모델과 Codex fast mode 설정도 이 로컬 설정 파일에 저장된다.
 
 ## 문서
 
