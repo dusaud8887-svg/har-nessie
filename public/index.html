@@ -367,7 +367,7 @@
               <option value="claude">Claude Code CLI</option>
               <option value="gemini">Gemini CLI</option>
             </select>
-            <div class="helper-text">Pick whichever CLI you have installed. All three work.</div>
+            <div class="helper-text">Runs re-read this provider when they start or resume. Work already in progress keeps its current process until the next stage.</div>
           </div>
           <div class="form-group">
             <label>Implementation provider</label>
@@ -376,7 +376,7 @@
               <option value="claude">Claude Code CLI</option>
               <option value="gemini">Gemini CLI</option>
             </select>
-            <div class="helper-text">Can be the same as or different from the planning provider.</div>
+            <div class="helper-text">Runs re-read this provider when they start or resume. It can be the same as or different from planning/review.</div>
           </div>
           <div class="form-group">
             <label>Codex runtime profile</label>
@@ -386,7 +386,7 @@
               <option value="safe">Read-only · safe mode</option>
             </select>
             <div class="form-note" style="margin-top:8px;">
-              The default is <code>Go now</code>. Most people should leave it there unless they want a more conservative mode.
+              The default is <code>Go now</code>. This only changes Codex CLI sandbox and approval behavior. It does not switch the planning or implementation provider.
             </div>
           </div>
           <div class="form-group">

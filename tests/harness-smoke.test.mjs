@@ -33,6 +33,7 @@ import {
   initHarness,
   listProjects,
   parseJsonReply,
+  refreshRunPreflight,
   requeueFailedTasks,
   resolveAdaptiveParallelLimit,
   runBrowserVerification,
@@ -41,6 +42,7 @@ import {
   searchRunMemory,
   shouldRunAutomaticReplan,
   skipTask,
+  startRun,
   startProjectSupervisor,
   stopProjectSupervisor,
   stopRun,
@@ -3429,6 +3431,112 @@ test('createRun snapshots coordination and worker provider settings', async () =
     assert.equal(byName['goal-judge'], 'claude');
     assert.equal(run.preflight.providerProfile?.coordinationProvider, 'claude');
     assert.equal(run.preflight.providerProfile?.workerProvider, 'gemini');
+  } finally {
+    if (runId) {
+      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+    }
+    await updateHarnessSettings(originalSettings);
+  }
+});
+
+test('refreshRunPreflight rebinds run provider profile to the current settings', async () => {
+  let runId = '';
+  const originalSettings = await getHarnessSettings(root);
+  try {
+    await updateHarnessSettings({
+      ...originalSettings,
+      coordinationProvider: 'claude',
+      workerProvider: 'gemini',
+      codexRuntimeProfile: 'safe'
+    });
+
+    const run = await createRun({
+      title: 'provider-rebind-refresh-smoke',
+      projectPath: root,
+      objective: 'provider rebind refresh smoke',
+      presetId: 'greenfield-app',
+      specText: '',
+      specFiles: '',
+      settings: { maxParallel: 1, maxTaskAttempts: 1, maxGoalLoops: 1 }
+    });
+    runId = run.id;
+
+    await updateHarnessSettings({
+      ...originalSettings,
+      coordinationProvider: 'codex',
+      workerProvider: 'codex',
+      codexRuntimeProfile: 'safe'
+    });
+
+    const refreshed = await refreshRunPreflight(run.id);
+    assert.equal(refreshed.settings.coordinationProvider, 'codex');
+    assert.equal(refreshed.settings.workerProvider, 'codex');
+    assert.equal(refreshed.harnessConfig.coordinationProvider, 'codex');
+    assert.equal(refreshed.harnessConfig.workerProvider, 'codex');
+    assert.equal(refreshed.projectContext?.providerProfile?.coordinationProvider, 'codex');
+    assert.equal(refreshed.projectContext?.providerProfile?.workerProvider, 'codex');
+    assert.equal(refreshed.preflight.providerProfile?.coordinationProvider, 'codex');
+    assert.equal(refreshed.preflight.providerProfile?.workerProvider, 'codex');
+
+    const byName = Object.fromEntries((refreshed.agents || []).map((agent) => [agent.name, agent.model]));
+    assert.equal(byName.planner, 'codex');
+    assert.equal(byName.implementer, 'codex');
+    assert.equal(byName.verifier, 'codex');
+    assert.equal(byName['goal-judge'], 'codex');
+  } finally {
+    if (runId) {
+      await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});
+    }
+    await updateHarnessSettings(originalSettings);
+  }
+});
+
+test('startRun follows the current provider settings instead of the saved run profile', async () => {
+  let runId = '';
+  const originalSettings = await getHarnessSettings(root);
+  try {
+    await updateHarnessSettings({
+      ...originalSettings,
+      uiLanguage: 'en',
+      agentLanguage: 'en',
+      coordinationProvider: 'codex',
+      workerProvider: 'codex',
+      codexRuntimeProfile: 'safe'
+    });
+
+    const run = await createRun({
+      title: 'blocked-provider-start-smoke',
+      projectPath: root,
+      objective: 'blocked provider start smoke',
+      presetId: 'greenfield-app',
+      specText: '',
+      specFiles: '',
+      settings: { maxParallel: 1, maxTaskAttempts: 1, maxGoalLoops: 1 }
+    });
+    runId = run.id;
+
+    await updateHarnessSettings({
+      ...originalSettings,
+      uiLanguage: 'en',
+      agentLanguage: 'en',
+      coordinationProvider: 'codex',
+      workerProvider: 'gemini',
+      codexRuntimeProfile: 'safe'
+    });
+
+    await assert.rejects(
+      () => startRun(run.id),
+      /current provider profile|rebound to the current settings|Gemini CLI/
+    );
+
+    const refreshed = await getRun(run.id);
+    assert.equal(refreshed.status, 'draft');
+    assert.equal(refreshed.settings.coordinationProvider, 'codex');
+    assert.equal(refreshed.settings.workerProvider, 'gemini');
+    assert.equal(refreshed.preflight.providerProfile?.workerProvider, 'gemini');
+    assert.ok((refreshed.logs || []).some((entry) => /Run provider profile re-bound to current settings/.test(entry?.message || '')));
+    assert.match(refreshed.logs.at(-1)?.message || '', /Run start blocked by environment or provider readiness/);
+    assert.equal(refreshed.preflight.autonomy?.executionReady, false);
   } finally {
     if (runId) {
       await fs.rm(path.join(root, 'runs', runId), { recursive: true, force: true }).catch(() => {});

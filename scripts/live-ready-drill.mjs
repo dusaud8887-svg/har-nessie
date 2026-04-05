@@ -104,6 +104,50 @@ async function waitForRunToSettle(runId, settleMs = 300, timeoutMs = 5000) {
   return latest || getRun(runId);
 }
 
+function fakeProviderStatePath() {
+  return process.env.FAKE_HARNESS_PROVIDER_STATE || process.env.FAKE_CODEX_STATE || '';
+}
+
+async function readFakeProviderState() {
+  const statePath = fakeProviderStatePath();
+  if (!statePath) {
+    return { attempts: {}, unlocks: {} };
+  }
+  try {
+    const parsed = JSON.parse(await fs.readFile(statePath, 'utf8'));
+    return {
+      attempts: typeof parsed?.attempts === 'object' && parsed.attempts ? parsed.attempts : {},
+      unlocks: typeof parsed?.unlocks === 'object' && parsed.unlocks ? parsed.unlocks : {}
+    };
+  } catch {
+    return { attempts: {}, unlocks: {} };
+  }
+}
+
+async function updateFakeProviderState(mutator) {
+  const statePath = fakeProviderStatePath();
+  if (!statePath) return;
+  const current = await readFakeProviderState();
+  const next = await mutator({
+    attempts: { ...current.attempts },
+    unlocks: { ...current.unlocks }
+  });
+  const finalState = next && typeof next === 'object'
+    ? {
+        attempts: typeof next.attempts === 'object' && next.attempts ? next.attempts : {},
+        unlocks: typeof next.unlocks === 'object' && next.unlocks ? next.unlocks : {}
+      }
+    : current;
+  await fs.writeFile(statePath, JSON.stringify(finalState, null, 2), 'utf8');
+}
+
+async function setFakeProviderUnlock(key, enabled) {
+  await updateFakeProviderState((state) => {
+    state.unlocks[key] = Boolean(enabled);
+    return state;
+  });
+}
+
 async function createDrillProject(parentDir, scenario) {
   const projectDir = path.join(parentDir, scenario);
   await fs.mkdir(path.join(projectDir, 'src'), { recursive: true });
@@ -162,9 +206,14 @@ const resolvedPrompt = promptFileHint
 
 async function readState() {
   try {
-    return JSON.parse(await fs.readFile(stateFile, 'utf8'));
+    const parsed = JSON.parse(await fs.readFile(stateFile, 'utf8'));
+    return {
+      attempts: typeof parsed?.attempts === 'object' && parsed.attempts ? parsed.attempts : {},
+      unlocks: typeof parsed?.unlocks === 'object' && parsed.unlocks ? parsed.unlocks : {},
+      replans: typeof parsed?.replans === 'object' && parsed.replans ? parsed.replans : {}
+    };
   } catch {
-    return { attempts: {} };
+    return { attempts: {}, unlocks: {}, replans: {} };
   }
 }
 
@@ -396,11 +445,11 @@ async function handleImplementation(promptText) {
       await fs.writeFile(readmePath, '# replan-flow\\n\\nPREPARED\\n', 'utf8');
     }
   } else if (scenarioText.includes('retry-flow') || scenarioText.includes('Retry README task')) {
-    if (attempt >= 2) {
+    if (state.unlocks['retry-task']) {
       await fs.writeFile(readmePath, '# retry-flow\\n\\nRETRY-SUCCESS\\n', 'utf8');
     }
   } else if (scenarioText.includes('requeue-flow') || scenarioText.includes('Requeue README task')) {
-    if (attempt >= 2) {
+    if (state.unlocks['requeue-task']) {
       await fs.writeFile(readmePath, '# requeue-flow\\n\\nREQUEUE-SUCCESS\\n', 'utf8');
     }
   } else if (scenarioText.includes('skip-flow') || scenarioText.includes('Skip README task')) {
@@ -681,10 +730,12 @@ async function scenarioClarifyApprovalSuccess(projectPath) {
 }
 
 async function scenarioRetry(projectPath) {
+  await setFakeProviderUnlock('retry-task', false);
   const { runId } = await runApprovedScenario('drill-retry-flow', 'retry-flow', projectPath, { maxTaskAttempts: 1 });
   const failed = await waitForRun(runId, (value) => value.tasks[0]?.status === 'failed' && ['failed', 'partial_complete'].includes(value.status));
   assert.equal(failed.tasks[0]?.status, 'failed');
   await retryTask(runId, failed.tasks[0].id);
+  await setFakeProviderUnlock('retry-task', true);
   await restartRun(runId);
   const completed = await waitForRun(runId, (value) => value.status === 'completed');
   assert.equal(completed.tasks[0]?.status, 'done');
@@ -697,10 +748,12 @@ async function scenarioRetry(projectPath) {
 }
 
 async function scenarioRequeue(projectPath) {
+  await setFakeProviderUnlock('requeue-task', false);
   const { runId } = await runApprovedScenario('drill-requeue-flow', 'requeue-flow', projectPath, { maxTaskAttempts: 1 });
   const failed = await waitForRun(runId, (value) => value.tasks[0]?.status === 'failed' && ['failed', 'partial_complete'].includes(value.status));
   assert.equal(failed.tasks[0]?.status, 'failed');
   await requeueFailedTasks(runId);
+  await setFakeProviderUnlock('requeue-task', true);
   await restartRun(runId);
   const completed = await waitForRun(runId, (value) => value.status === 'completed');
   assert.equal(completed.tasks[0]?.status, 'done');
@@ -912,6 +965,8 @@ export async function runLiveReadyDrill() {
       scenarios
     };
   } finally {
+    await Promise.all(createdRuns.map((runId) => waitForRunToSettle(runId, 250, 1500).catch(() => null)));
+    await sleep(250);
     env.restore();
     for (const runId of createdRuns) {
       await deleteRun(runId).catch(() => {});

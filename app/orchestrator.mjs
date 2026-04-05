@@ -333,12 +333,220 @@ function resolveRunProviderProfile(run) {
   };
 }
 
+function providerProfilesMatch(left, right) {
+  return normalizeAgentProvider(left?.coordinationProvider, 'codex') === normalizeAgentProvider(right?.coordinationProvider, 'codex')
+    && normalizeAgentProvider(left?.workerProvider, 'codex') === normalizeAgentProvider(right?.workerProvider, 'codex');
+}
+
+function providerForAgentName(agentName, providerProfile) {
+  const normalizedName = String(agentName || '').trim().toLowerCase();
+  if (!normalizedName) return '';
+  if (normalizedName === 'implementer') return normalizeAgentProvider(providerProfile?.workerProvider, 'codex');
+  if ([
+    'planner',
+    'verifier',
+    'goal-judge',
+    'bug-reproducer',
+    'spec-locker',
+    'integrator',
+    'producer-reviewer-loop'
+  ].includes(normalizedName)) {
+    return normalizeAgentProvider(providerProfile?.coordinationProvider, 'codex');
+  }
+  return '';
+}
+
+function rebindAgentProviderModels(agents, providerProfile) {
+  if (!Array.isArray(agents)) return [];
+  return agents.map((agent) => {
+    const targetProvider = providerForAgentName(agent?.name, providerProfile);
+    if (!targetProvider) return agent;
+    return {
+      ...agent,
+      model: targetProvider
+    };
+  });
+}
+
 function normalizeProviderProfile(value, fallback = DEFAULT_HARNESS_SETTINGS) {
   if (!value || typeof value !== 'object') return null;
   return {
     coordinationProvider: normalizeAgentProvider(value.coordinationProvider, fallback?.coordinationProvider || 'codex'),
     workerProvider: normalizeAgentProvider(value.workerProvider, fallback?.workerProvider || 'codex')
   };
+}
+
+function preflightExecutionReady(preflight) {
+  if (!preflight || typeof preflight !== 'object') return true;
+  if (preflight.autonomy && Object.prototype.hasOwnProperty.call(preflight.autonomy, 'executionReady')) {
+    return preflight.autonomy.executionReady !== false;
+  }
+  if (Object.prototype.hasOwnProperty.call(preflight, 'ready')) {
+    return preflight.ready !== false;
+  }
+  return true;
+}
+
+async function resolveCurrentRunSettings(run) {
+  const currentHarnessSettings = await getHarnessSettings(run?.projectPath || '');
+  const projectId = String(run?.project?.id || '').trim();
+  let projectDefaultSettings = {};
+  if (projectId) {
+    const project = await loadProjectStateOrThrowNotFound(projectId).catch((error) => {
+      if (error?.statusCode === 404 || error?.code === 'PROJECT_NOT_FOUND' || error?.code === 'ENOENT') return null;
+      throw error;
+    });
+    projectDefaultSettings = project?.defaultSettings && typeof project.defaultSettings === 'object'
+      ? project.defaultSettings
+      : {};
+  }
+  const effectiveProviderProfile = normalizeProviderProfile(projectDefaultSettings.providerProfile, currentHarnessSettings) || {
+    coordinationProvider: normalizeAgentProvider(currentHarnessSettings.coordinationProvider, DEFAULT_HARNESS_SETTINGS.coordinationProvider),
+    workerProvider: normalizeAgentProvider(currentHarnessSettings.workerProvider, DEFAULT_HARNESS_SETTINGS.workerProvider)
+  };
+  const effectiveHarnessSettings = {
+    ...currentHarnessSettings,
+    coordinationProvider: effectiveProviderProfile.coordinationProvider,
+    workerProvider: effectiveProviderProfile.workerProvider
+  };
+  const effectiveCodexRuntimeProfile = normalizeCodexRuntimeProfile(
+    hasOwnSetting(projectDefaultSettings, 'codexRuntimeProfile')
+      ? projectDefaultSettings.codexRuntimeProfile
+      : currentHarnessSettings.codexRuntimeProfile,
+    DEFAULT_SETTINGS.codexRuntimeProfile
+  );
+  const effectiveCodexModel = normalizeCodexModel(
+    hasOwnSetting(projectDefaultSettings, 'codexModel')
+      ? projectDefaultSettings.codexModel
+      : currentHarnessSettings.codexModel,
+    DEFAULT_SETTINGS.codexModel
+  );
+  const effectiveCodexFastMode = normalizeCodexFastMode(
+    hasOwnSetting(projectDefaultSettings, 'codexFastMode')
+      ? projectDefaultSettings.codexFastMode
+      : currentHarnessSettings.codexFastMode,
+    DEFAULT_SETTINGS.codexFastMode
+  );
+  return {
+    currentHarnessSettings,
+    effectiveProviderProfile,
+    effectiveHarnessSettings,
+    effectiveCodexRuntimeProfile,
+    effectiveCodexModel,
+    effectiveCodexFastMode
+  };
+}
+
+function applyCurrentRunSettings(state, liveSettings, { preflight = null, validationCommands = null } = {}) {
+  const previousProviderProfile = resolveRunProviderProfile(state);
+  const effectiveProviderProfile = liveSettings.effectiveProviderProfile;
+  const reboundAgents = rebindAgentProviderModels(state.agents, effectiveProviderProfile);
+  const reboundTeamBlueprint = rebindAgentProviderModels(state.harnessConfig?.teamBlueprint, effectiveProviderProfile);
+
+  state.settings = {
+    ...(state.settings || {}),
+    coordinationProvider: effectiveProviderProfile.coordinationProvider,
+    workerProvider: effectiveProviderProfile.workerProvider,
+    codexRuntimeProfile: liveSettings.effectiveCodexRuntimeProfile,
+    codexModel: liveSettings.effectiveCodexModel,
+    codexFastMode: liveSettings.effectiveCodexFastMode,
+    codexServiceTier: liveSettings.effectiveCodexFastMode ? 'fast' : 'default',
+    claudeModel: String(liveSettings.effectiveHarnessSettings.claudeModel || DEFAULT_SETTINGS.claudeModel).trim(),
+    geminiModel: String(liveSettings.effectiveHarnessSettings.geminiModel || DEFAULT_SETTINGS.geminiModel).trim() || DEFAULT_SETTINGS.geminiModel,
+    geminiProjectId: String(liveSettings.effectiveHarnessSettings.geminiProjectId || DEFAULT_SETTINGS.geminiProjectId).trim()
+  };
+  state.harnessConfig = {
+    ...(state.harnessConfig || {}),
+    ...liveSettings.effectiveHarnessSettings,
+    coordinationProvider: effectiveProviderProfile.coordinationProvider,
+    workerProvider: effectiveProviderProfile.workerProvider,
+    ...(reboundTeamBlueprint.length ? { teamBlueprint: reboundTeamBlueprint } : {})
+  };
+  if (Array.isArray(state.agents) && state.agents.length) {
+    state.agents = reboundAgents;
+  }
+  state.projectContext = {
+    ...(state.projectContext || {}),
+    ...(validationCommands ? { validationCommands } : {}),
+    providerProfile: effectiveProviderProfile
+  };
+  if (preflight) {
+    state.preflight = preflight;
+  } else if (state.preflight && typeof state.preflight === 'object') {
+    state.preflight = {
+      ...state.preflight,
+      providerProfile: effectiveProviderProfile
+    };
+  }
+  return {
+    previousProviderProfile,
+    effectiveProviderProfile,
+    changed: !providerProfilesMatch(previousProviderProfile, effectiveProviderProfile)
+  };
+}
+
+async function syncRunToCurrentSettings(runId, { refreshPreflight = false } = {}) {
+  const result = await withLock(runId, async () => {
+    const state = await loadState(runId);
+    const liveSettings = await resolveCurrentRunSettings(state);
+    const preflight = refreshPreflight
+      ? await buildPreflight(state.projectPath || '', state.input?.specFiles || [], liveSettings.effectiveHarnessSettings)
+      : null;
+    const validationCommands = refreshPreflight
+      ? await detectProjectValidationCommands(state.projectPath || '', PROJECT_INTEL_HELPERS)
+      : null;
+    const applied = applyCurrentRunSettings(state, liveSettings, { preflight, validationCommands });
+    if (refreshPreflight || applied.changed) {
+      await saveState(state);
+    }
+    return {
+      state,
+      ...applied
+    };
+  });
+  if (result.changed) {
+    await writeHarnessGuidanceDoc(result.state);
+  }
+  return result;
+}
+
+function buildRunStartBlockedError(run, preflight, options = {}) {
+  const language = normalizeLanguage(run?.harnessConfig?.uiLanguage || run?.harnessConfig?.agentLanguage, DEFAULT_HARNESS_SETTINGS.uiLanguage);
+  const activeProviderProfile = normalizeProviderProfile(preflight?.providerProfile, run?.harnessConfig || DEFAULT_HARNESS_SETTINGS)
+    || resolveRunProviderProfile(run);
+  const previousProviderProfile = options.previousProviderProfile || null;
+  const blockers = Array.isArray(preflight?.blockers) ? preflight.blockers.map((item) => String(item || '').trim()).filter(Boolean) : [];
+  const lines = [
+    localizedText(
+      language,
+      `현재 설정 기준 provider profile은 계획/검토=${providerDisplayName(activeProviderProfile.coordinationProvider)} · 구현=${providerDisplayName(activeProviderProfile.workerProvider)} 입니다. 이 profile로는 run을 시작할 수 없습니다.`,
+      `The current provider profile is planning/review=${providerDisplayName(activeProviderProfile.coordinationProvider)} and implementation=${providerDisplayName(activeProviderProfile.workerProvider)}. The run cannot start with this profile.`
+    )
+  ];
+  if (previousProviderProfile && !providerProfilesMatch(previousProviderProfile, activeProviderProfile)) {
+    lines.push(localizedText(
+      language,
+      '기존 run provider profile은 시작 전에 현재 설정으로 재바인드되었습니다.',
+      'The run provider profile was rebound to the current settings before startup.'
+    ));
+  }
+  lines.push(localizedText(
+    language,
+    '`Codex 실행 프로필`은 Codex CLI의 approval/sandbox 모드만 바꾸며, 계획/구현 담당 provider는 바꾸지 않습니다.',
+    'The Codex runtime profile only changes Codex CLI approval/sandbox behavior. It does not switch the planning or implementation provider.'
+  ));
+  if (blockers.length) {
+    lines.push(localizedText(language, `차단 원인: ${blockers[0]}`, `Blocked by: ${blockers[0]}`));
+  }
+  lines.push(localizedText(
+    language,
+    '해결 방법: 필요한 CLI를 설치하거나, 현재 설정의 provider를 다시 바꾸고 run을 다시 시작하세요.',
+    'Fix: install the required CLI, or change the current provider settings and start the run again.'
+  ));
+  const error = new Error(lines.join(' '));
+  error.code = 'RUN_NOT_STARTABLE';
+  error.statusCode = 409;
+  return error;
 }
 
 function normalizeRunLoopSettings(value, fallback = null) {
@@ -1567,7 +1775,8 @@ async function readJson(filePath) {
       return JSON.parse(decodeTextBuffer(await fs.readFile(filePath)));
     } catch (error) {
       lastError = error;
-      if (!(error instanceof SyntaxError) || attempt === 3) {
+      const retryableReadError = error instanceof SyntaxError || error?.code === 'ENOENT';
+      if (!retryableReadError || attempt === 3) {
         throw error;
       }
       await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
@@ -1577,7 +1786,21 @@ async function readJson(filePath) {
 }
 
 async function writeJson(filePath, value) {
-  await fs.writeFile(filePath, JSON.stringify(value, null, 2), 'utf8');
+  const serialized = JSON.stringify(value, null, 2);
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2, 8)}.tmp`;
+  await fs.writeFile(tempPath, serialized, 'utf8');
+  try {
+    await fs.rename(tempPath, filePath);
+  } catch (error) {
+    if (process.platform === 'win32' && ['EEXIST', 'EPERM'].includes(String(error?.code || ''))) {
+      await fs.rm(filePath, { force: true }).catch(() => {});
+      await fs.rename(tempPath, filePath);
+    } else {
+      throw error;
+    }
+  } finally {
+    await fs.rm(tempPath, { force: true }).catch(() => {});
+  }
 }
 
 function serializeState(state) {
@@ -2377,8 +2600,7 @@ function openQuestionText(value) {
 
 async function probeCommand(command, args = [], cwd = ROOT_DIR) {
   try {
-    const isCmdScript = process.platform === 'win32' && /\.cmd$/i.test(command);
-    const result = process.platform === 'win32' && isCmdScript
+    const result = process.platform === 'win32'
       ? await runProcess('cmd.exe', ['/d', '/s', '/c', command, ...args], cwd, null, false)
       : await runProcess(command, args, cwd, null, false);
     const output = clipLine(result.stdout || result.stderr || `exit ${result.code}`);
@@ -2398,9 +2620,9 @@ async function probeCommand(command, args = [], cwd = ROOT_DIR) {
 
 async function buildEnvironmentDiagnostics() {
   const [codex, claude, gemini, git, node, python, playwright] = await Promise.all([
-    probeCommand(process.platform === 'win32' ? 'codex.cmd' : 'codex', ['--version']),
-    probeCommand(process.platform === 'win32' ? 'claude.cmd' : 'claude', ['--version']),
-    probeCommand(process.platform === 'win32' ? 'gemini.cmd' : 'gemini', ['--version']),
+    probeCommand('codex', ['--version']),
+    probeCommand('claude', ['--version']),
+    probeCommand('gemini', ['--version']),
     probeCommand('git', ['--version']),
     probeCommand('node', ['--version']),
     probeCommand('python', ['--version']),
@@ -3440,7 +3662,7 @@ async function runCodex(prompt, cwd, settings, controller) {
   const outputFilePath = path.join(cwd, outputFileName);
   const args = buildCodexExecArgs(settings, outputFileName);
   const result = process.platform === 'win32'
-    ? await runProcess('cmd.exe', ['/d', '/s', '/c', 'codex.cmd', ...args], cwd, controller, true, null, CODEX_TIMEOUT_MS, prompt)
+    ? await runProcess('cmd.exe', ['/d', '/s', '/c', 'codex', ...args], cwd, controller, true, null, CODEX_TIMEOUT_MS, prompt)
     : await runProcess('codex', args, cwd, controller, true, null, CODEX_TIMEOUT_MS, prompt);
   const lastMessage = await fs.readFile(outputFilePath, 'utf8').catch(() => '');
   await fs.rm(outputFilePath, { force: true }).catch(() => {});
@@ -3456,7 +3678,7 @@ async function runFileBackedAgentPrompt(providerCommand, prompt, cwd, controller
   if (shouldStreamPromptViaStdin) {
     const args = argsBuilder('-');
     return process.platform === 'win32'
-      ? runProcess('cmd.exe', ['/d', '/s', '/c', `${providerCommand}.cmd`, ...args], cwd, controller, true, envOverrides, timeoutMs, prompt)
+      ? runProcess('cmd.exe', ['/d', '/s', '/c', providerCommand, ...args], cwd, controller, true, envOverrides, timeoutMs, prompt)
       : runProcess(providerCommand, args, cwd, controller, true, envOverrides, timeoutMs, prompt);
   }
   const promptFileName = `.harness-${providerCommand}-prompt-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.md`;
@@ -3466,7 +3688,7 @@ async function runFileBackedAgentPrompt(providerCommand, prompt, cwd, controller
   try {
     const args = argsBuilder(launcherPrompt);
     return process.platform === 'win32'
-      ? runProcess('cmd.exe', ['/d', '/s', '/c', `${providerCommand}.cmd`, ...args], cwd, controller, true, envOverrides, timeoutMs)
+      ? runProcess('cmd.exe', ['/d', '/s', '/c', providerCommand, ...args], cwd, controller, true, envOverrides, timeoutMs)
       : runProcess(providerCommand, args, cwd, controller, true, envOverrides, timeoutMs);
   } finally {
     await fs.rm(promptFilePath, { force: true }).catch(() => {});
@@ -6183,7 +6405,14 @@ async function maybeTriggerAutoChainRun(runId) {
 
 async function loopRun(runId, controller) {
   try {
-    let state = await loadState(runId);
+    let syncState = await syncRunToCurrentSettings(runId);
+    if (syncState.changed) {
+      await appendLog(runId, 'info', 'Run provider profile re-bound to current settings.', {
+        previousProviderProfile: syncState.previousProviderProfile,
+        providerProfile: syncState.effectiveProviderProfile
+      });
+    }
+    let state = syncState.state;
     if (state.humanLoop?.clarifyPending?.length) {
       await appendLog(runId, 'warning', 'Run paused for clarify answers.', { questions: state.humanLoop.clarifyPending });
       await appendTrace(runId, 'run.paused-for-clarify', { questions: state.humanLoop.clarifyPending.length });
@@ -6209,7 +6438,14 @@ async function loopRun(runId, controller) {
     }
 
     while (!controller.stopRequested) {
-      state = await loadState(runId);
+      syncState = await syncRunToCurrentSettings(runId);
+      if (syncState.changed) {
+        await appendLog(runId, 'info', 'Run provider profile re-bound to current settings.', {
+          previousProviderProfile: syncState.previousProviderProfile,
+          providerProfile: syncState.effectiveProviderProfile
+        });
+      }
+      state = syncState.state;
       if (state.status === 'needs_input' || state.status === 'needs_approval') {
         break;
       }
@@ -6257,6 +6493,13 @@ async function loopRun(runId, controller) {
       }
       await Promise.all(batch.map((task) => executeTask(runId, task.id, controller)));
       const checkpoint = await writeRunCheckpoint(runId, 'task-batch-completed');
+      syncState = await syncRunToCurrentSettings(runId);
+      if (syncState.changed) {
+        await appendLog(runId, 'info', 'Run provider profile re-bound to current settings.', {
+          previousProviderProfile: syncState.previousProviderProfile,
+          providerProfile: syncState.effectiveProviderProfile
+        });
+      }
       const replan = await maybeAutomaticReplan(runId, controller, checkpoint);
       if (replan?.pauseForHuman) {
         break;
@@ -7594,7 +7837,7 @@ export async function approvePlan(runId) {
       status: 'approved',
       approvedAt: now()
     };
-    state.status = 'running';
+    state.status = 'needs_approval';
     await saveState(state);
   });
   await appendLog(runId, 'info', 'Plan approved by user.');
@@ -7717,18 +7960,8 @@ export async function diagnoseSetup(input = {}) {
 }
 
 export async function refreshRunPreflight(runId) {
-  return withLock(runId, async () => {
-    const state = await loadState(runId);
-    const preflight = await buildPreflight(state.projectPath || '', state.input?.specFiles || [], state.harnessConfig || null);
-    const validationCommands = await detectProjectValidationCommands(state.projectPath || '', PROJECT_INTEL_HELPERS);
-    state.preflight = preflight;
-    state.projectContext = {
-      ...(state.projectContext || {}),
-      validationCommands
-    };
-    await saveState(state);
-    return state;
-  });
+  const result = await syncRunToCurrentSettings(runId, { refreshPreflight: true });
+  return result.state;
 }
 
 export async function retryTask(runId, taskId) {
@@ -8135,7 +8368,11 @@ export async function createRun(input) {
 export async function startRun(runId, { additionalRequirements = '' } = {}) {
   if (activeRuns.has(runId)) {
     const existing = await loadState(runId).catch(() => null);
-    if (!existing || ['stopped', 'failed', 'completed', 'partial_complete'].includes(String(existing.status || ''))) {
+    const stalePausedRun = existing && (
+      (existing.status === 'needs_input' && !(existing.humanLoop?.clarifyPending?.length))
+      || (existing.status === 'needs_approval' && existing.humanLoop?.planApproval?.status === 'approved')
+    );
+    if (!existing || stalePausedRun || ['stopped', 'failed', 'completed', 'partial_complete'].includes(String(existing.status || ''))) {
       activeRuns.delete(runId);
     } else {
       return existing;
@@ -8143,34 +8380,78 @@ export async function startRun(runId, { additionalRequirements = '' } = {}) {
   }
   const controller = { stopRequested: false, children: new Set() };
   activeRuns.set(runId, controller);
-  await withLock(runId, async () => {
-    const state = await loadState(runId);
-    if (additionalRequirements && additionalRequirements.trim()) {
-      const trimmed = additionalRequirements.trim();
-      state.input = state.input || {};
-      state.input.additionalNotes = ((state.input.additionalNotes || '') + '\n\n---\n# Additional requirements (' + now() + ')\n\n' + trimmed).trim();
-      const specBundlePath = path.join(runDir(runId), 'input', 'spec-bundle.md');
-      const existing = await fs.readFile(specBundlePath, 'utf8').catch(() => '');
-      await fs.writeFile(specBundlePath, existing + '\n\n# Additional requirements (' + now() + ')\n\n' + trimmed + '\n', 'utf8');
+  try {
+    let blockedError = null;
+    let blockedMeta = null;
+    let reboundMeta = null;
+    await withLock(runId, async () => {
+      const state = await loadState(runId);
+      if (additionalRequirements && additionalRequirements.trim()) {
+        const trimmed = additionalRequirements.trim();
+        state.input = state.input || {};
+        state.input.additionalNotes = ((state.input.additionalNotes || '') + '\n\n---\n# Additional requirements (' + now() + ')\n\n' + trimmed).trim();
+        const specBundlePath = path.join(runDir(runId), 'input', 'spec-bundle.md');
+        const existing = await fs.readFile(specBundlePath, 'utf8').catch(() => '');
+        await fs.writeFile(specBundlePath, existing + '\n\n# Additional requirements (' + now() + ')\n\n' + trimmed + '\n', 'utf8');
+        await saveState(state);
+        await appendLog(runId, 'info', 'Additional requirements applied to spec.');
+      }
+      const liveSettings = await resolveCurrentRunSettings(state);
+      const rebound = applyCurrentRunSettings(state, liveSettings);
+      const refreshedPreflight = await buildPreflight(state.projectPath || '', state.input?.specFiles || [], liveSettings.effectiveHarnessSettings);
+      const validationCommands = await detectProjectValidationCommands(state.projectPath || '', PROJECT_INTEL_HELPERS);
+      applyCurrentRunSettings(state, liveSettings, { preflight: refreshedPreflight, validationCommands });
+      if (rebound.changed) {
+        reboundMeta = {
+          previousProviderProfile: rebound.previousProviderProfile,
+          providerProfile: rebound.effectiveProviderProfile
+        };
+      }
+      if (!preflightExecutionReady(refreshedPreflight)) {
+        state.status = state.humanLoop?.clarifyPending?.length
+          ? 'needs_input'
+          : (state.status === 'running' ? (state.tasks.length ? 'needs_approval' : 'draft') : state.status);
+        await saveState(state);
+        blockedError = buildRunStartBlockedError(state, refreshedPreflight, {
+          previousProviderProfile: rebound.previousProviderProfile
+        });
+        blockedMeta = {
+          blockers: refreshedPreflight.blockers || [],
+          providerProfile: resolveRunProviderProfile(state),
+          ...(reboundMeta || {})
+        };
+        return;
+      }
+      if (state.humanLoop?.clarifyPending?.length) {
+        state.status = 'needs_input';
+      } else if (!state.tasks.length || state.status === 'draft') {
+        state.status = 'running';
+      } else if (state.status === 'needs_approval' && state.humanLoop?.planApproval?.status !== 'approved') {
+        state.status = 'needs_approval';
+      } else {
+        state.status = 'running';
+      }
       await saveState(state);
-      await appendLog(runId, 'info', 'Additional requirements applied to spec.');
+    });
+    if (reboundMeta) {
+      await writeHarnessGuidanceDoc(await loadState(runId));
+      await appendLog(runId, 'info', 'Run provider profile re-bound to current settings.', reboundMeta);
     }
-    if (state.humanLoop?.clarifyPending?.length) {
-      state.status = 'needs_input';
-    } else if (!state.tasks.length || state.status === 'draft') {
-      state.status = 'running';
-    } else if (state.status === 'needs_approval' && state.humanLoop?.planApproval?.status !== 'approved') {
-      state.status = 'needs_approval';
-    } else {
-      state.status = 'running';
+    if (blockedError) {
+      await appendLog(runId, 'warning', 'Run start blocked by environment or provider readiness.', blockedMeta || {});
+      await writeRunCheckpoint(runId, 'run-start-blocked');
+      activeRuns.delete(runId);
+      throw blockedError;
     }
-    await saveState(state);
-  });
-  await appendLog(runId, 'info', 'Run started.');
-  await appendTrace(runId, 'run.started', {});
-  await writeRunCheckpoint(runId, 'run-started');
-  loopRun(runId, controller);
-  return loadState(runId);
+    await appendLog(runId, 'info', 'Run started.');
+    await appendTrace(runId, 'run.started', {});
+    await writeRunCheckpoint(runId, 'run-started');
+    loopRun(runId, controller);
+    return loadState(runId);
+  } catch (error) {
+    activeRuns.delete(runId);
+    throw error;
+  }
 }
 
 export async function stopRun(runId) {
