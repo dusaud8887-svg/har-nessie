@@ -40,6 +40,7 @@ import {
   runProjectQualitySweep,
   retryTask,
   searchRunMemory,
+  selectVerificationCommands,
   shouldRunAutomaticReplan,
   skipTask,
   startRun,
@@ -1724,6 +1725,67 @@ test('decideReviewRoute blocks verification failures before agent review', () =>
   assert.equal(review?.decision, 'retry');
   assert.equal(review?.route, 'rule-blocked');
   assert.match((review?.findings || []).join('\n'), /automatic verification failed/i);
+});
+
+test('selectVerificationCommands skips repo-wide validation for docs-only tasks without explicit commands', () => {
+  const commands = selectVerificationCommands(
+    {
+      projectContext: { validationCommands: ['npm run test', 'npm run lint', 'npm run build'] },
+      preset: { id: 'docs-spec-first' }
+    },
+    {
+      title: 'Lock intake boundaries in the backlog',
+      goal: 'Update the active exec plan document only.',
+      filesLikely: ['docs/exec-plans/active/project-intake-2026-04-04.md'],
+      constraints: ['Keep this scoped to docs only.'],
+      acceptanceChecks: ['Phase Goal and Files Likely sections are present.']
+    }
+  );
+
+  assert.deepEqual(commands, []);
+});
+
+test('selectVerificationCommands prefers explicit acceptance commands for docs-only tasks', () => {
+  const commands = selectVerificationCommands(
+    {
+      projectContext: { validationCommands: ['npm run test', 'npm run lint'] },
+      preset: { id: 'docs-spec-first' }
+    },
+    {
+      title: 'Record intake acceptance evidence',
+      goal: 'Leave command-based evidence in the task artifact.',
+      filesLikely: ['docs/exec-plans/active/project-intake-2026-04-04.md'],
+      constraints: [],
+      acceptanceChecks: [
+        'rg -n "^## (Phase Goal|Out of Scope|Next Action|Files Likely)$" docs/exec-plans/active/project-intake-2026-04-04.md exits 0',
+        'Test-Path docs/exec-plans/active/project-intake-2026-04-04.md returns True',
+        'The backlog text stays scoped to the current phase.'
+      ]
+    }
+  );
+
+  assert.deepEqual(commands, [
+    'rg -n "^## (Phase Goal|Out of Scope|Next Action|Files Likely)$" docs/exec-plans/active/project-intake-2026-04-04.md',
+    'Test-Path docs/exec-plans/active/project-intake-2026-04-04.md'
+  ]);
+});
+
+test('selectVerificationCommands prefers explicit acceptance commands for code tasks', () => {
+  const commands = selectVerificationCommands(
+    {
+      projectContext: { validationCommands: ['npm run test', 'npm run lint', 'npm run build'] },
+      preset: { id: 'existing-repo-feature' }
+    },
+    {
+      title: 'Fix the lint blocker',
+      goal: 'Restore the minimum verification contract.',
+      filesLikely: ['src/editor/InlineHintLayer.tsx', 'eslint.config.js'],
+      constraints: [],
+      acceptanceChecks: ['npm run lint exits 0', 'npm run test exits 0', 'npm run build exits 0']
+    }
+  );
+
+  assert.deepEqual(commands, ['npm run lint', 'npm run test', 'npm run build']);
 });
 
 test('buildTaskCodeContext returns related file symbols and references', async () => {

@@ -155,7 +155,7 @@ const {
   refreshRunMemory
 } = memoryResolver;
 
-export { applyPlanPolicy, defaultExecutionPolicy, buildContinuationPromptLines, decideReviewRoute, isReadOnlyVerificationTask };
+export { applyPlanPolicy, defaultExecutionPolicy, buildContinuationPromptLines, decideReviewRoute, isReadOnlyVerificationTask, selectVerificationCommands };
 
 /**
  * @typedef {Object} RunSummary
@@ -2800,7 +2800,78 @@ function categorizeValidationCommand(commandLine) {
   return 'other';
 }
 
+function isDocsOnlyTask(task) {
+  const filesLikely = Array.isArray(task?.filesLikely) ? task.filesLikely : [];
+  if (!filesLikely.length) return false;
+  return filesLikely.every((filePath) => {
+    const normalized = String(filePath || '').trim().replace(/\\/g, '/').toLowerCase();
+    if (!normalized || normalized === '*') return false;
+    if (/\.(md|mdx|txt|rst|adoc)$/i.test(normalized)) return true;
+    return normalized.startsWith('docs/') && !/\.(js|jsx|ts|tsx|mjs|cjs|json|css|scss|sass|less|html|rs|py|go|java|kt|swift|php|rb|yml|yaml|toml)$/i.test(normalized);
+  });
+}
+
+function looksLikeShellCommand(value) {
+  const command = String(value || '').trim();
+  if (!command || /\r|\n/.test(command)) return false;
+  const firstToken = command.split(/\s+/)[0].toLowerCase();
+  return [
+    'npm',
+    'pnpm',
+    'yarn',
+    'bun',
+    'npx',
+    'node',
+    'python',
+    'pytest',
+    'cargo',
+    'go',
+    'dotnet',
+    'mvn',
+    'gradle',
+    './gradlew',
+    'git',
+    'rg',
+    'grep',
+    'findstr',
+    'test-path',
+    'powershell',
+    'pwsh',
+    'cmd',
+    'bash',
+    'sh',
+    'get-childitem',
+    'select-string'
+  ].includes(firstToken);
+}
+
+function extractAcceptanceVerificationCommands(task) {
+  const checks = Array.isArray(task?.acceptanceChecks) ? task.acceptanceChecks : [];
+  const commands = [];
+  for (const rawCheck of checks) {
+    const check = String(rawCheck || '').trim();
+    if (!check) continue;
+    let command = '';
+    let match = check.match(/^`([^`]+)`\s+(?:exits?\s*0|returns?\s+(?:true|false)|passes)\b/i);
+    if (match) {
+      command = match[1];
+    } else {
+      match = check.match(/^(.+?)\s+(?:exits?\s*0|returns?\s+(?:true|false)|passes)\b/i);
+      if (match) command = match[1];
+    }
+    command = String(command || '').trim();
+    if (!looksLikeShellCommand(command)) continue;
+    commands.push(command);
+  }
+  return uniqueBy(commands, (item) => item).slice(0, 3);
+}
+
 function selectVerificationCommands(run, task) {
+  const explicitCommands = extractAcceptanceVerificationCommands(task);
+  if (explicitCommands.length) return explicitCommands;
+
+  if (isDocsOnlyTask(task)) return [];
+
   const commands = Array.isArray(run.projectContext?.validationCommands) ? run.projectContext.validationCommands : [];
   if (!commands.length) return [];
 
