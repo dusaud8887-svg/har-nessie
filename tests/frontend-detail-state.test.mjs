@@ -473,6 +473,47 @@ test('renderTaskInsights falls back to task execution changed files when artifac
   assert.doesNotMatch(markup, /아직 변경 파일 없음/);
 });
 
+test('renderTaskInsights and actions treat superseded failed tasks as non-actionable', async () => {
+  const { context } = await createUiHarness();
+  const task = {
+    ...makeTask('T002', 'status alignment'),
+    status: 'failed',
+    replacementTaskId: 'T006',
+    replacementTaskTitle: 'T002 재시도: P0 상태 문서 정렬',
+    replacementTaskStatus: 'in_progress'
+  };
+  const insightMarkup = vm.runInContext(`renderTaskInsights(${JSON.stringify(task)}, undefined)`, context);
+  const actionMarkup = vm.runInContext(`renderTaskActions(${JSON.stringify(task)})`, context);
+
+  assert.match(insightMarkup, /자동 승계 태스크 T006/);
+  assert.doesNotMatch(insightMarkup, /다시 시도할지, 이번 작업은 건너뛸지/);
+  assert.equal(actionMarkup, '');
+});
+
+test('dashboard recovery actions ignore superseded failed tasks and focus the replacement task', async () => {
+  const { context } = await createUiHarness();
+  const run = {
+    status: 'failed',
+    tasks: [
+      {
+        ...makeTask('T002', 'original failed'),
+        status: 'failed',
+        replacementTaskId: 'T006'
+      },
+      {
+        ...makeTask('T006', 'replacement ready'),
+        status: 'ready'
+      }
+    ]
+  };
+  const markup = vm.runInContext(`
+    renderRecoveryActions(${JSON.stringify(run)})
+  `, context);
+
+  assert.doesNotMatch(markup, /같은 계획으로 다시 시도/);
+  assert.match(markup, /이번 목표에서 제외/);
+});
+
 test('renderArtifactTabs shows timeline entries from trace and trajectory artifacts', async () => {
   const { context } = await createUiHarness();
   const markup = vm.runInContext(`

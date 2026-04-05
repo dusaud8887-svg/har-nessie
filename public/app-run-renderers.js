@@ -193,13 +193,17 @@
     const changedFiles = resolveChangedFiles(task, artifacts);
     const evidence = deriveTaskEvidence(task, artifacts);
     const evidenceSummary = summarizeTaskEvidence(evidence);
+    const isSupersededFailure = task.status === 'failed' && task.replacementTaskId;
+    const replacementLabel = [task.replacementTaskId, task.replacementTaskTitle].filter(Boolean).join(' ');
     return `
       <div class="grid-2 task-insight-grid">
         <div class="card">
           <h3>${escapeHtml(t('현재 판단', 'Current judgment'))}</h3>
           <div class="detail-list">
             ${renderDetailItem(t('요약', 'Summary'), task.reviewSummary || (task.status === 'done' ? t('검토 완료', 'Review complete') : t('아직 검토 요약 없음', 'No review summary yet')), t('요약 없음', 'No summary'))}
-            ${renderDetailItem(t('다음 액션', 'Next action'), task.status === 'failed'
+            ${renderDetailItem(t('다음 액션', 'Next action'), isSupersededFailure
+              ? t(`자동 승계 태스크 ${replacementLabel || task.replacementTaskId}이 이어서 처리 중이므로 이 실패 태스크를 수동으로 다시 시도하거나 건너뛸 필요가 없습니다.`, `Replacement task ${replacementLabel || task.replacementTaskId} is already carrying this forward, so you do not need to retry or skip the failed original manually.`)
+              : task.status === 'failed'
               ? t('실패 원인을 보고 다시 시도할지, 이번 작업은 건너뛸지 결정하세요.', 'Review the failure and decide whether to retry or skip this task.')
               : (task.status === 'done'
                 ? t('산출물과 검토 결과를 확인하면 됩니다.', 'Review the artifacts and review result.')
@@ -251,8 +255,9 @@
   function renderTaskActions(task, deps) {
     const { escapeHtml, isBusy, t } = deps;
     if (!task) return '';
-    const canRetry = task.status === 'failed';
-    const canSkip = task.status === 'failed' || task.status === 'ready';
+    const isSupersededFailure = task.status === 'failed' && task.replacementTaskId;
+    const canRetry = task.status === 'failed' && !isSupersededFailure;
+    const canSkip = (task.status === 'failed' && !isSupersededFailure) || task.status === 'ready';
     if (!canRetry && !canSkip) return '';
     return `
       <div class="card" style="margin-bottom: 16px;">

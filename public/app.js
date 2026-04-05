@@ -1877,8 +1877,8 @@
 
     function getRecoveryFocusTask(run) {
       const tasks = Array.isArray(run?.tasks) ? run.tasks : [];
-      return tasks.find((task) => task.id === selectedTaskId && ['failed', 'ready'].includes(String(task?.status || '')))
-        || tasks.find((task) => task.status === 'failed')
+      return tasks.find((task) => task.id === selectedTaskId && ['failed', 'ready'].includes(String(task?.status || '')) && !(task.status === 'failed' && task.replacementTaskId))
+        || tasks.find((task) => task.status === 'failed' && !task.replacementTaskId)
         || tasks.find((task) => task.status === 'ready')
         || null;
     }
@@ -3819,7 +3819,7 @@
       await runUiAction('start-run', async () => {
         captureClarifyDrafts();
         const run = runs.find((item) => item.id === selectedRunId);
-        const failedTasks = (run?.tasks || []).filter((task) => task.status === 'failed');
+        const failedTasks = (run?.tasks || []).filter((task) => task.status === 'failed' && !task.replacementTaskId);
         if (run && ['failed', 'partial_complete', 'stopped'].includes(run.status) && failedTasks.length > 0) {
         const confirmed = window.confirm(t(`실패한 태스크 ${failedTasks.length}개를 다시 대기로 돌리고 재개할까요?`, `Move ${failedTasks.length} failed task(s) back to ready and resume?`));
           if (confirmed) {

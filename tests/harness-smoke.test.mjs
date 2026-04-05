@@ -95,32 +95,44 @@ async function stopServerProcess(child) {
 }
 
 async function startHarnessServerForTest() {
-  const port = 4300 + Math.floor(Math.random() * 1000);
-  const child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', 'app/server.mjs'], {
-    cwd: root,
-    env: {
-      ...process.env,
-      HARNESS_PORT: String(port)
-    },
-    stdio: ['ignore', 'pipe', 'pipe']
-  });
-  const stdout = [];
-  const stderr = [];
-  child.stdout.on('data', (chunk) => stdout.push(chunk));
-  child.stderr.on('data', (chunk) => stderr.push(chunk));
-  try {
-    const baseUrl = `http://127.0.0.1:${port}`;
-    await waitForServerReady(baseUrl);
-    return {
-      baseUrl,
-      child,
-      stop: async () => stopServerProcess(child)
-    };
-  } catch (error) {
-    await stopServerProcess(child);
-    const output = Buffer.concat([...stdout, ...stderr]).toString('utf8').trim();
-    throw new Error(output ? `${error.message}\n${output}` : error.message);
+  let lastError = null;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const port = 4300 + Math.floor(Math.random() * 20000);
+    const child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', 'app/server.mjs'], {
+      cwd: root,
+      env: {
+        ...process.env,
+        HARNESS_PORT: String(port)
+      },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    const stdout = [];
+    const stderr = [];
+    child.stdout.on('data', (chunk) => stdout.push(chunk));
+    child.stderr.on('data', (chunk) => stderr.push(chunk));
+    try {
+      const baseUrl = `http://127.0.0.1:${port}`;
+      await Promise.race([
+        waitForServerReady(baseUrl),
+        new Promise((_, reject) => {
+          child.once('close', () => reject(new Error('Harness server exited before becoming ready.')));
+        })
+      ]);
+      return {
+        baseUrl,
+        child,
+        stop: async () => stopServerProcess(child)
+      };
+    } catch (error) {
+      await stopServerProcess(child);
+      const output = Buffer.concat([...stdout, ...stderr]).toString('utf8').trim();
+      lastError = new Error(output ? `${error.message}\n${output}` : error.message);
+      if (!/EADDRINUSE/.test(output)) {
+        throw lastError;
+      }
+    }
   }
+  throw lastError || new Error('Unable to start harness test server.');
 }
 
 test('harness path env overrides redirect mutable state outside the repo root', async () => {
@@ -4324,6 +4336,146 @@ test('manual retry resets attempts and reopens a failed run', async () => {
     assert.equal(refreshed.status, 'draft');
     assert.equal(refreshed.tasks[0].status, 'ready');
     assert.equal(refreshed.tasks[0].attempts, 0);
+  } finally {
+    if (runId) {
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
+    }
+  }
+});
+
+test('run detail follows automatic replacement tasks instead of surfacing the failed original as retryable', async () => {
+  let runId = '';
+  const server = await startHarnessServerForTest();
+  try {
+    const run = await createRun({
+      title: 'replacement-task-smoke',
+      projectPath: root,
+      objective: 'replacement task smoke',
+      specText: '',
+      specFiles: '',
+      settings: { maxParallel: 1, maxTaskAttempts: 3, maxGoalLoops: 1 }
+    });
+    runId = run.id;
+
+    const statePath = path.join(runsRoot, run.id, 'state.json');
+    const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+    state.status = 'running';
+    state.tasks = [{
+      id: 'T002',
+      title: 'T001 P0 상태 문서 정렬',
+      goal: 'align docs',
+      dependsOn: ['T001'],
+      filesLikely: [],
+      acceptanceChecks: [],
+      attempts: 2,
+      status: 'failed',
+      reviewSummary: 'original task failed',
+      findings: ['verification failed'],
+      lastExecution: {
+        workspaceMode: 'shared',
+        applyResult: 'failed',
+        reviewDecision: 'retry'
+      }
+    }, {
+      id: 'T006',
+      title: 'T002 재시도: P0 상태 문서 정렬',
+      goal: 'retry alignment',
+      dependsOn: ['T001'],
+      filesLikely: [],
+      acceptanceChecks: [],
+      attempts: 0,
+      status: 'in_progress',
+      reviewSummary: 'replacement task is running',
+      findings: [],
+      lastExecution: {
+        workspaceMode: 'shared',
+        applyResult: '',
+        reviewDecision: ''
+      }
+    }];
+    await fs.writeFile(statePath, JSON.stringify(state, null, 2), 'utf8');
+
+    const response = await fetch(`${server.baseUrl}/api/runs/${run.id}`);
+    assert.equal(response.status, 200);
+    const detail = await response.json();
+    const original = detail.tasks.find((task) => task.id === 'T002');
+    const replacement = detail.tasks.find((task) => task.id === 'T006');
+
+    assert.equal(original?.replacementTaskId, 'T006');
+    assert.equal(original?.replacementTaskStatus, 'in_progress');
+    assert.equal(replacement?.retryOfTaskId, 'T002');
+    assert.equal(detail.analytics.retryCount, 0);
+    assert.equal(detail.decisionPanel.primaryAction?.id, 'follow-replacement-task');
+  } finally {
+    await server.stop();
+    if (runId) {
+      await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});
+    }
+  }
+});
+
+test('superseded failed tasks cannot be retried or skipped and are ignored by requeueFailedTasks', async () => {
+  let runId = '';
+  try {
+    const run = await createRun({
+      title: 'superseded-recovery-guard-smoke',
+      projectPath: root,
+      objective: 'superseded recovery guard smoke',
+      specText: '',
+      specFiles: '',
+      settings: { maxParallel: 1, maxTaskAttempts: 3, maxGoalLoops: 1 }
+    });
+    runId = run.id;
+
+    const statePath = path.join(runsRoot, run.id, 'state.json');
+    const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+    state.status = 'failed';
+    state.tasks = [{
+      id: 'T002',
+      title: 'T001 P0 상태 문서 정렬',
+      goal: 'align docs',
+      dependsOn: ['T001'],
+      filesLikely: [],
+      acceptanceChecks: [],
+      attempts: 2,
+      status: 'failed',
+      replacementTaskId: 'T006',
+      reviewSummary: 'original task failed',
+      findings: ['verification failed'],
+      lastExecution: {
+        workspaceMode: 'shared',
+        applyResult: 'failed',
+        reviewDecision: 'retry'
+      }
+    }, {
+      id: 'T006',
+      title: 'T002 재시도: P0 상태 문서 정렬',
+      goal: 'retry alignment',
+      dependsOn: ['T001'],
+      filesLikely: [],
+      acceptanceChecks: [],
+      attempts: 0,
+      status: 'ready',
+      reviewSummary: '',
+      findings: [],
+      lastExecution: {
+        workspaceMode: 'shared',
+        applyResult: '',
+        reviewDecision: ''
+      }
+    }];
+    await fs.writeFile(statePath, JSON.stringify(state, null, 2), 'utf8');
+
+    await assert.rejects(() => retryTask(run.id, 'T002'), /superseded by T006/i);
+    await assert.rejects(() => skipTask(run.id, 'T002', 'skip original'), /superseded by T006/i);
+
+    const refreshed = await requeueFailedTasks(run.id);
+    const original = refreshed.tasks.find((task) => task.id === 'T002');
+    const replacement = refreshed.tasks.find((task) => task.id === 'T006');
+
+    assert.equal(original?.status, 'failed');
+    assert.equal(replacement?.status, 'ready');
+    assert.equal(refreshed.status, 'failed');
   } finally {
     if (runId) {
       await fs.rm(path.join(runsRoot, runId), { recursive: true, force: true }).catch(() => {});

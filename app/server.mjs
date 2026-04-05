@@ -450,7 +450,7 @@ function buildRunAnalytics(run, traceEntries = []) {
   const tasks = Array.isArray(run?.tasks) ? run.tasks : [];
   const lastTrace = traceEntries.at(-1) || null;
   const activeTask = tasks.find((task) => task.status === 'in_progress') || null;
-  const retryTasks = tasks.filter((task) => String(task.lastExecution?.reviewDecision || '') === 'retry' || task.status === 'failed');
+  const retryTasks = tasks.filter((task) => (String(task.lastExecution?.reviewDecision || '') === 'retry' || task.status === 'failed') && !task.replacementTaskId);
   const acceptanceCounts = new Map();
   for (const task of tasks) {
     for (const result of Array.isArray(task.lastExecution?.acceptanceCheckResults) ? task.lastExecution.acceptanceCheckResults : []) {
@@ -498,8 +498,12 @@ function buildRunAnalytics(run, traceEntries = []) {
 
 function buildDecisionPanel(run, analytics, runActionRecords = []) {
   const tasks = Array.isArray(run?.tasks) ? run.tasks : [];
-  const failedTasks = tasks.filter((task) => task.status === 'failed');
+  const failedTasks = tasks.filter((task) => task.status === 'failed' && !task.replacementTaskId);
   const retryableTasks = failedTasks.filter((task) => String(task.lastExecution?.reviewDecision || '') === 'retry');
+  const supersededFailedTasks = tasks.filter((task) => task.status === 'failed' && task.replacementTaskId);
+  const replacementTask = supersededFailedTasks
+    .map((task) => tasks.find((candidate) => candidate.id === task.replacementTaskId))
+    .find(Boolean) || null;
   const blockedTask = failedTasks[0] || tasks.find((task) => task.status === 'ready') || null;
   const lastRunAction = runActionRecords.at(-1) || null;
   const actions = [];
@@ -521,6 +525,12 @@ function buildDecisionPanel(run, analytics, runActionRecords = []) {
       id: 'retry-task',
       label: localizeRunText(run, `${retryableTasks[0].id} 재시도`, `Retry ${retryableTasks[0].id}`),
       description: localizeRunText(run, '단일 실패 태스크라서 root cause를 고친 뒤 바로 retry하는 것이 가장 짧다.', 'There is one failed task, so fixing the root cause and retrying it is the shortest path.')
+    });
+  } else if (replacementTask) {
+    actions.push({
+      id: 'follow-replacement-task',
+      label: localizeRunText(run, `${replacementTask.id} 확인`, `Inspect ${replacementTask.id}`),
+      description: localizeRunText(run, '실패 태스크는 자동 승계되었으므로 원본을 다시 돌리지 말고 후속 태스크를 확인한다.', 'The failed task has already been superseded automatically, so inspect the replacement task instead of retrying the original.')
     });
   } else if (failedTasks.length > 1) {
     actions.push({
@@ -574,6 +584,8 @@ function buildDecisionPanel(run, analytics, runActionRecords = []) {
 
 function buildRecoveryGuide(run, analytics) {
   const steps = [];
+  const actionableFailedTasks = (Array.isArray(run?.tasks) ? run.tasks : []).filter((task) => task.status === 'failed' && !task.replacementTaskId);
+  const supersededFailedTasks = (Array.isArray(run?.tasks) ? run.tasks : []).filter((task) => task.status === 'failed' && task.replacementTaskId);
   if (run.status === 'needs_input') {
     steps.push(localizeRunText(run, '답변 대기 중인 작업 전 확인 질문에 응답한 뒤 다시 시작한다.', 'Answer the pending pre-work questions, then resume the run.'));
   }
@@ -583,8 +595,11 @@ function buildRecoveryGuide(run, analytics) {
   if (run.status === 'stopped') {
     steps.push(localizeRunText(run, '중단 이유를 확인하고 시작/재개 버튼으로 이어서 실행한다.', 'Check why the run stopped, then continue with Start/Resume.'));
   }
-  if (run.status === 'failed' || run.status === 'partial_complete') {
+  if ((run.status === 'failed' || run.status === 'partial_complete') && actionableFailedTasks.length > 0) {
     steps.push(localizeRunText(run, '실패 태스크의 요약, 검증 결과, action 기록을 읽고 재시도 또는 requeue를 결정한다.', 'Read the failed task summary, verification results, and action log, then choose retry or requeue.'));
+  }
+  if (supersededFailedTasks.length > 0) {
+    steps.push(localizeRunText(run, `자동 승계된 실패 태스크(${supersededFailedTasks.map((task) => task.id).join(', ')})는 수동 재시도하지 말고 후속 태스크를 따른다.`, `Do not retry superseded failed tasks (${supersededFailedTasks.map((task) => task.id).join(', ')}); follow their replacement tasks instead.`));
   }
   if ((analytics?.scopeDriftCount || 0) > 0) {
     steps.push(localizeRunText(run, '범위 밖 변경이 있었으므로 Timeline과 변경점 탭을 먼저 확인한다.', 'There were out-of-scope changes, so check the Timeline and Changes tabs first.'));

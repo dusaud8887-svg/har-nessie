@@ -1612,8 +1612,71 @@ function normalizeTask(raw, existingTasks) {
       ...defaultTaskExecution(),
       ...(raw.lastExecution && typeof raw.lastExecution === 'object' ? raw.lastExecution : {})
     },
-    allowedActionClasses: Array.isArray(raw.allowedActionClasses) ? raw.allowedActionClasses.map(String) : []
+    allowedActionClasses: Array.isArray(raw.allowedActionClasses) ? raw.allowedActionClasses.map(String) : [],
+    retryOfTaskId: String(raw.retryOfTaskId || '').trim(),
+    retryOfTaskTitle: String(raw.retryOfTaskTitle || '').trim(),
+    replacementTaskId: String(raw.replacementTaskId || '').trim(),
+    replacementTaskTitle: String(raw.replacementTaskTitle || '').trim(),
+    replacementTaskStatus: String(raw.replacementTaskStatus || '').trim()
   };
+}
+
+function normalizeLinkedTaskId(value) {
+  const normalized = String(value || '').trim().toUpperCase();
+  return /^T\d+$/.test(normalized) ? normalized : '';
+}
+
+function inferRetryOfTaskId(task) {
+  const explicit = normalizeLinkedTaskId(task?.retryOfTaskId);
+  if (explicit) return explicit;
+  const title = String(task?.title || '').trim();
+  let match = title.match(/^(T\d+)\s*(?:재시도|retry)(?=\s|:|-|$)/i);
+  if (match) return normalizeLinkedTaskId(match[1]);
+  match = title.match(/^(?:재시도|retry)\s*(?:task\s*)?(T\d+)(?=\s|:|-|$)/i);
+  return match ? normalizeLinkedTaskId(match[1]) : '';
+}
+
+function annotateTaskReplacementLinks(tasks) {
+  const annotated = (Array.isArray(tasks) ? tasks : []).map((task) => ({
+    ...task,
+    retryOfTaskId: normalizeLinkedTaskId(task?.retryOfTaskId),
+    retryOfTaskTitle: '',
+    replacementTaskId: normalizeLinkedTaskId(task?.replacementTaskId),
+    replacementTaskTitle: '',
+    replacementTaskStatus: ''
+  }));
+  const byId = new Map(annotated.map((task) => [String(task.id || '').trim(), task]));
+
+  for (const task of annotated) {
+    const retryOfTaskId = inferRetryOfTaskId(task);
+    if (!retryOfTaskId || !byId.has(retryOfTaskId) || retryOfTaskId === task.id) continue;
+    task.retryOfTaskId = retryOfTaskId;
+    task.retryOfTaskTitle = byId.get(retryOfTaskId)?.title || '';
+    const predecessor = byId.get(retryOfTaskId);
+    predecessor.replacementTaskId = task.id;
+    predecessor.replacementTaskTitle = task.title || '';
+    predecessor.replacementTaskStatus = String(task.status || '').trim();
+  }
+
+  for (const task of annotated) {
+    const successorId = normalizeLinkedTaskId(task?.replacementTaskId);
+    const successor = successorId ? byId.get(successorId) : null;
+    if (!successor) {
+      task.replacementTaskId = '';
+      task.replacementTaskTitle = '';
+      task.replacementTaskStatus = '';
+      continue;
+    }
+    task.replacementTaskId = successor.id;
+    task.replacementTaskTitle = successor.title || '';
+    task.replacementTaskStatus = String(successor.status || '').trim();
+    if (!successor.retryOfTaskId) {
+      successor.retryOfTaskId = task.id;
+      successor.retryOfTaskTitle = task.title || '';
+    }
+  }
+
+  return annotated;
 }
 
 function nextPhaseId(existingPhases = []) {
@@ -1960,6 +2023,7 @@ async function loadPersistedState(runId) {
 
 async function loadState(runId) {
   const state = await loadPersistedState(runId);
+  state.tasks = annotateTaskReplacementLinks(state.tasks);
   state.logs = await readRecentLogs(runId);
   return state;
 }
@@ -5461,7 +5525,7 @@ function summarizeExecutionFailure(execution) {
   return clipLine((focused[0] || combined).replace(/\[stderr\]/gi, '').trim(), 320);
 }
 
-function classifyExecutionFailure(execution, errorSnippet = '') {
+function classifyExecutionFailure(execution, errorSnippet = '', provider = '') {
   const text = String([errorSnippet, execution?.stderr, execution?.stdout].filter(Boolean).join('\n')).toLowerCase();
   const permanentPatterns = [
     'projectidrequirederror',
@@ -5487,7 +5551,7 @@ function classifyExecutionFailure(execution, errorSnippet = '') {
     return {
       retryable: false,
       category: 'configuration',
-      summary: `${providerDisplayName(resolveStageProvider(run, 'implementer'))} environment or authentication configuration issue — failing immediately.`
+      summary: `${providerDisplayName(provider || 'codex')} environment or authentication configuration issue — failing immediately.`
     };
   }
   if (execution?.timedOut || transientPatterns.some((pattern) => text.includes(pattern))) {
@@ -5858,7 +5922,7 @@ async function executeTask(runId, taskId, controller) {
     if (execution.code !== 0) {
       let rollbackMessage = '';
       const errorSnippet = summarizeExecutionFailure(execution);
-      const failurePolicy = classifyExecutionFailure(execution, errorSnippet);
+      const failurePolicy = classifyExecutionFailure(execution, errorSnippet, implementerProvider);
       if (executionCtx.mode === 'shared') {
         const rollback = await runTaskAction(
           runId,
@@ -8102,6 +8166,9 @@ export async function retryTask(runId, taskId) {
     const state = await loadState(runId);
     const task = state.tasks.find((item) => item.id === taskId);
     if (!task) throw new Error(`Task not found: ${taskId}`);
+    if (task.status === 'failed' && task.replacementTaskId) {
+      throw new Error(`Task ${taskId} has been superseded by ${task.replacementTaskId}. Retry the replacement task instead.`);
+    }
     if (task.status === 'in_progress') {
       throw new Error('Task is already running.');
     }
@@ -8129,7 +8196,7 @@ export async function requeueFailedTasks(runId) {
   await withLock(runId, async () => {
     const state = await loadState(runId);
     for (const task of state.tasks) {
-      if (task.status !== 'failed') continue;
+      if (task.status !== 'failed' || task.replacementTaskId) continue;
       task.status = 'ready';
       task.attempts = 0;
       task.reviewSummary = '';
@@ -8156,6 +8223,9 @@ export async function skipTask(runId, taskId, reason = '') {
     const state = await loadState(runId);
     const task = state.tasks.find((item) => item.id === taskId);
     if (!task) throw new Error(`Task not found: ${taskId}`);
+    if (task.status === 'failed' && task.replacementTaskId) {
+      throw new Error(`Task ${taskId} has been superseded by ${task.replacementTaskId}. Skip the replacement task if you want to exclude this work.`);
+    }
     if (task.status === 'in_progress') {
       throw new Error('Task is already running.');
     }
